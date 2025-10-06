@@ -13,6 +13,7 @@ backups/
 
 # Node modules
 node_modules/
+package-lock.json
 
 # Logs
 *.log

@@ -55,6 +55,32 @@ class SessionManager {
   }
 
   /**
+   * Stores email in the session
+   * 
+   * @param {string} chatId - Telegram chat ID
+   * @param {string} email - User's email
+   */
+  setEmail(chatId, email) {
+    if (this.sessions[chatId]) {
+      this.sessions[chatId].email = email;
+      console.log(`📧 Email stored for ${chatId}`);
+    }
+  }
+
+  /**
+   * Stores password in the session
+   * 
+   * @param {string} chatId - Telegram chat ID
+   * @param {string} password - User's password
+   */
+  setPassword(chatId, password) {
+    if (this.sessions[chatId]) {
+      this.sessions[chatId].password = password;
+      console.log(`🔑 Password stored for ${chatId}`);
+    }
+  }
+
+  /**
    * Stores browser and page instances in the session
    * 
    * @param {string} chatId - Telegram chat ID

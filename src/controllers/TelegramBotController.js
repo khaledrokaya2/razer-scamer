@@ -347,6 +347,11 @@ class TelegramBotController {
    * @param {string} queryId - Callback query ID for acknowledgment
    */
   async handleLoginButton(chatId, queryId) {
+    // Create session if it doesn't exist
+    if (!sessionManager.getSession(chatId)) {
+      sessionManager.createSession(chatId);
+    }
+
     // Update session state to await email input
     sessionManager.updateState(chatId, 'awaiting_email');
 
