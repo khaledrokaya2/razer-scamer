@@ -17,8 +17,21 @@ const encryption = require('../utils/encryption');
 
 class DatabaseService {
   constructor() {
-    // Database file path - can be customized via environment variable
-    const dbPath = process.env.DB_PATH || path.join(__dirname, '../../data/razer-buyer.db');
+    // Auto-detect environment
+    const isRailway = process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID;
+
+    // Set database path based on environment
+    let dbPath;
+    if (process.env.DB_PATH) {
+      // Use custom path if provided
+      dbPath = process.env.DB_PATH;
+    } else if (isRailway) {
+      // Railway: use /data volume (persistent storage)
+      dbPath = '/data/razer-buyer.db';
+    } else {
+      // Local: use ./data folder
+      dbPath = path.join(__dirname, '../../data/razer-buyer.db');
+    }
 
     // Ensure data directory exists
     const dbDir = path.dirname(dbPath);
@@ -27,6 +40,7 @@ class DatabaseService {
     }
 
     console.log('📝 Using SQLite database at:', dbPath);
+    console.log('🌍 Environment:', isRailway ? 'RAILWAY (Production)' : 'LOCAL (Development)');
 
     this.dbPath = dbPath;
     this.db = null;

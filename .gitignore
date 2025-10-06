@@ -1,6 +1,16 @@
 # Environment variables (contains sensitive data)
 .env
 
+# SQLite Database (contains user data)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Database backups
+backups/
+*.backup
+
 # Node modules
 node_modules/
 package-lock.json
