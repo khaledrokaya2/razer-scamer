@@ -22,7 +22,7 @@ const botController = require('./src/controllers/TelegramBotController');
  * Exits the process if critical variables are missing
  */
 function validateEnvironment() {
-  const requiredVars = ['TELEGRAM_TEST_BOT_TOKEN'];
+  const requiredVars = ['TELEGRAM_BOT_TOKEN'];
   const missing = requiredVars.filter(varName => !process.env[varName]);
 
   if (missing.length > 0) {
@@ -42,7 +42,7 @@ async function initializeServices() {
   await authService.initialize();
 
   // Initialize Telegram bot controller with bot token
-  botController.initialize(process.env.TELEGRAM_TEST_BOT_TOKEN);
+  botController.initialize(process.env.TELEGRAM_BOT_TOKEN);
 
   console.log('✅ All services initialized');
 }
