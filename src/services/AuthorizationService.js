@@ -1,81 +1,99 @@
 /**
  * AuthorizationService
  * 
- * Handles user authorization for the Telegram bot.
- * Checks if users are allowed to access the bot.
+ * Handles user authorization for the Telegram bot using database.
+ * Checks if users exist in the database and their roles.
  * 
  * Following Single Responsibility Principle (SRP):
  * - Only handles authorization logic
- * - No scraping, session, or bot logic
+ * - Delegates database operations to DatabaseService
  */
+
+const databaseService = require('./DatabaseService');
 
 class AuthorizationService {
   constructor() {
-    // List of allowed Telegram user IDs (loaded from environment variable)
-    this.allowedUsers = [];
+    this.initialized = false;
   }
 
   /**
-   * Initialize the authorization service with allowed users
-   * 
-   * @param {string} allowedUsersString - Comma-separated list of Telegram IDs
+   * Initialize the authorization service
    */
-  initialize(allowedUsersString) {
-    // Split the string by comma, trim whitespace, and filter empty strings
-    this.allowedUsers = (allowedUsersString || '')
-      .split(',')
-      .map(id => id.trim())
-      .filter(Boolean);
-
-    console.log(`🔐 Authorization initialized with ${this.allowedUsers.length} allowed users`);
-  }
-
-  /**
-   * Checks if a user is authorized to use the bot
-   * 
-   * @param {string} chatId - Telegram chat ID to check
-   * @returns {boolean} True if user is allowed, false otherwise
-   */
-  isAuthorized(chatId) {
-    const authorized = this.allowedUsers.includes(chatId.toString());
-    console.log(`🔍 Authorization check for ${chatId}: ${authorized ? 'ALLOWED' : 'DENIED'}`);
-    return authorized;
-  }
-
-  /**
-   * Adds a user to the allowed list
-   * 
-   * @param {string} chatId - Telegram chat ID to add
-   */
-  addUser(chatId) {
-    const id = chatId.toString();
-    if (!this.allowedUsers.includes(id)) {
-      this.allowedUsers.push(id);
-      console.log(`✅ User ${id} added to allowed list`);
+  async initialize() {
+    try {
+      await databaseService.connect();
+      this.initialized = true;
+      console.log('🔐 Authorization service initialized with database');
+    } catch (err) {
+      console.error('❌ Failed to initialize authorization service:', err);
+      throw err;
     }
   }
 
   /**
-   * Removes a user from the allowed list
+   * Checks if a user is authorized to use the bot (exists in database)
    * 
-   * @param {string} chatId - Telegram chat ID to remove
+   * @param {string} telegramUserId - Telegram user ID to check
+   * @returns {Promise<{authorized: boolean, user: UserAccount|null, reason: string}>}
    */
-  removeUser(chatId) {
-    const id = chatId.toString();
-    const index = this.allowedUsers.indexOf(id);
-    if (index > -1) {
-      this.allowedUsers.splice(index, 1);
-      console.log(`❌ User ${id} removed from allowed list`);
+  async checkAuthorization(telegramUserId) {
+    try {
+      const user = await databaseService.getUserByTelegramId(telegramUserId);
+
+      if (!user) {
+        console.log(`🔍 Authorization check for ${telegramUserId}: DENIED (not in database)`);
+        return {
+          authorized: false,
+          user: null,
+          reason: 'User not found in database'
+        };
+      }
+
+      console.log(`🔍 Authorization check for ${telegramUserId}: ALLOWED (${user.role})`);
+      return {
+        authorized: true,
+        user: user,
+        reason: 'Authorized'
+      };
+    } catch (err) {
+      console.error('Error checking authorization:', err);
+      return {
+        authorized: false,
+        user: null,
+        reason: 'Database error'
+      };
     }
   }
 
   /**
-   * Gets the list of all allowed users
+   * Check if user is admin
    * 
-   * @returns {string[]} Array of allowed Telegram IDs
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<boolean>} True if user is admin
    */
-  getAllowedUsers() {
-    return [...this.allowedUsers]; // Return a copy to prevent external modification
+  async isAdmin(telegramUserId) {
+    try {
+      const user = await databaseService.getUserByTelegramId(telegramUserId);
+      return user && user.isAdmin();
+    } catch (err) {
+      console.error('Error checking admin status:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Get user from database
+   * 
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<UserAccount|null>} User account or null
+   */
+  async getUser(telegramUserId) {
+    try {
+      return await databaseService.getUserByTelegramId(telegramUserId);
+    } catch (err) {
+      console.error('Error getting user:', err);
+      return null;
+    }
   }
 }
 

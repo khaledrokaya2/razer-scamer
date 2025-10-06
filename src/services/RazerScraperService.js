@@ -16,7 +16,7 @@ class RazerScraperService {
     // Razer website URLs
     this.LOGIN_URL = 'https://razerid.razer.com';
     this.DASHBOARD_URL = 'https://razerid.razer.com/dashboard';
-    this.DEFAULT_TIMEOUT = 120000; // 2 minutes
+    this.DEFAULT_TIMEOUT = 30000; // 30 seconds
   }
 
   /**
@@ -30,7 +30,6 @@ class RazerScraperService {
   async login(email, password) {
     // Launch a headless browser (runs in background without GUI)
     const browser = await puppeteer.launch({
-      headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'] // Security flags for server environments
     });
 

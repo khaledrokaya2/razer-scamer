@@ -25,8 +25,6 @@ class SessionManager {
   createSession(chatId) {
     this.sessions[chatId] = {
       state: 'idle',           // Current state: idle, awaiting_email, awaiting_password, logged_in
-      email: null,             // User's Razer email
-      password: null,          // User's Razer password
       browser: null,           // Puppeteer browser instance
       page: null               // Puppeteer page instance
     };
@@ -53,30 +51,6 @@ class SessionManager {
     if (this.sessions[chatId]) {
       this.sessions[chatId].state = state;
       console.log(`🔄 Session state updated for ${chatId}: ${state}`);
-    }
-  }
-
-  /**
-   * Stores email in the session
-   * 
-   * @param {string} chatId - Telegram chat ID
-   * @param {string} email - User's email
-   */
-  setEmail(chatId, email) {
-    if (this.sessions[chatId]) {
-      this.sessions[chatId].email = email;
-    }
-  }
-
-  /**
-   * Stores password in the session
-   * 
-   * @param {string} chatId - Telegram chat ID
-   * @param {string} password - User's password
-   */
-  setPassword(chatId, password) {
-    if (this.sessions[chatId]) {
-      this.sessions[chatId].password = password;
     }
   }
 
