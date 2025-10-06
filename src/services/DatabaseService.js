@@ -125,8 +125,52 @@ class DatabaseService {
     `);
 
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_purchases_order_id ON purchases(order_id)`);
-
+    
     console.log('✅ Database schema initialized');
+    
+    // Initialize default admin user if database is empty
+    this.initializeDefaultAdmin();
+  }
+
+  /**
+   * Initialize default admin user if database is empty
+   * Creates the first admin user automatically on fresh database
+   */
+  initializeDefaultAdmin() {
+    try {
+      // Check if database has any users
+      const countStmt = this.db.prepare('SELECT COUNT(*) as count FROM user_accounts');
+      const result = countStmt.get();
+      
+      if (result.count === 0) {
+        console.log('📝 Database is empty. Creating default admin user...');
+        
+        // Create default admin user
+        const insertStmt = this.db.prepare(`
+          INSERT INTO user_accounts (telegram_user_id, username, role, SubscriptionType, AllowedAttempts)
+          VALUES (?, ?, ?, ?, ?)
+        `);
+        
+        const adminTelegramId = '1835070193';
+        const adminUsername = 'Khaled Mostafa';
+        const adminRole = 'admin';
+        const adminSubscription = 'vip'; // Give admin VIP subscription
+        const adminAttempts = 999; // Give admin unlimited attempts
+        
+        insertStmt.run(adminTelegramId, adminUsername, adminRole, adminSubscription, adminAttempts);
+        
+        console.log('✅ Default admin user created successfully!');
+        console.log(`   👤 Username: ${adminUsername}`);
+        console.log(`   🆔 Telegram ID: ${adminTelegramId}`);
+        console.log(`   👑 Role: ${adminRole}`);
+        console.log(`   ⭐ Subscription: ${adminSubscription}`);
+      } else {
+        console.log(`✅ Database has ${result.count} user(s)`);
+      }
+    } catch (err) {
+      console.error('⚠️  Error initializing default admin:', err);
+      // Don't throw - this is not critical, just log the error
+    }
   }
 
   /**
