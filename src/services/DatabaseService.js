@@ -2,174 +2,39 @@
  * Database Service
  * 
  * Handles all database operations for the application.
- * Uses SQLite for local and production database.
+ * Uses Azure SQL (MSSQL) for data persistence.
  * 
  * Following Single Responsibility Principle:
  * - Only handles database queries and data persistence
  * - No business logic or bot interactions
  */
 
-const Database = require('better-sqlite3');
-const path = require('path');
-const fs = require('fs');
+const sql = require('mssql');
 const { UserAccount, Order, Purchase, SubscriptionPlans } = require('../models/DatabaseModels');
 const encryption = require('../utils/encryption');
 
 class DatabaseService {
   constructor() {
-    // Auto-detect environment
-    const isRailway = process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID;
-
-    // Set database path based on environment
-    let dbPath;
-    if (process.env.DB_PATH) {
-      // Use custom path if provided
-      dbPath = process.env.DB_PATH;
-    } else if (isRailway) {
-      // Railway: use /data volume (persistent storage)
-      dbPath = '/data/razer-buyer.db';
-    } else {
-      // Local: use ./data folder
-      dbPath = path.join(__dirname, '../../data/razer-buyer.db');
-    }
-
-    // Ensure data directory exists
-    const dbDir = path.dirname(dbPath);
-    if (!fs.existsSync(dbDir)) {
-      fs.mkdirSync(dbDir, { recursive: true });
-    }
-
-    console.log('📝 Using SQLite database at:', dbPath);
-    console.log('🌍 Environment:', isRailway ? 'RAILWAY (Production)' : 'LOCAL (Development)');
-
-    this.dbPath = dbPath;
-    this.db = null;
+    this.pool = null;
+    // Use connection string directly
+    this.config = process.env.DB_CONNECTION_STRING;
+    console.log('📝 Using Azure SQL Database (MSSQL)');
   }
 
   /**
-   * Initialize database connection and create tables if needed
+   * Initialize database connection pool
    */
   async connect() {
     try {
-      if (!this.db) {
-        console.log('🔌 Connecting to database...');
-
-        // Open database connection
-        this.db = new Database(this.dbPath, { verbose: null });
-
-        // Enable foreign keys
-        this.db.pragma('foreign_keys = ON');
-
-        // Initialize schema
-        this.initializeSchema();
-
+      if (!this.pool) {
+        console.log('🔌 Connecting to Azure SQL Database...');
+        this.pool = await sql.connect(this.config);
         console.log('✅ Database connected successfully');
       }
-      return this.db;
+      return this.pool;
     } catch (err) {
       console.error('❌ Database connection failed:', err.message);
       throw err;
-    }
-  }
-
-  /**
-   * Create database schema if it doesn't exist
-   */
-  initializeSchema() {
-    // Create user_accounts table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS user_accounts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_user_id INTEGER NOT NULL UNIQUE,
-        username TEXT NOT NULL,
-        created_at DATETIME DEFAULT (datetime('now', 'utc')),
-        AllowedAttempts INTEGER NOT NULL DEFAULT 0,
-        SubscriptionType TEXT NOT NULL DEFAULT 'free' CHECK (SubscriptionType IN ('free', 'pro', 'gold', 'vip')),
-        SubscriptionExpiresAt DATETIME,
-        role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin'))
-      )
-    `);
-
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_user_accounts_telegram_id ON user_accounts(telegram_user_id)`);
-
-    // Create orders table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        cards_count INTEGER,
-        status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'failed')),
-        created_at DATETIME DEFAULT (datetime('now')),
-        completed_purchases INTEGER DEFAULT 0,
-        total_cost DECIMAL(10, 2),
-        card_value DECIMAL(5, 2),
-        FOREIGN KEY (user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
-      )
-    `);
-
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)`);
-
-    // Create purchases table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS purchases (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id INTEGER,
-        reference_id TEXT,
-        payment_id TEXT,
-        created_at DATETIME DEFAULT (datetime('now')),
-        card_serial TEXT,
-        card_value DECIMAL(5, 2),
-        card_code TEXT,
-        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
-      )
-    `);
-
-    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_purchases_order_id ON purchases(order_id)`);
-    
-    console.log('✅ Database schema initialized');
-    
-    // Initialize default admin user if database is empty
-    this.initializeDefaultAdmin();
-  }
-
-  /**
-   * Initialize default admin user if database is empty
-   * Creates the first admin user automatically on fresh database
-   */
-  initializeDefaultAdmin() {
-    try {
-      // Check if database has any users
-      const countStmt = this.db.prepare('SELECT COUNT(*) as count FROM user_accounts');
-      const result = countStmt.get();
-      
-      if (result.count === 0) {
-        console.log('📝 Database is empty. Creating default admin user...');
-        
-        // Create default admin user
-        const insertStmt = this.db.prepare(`
-          INSERT INTO user_accounts (telegram_user_id, username, role, SubscriptionType, AllowedAttempts)
-          VALUES (?, ?, ?, ?, ?)
-        `);
-        
-        const adminTelegramId = '1835070193';
-        const adminUsername = 'Khaled Mostafa';
-        const adminRole = 'admin';
-        const adminSubscription = 'vip'; // Give admin VIP subscription
-        const adminAttempts = 999; // Give admin unlimited attempts
-        
-        insertStmt.run(adminTelegramId, adminUsername, adminRole, adminSubscription, adminAttempts);
-        
-        console.log('✅ Default admin user created successfully!');
-        console.log(`   👤 Username: ${adminUsername}`);
-        console.log(`   🆔 Telegram ID: ${adminTelegramId}`);
-        console.log(`   👑 Role: ${adminRole}`);
-        console.log(`   ⭐ Subscription: ${adminSubscription}`);
-      } else {
-        console.log(`✅ Database has ${result.count} user(s)`);
-      }
-    } catch (err) {
-      console.error('⚠️  Error initializing default admin:', err);
-      // Don't throw - this is not critical, just log the error
     }
   }
 
@@ -181,10 +46,11 @@ class DatabaseService {
   async getUserByTelegramId(telegramUserId) {
     try {
       await this.connect();
-      const stmt = this.db.prepare('SELECT * FROM user_accounts WHERE telegram_user_id = ?');
-      const row = stmt.get(telegramUserId);
+      const result = await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query('SELECT * FROM user_accounts WHERE telegram_user_id = @telegram_user_id');
 
-      return row ? new UserAccount(row) : null;
+      return result.recordset.length > 0 ? new UserAccount(result.recordset[0]) : null;
     } catch (err) {
       console.error('Error getting user:', err);
       throw err;
@@ -199,10 +65,11 @@ class DatabaseService {
   async getUserById(userId) {
     try {
       await this.connect();
-      const stmt = this.db.prepare('SELECT * FROM user_accounts WHERE id = ?');
-      const row = stmt.get(userId);
+      const result = await this.pool.request()
+        .input('id', sql.Int, userId)
+        .query('SELECT * FROM user_accounts WHERE id = @id');
 
-      return row ? new UserAccount(row) : null;
+      return result.recordset.length > 0 ? new UserAccount(result.recordset[0]) : null;
     } catch (err) {
       console.error('Error getting user by ID:', err);
       throw err;
@@ -216,10 +83,10 @@ class DatabaseService {
   async getAllUsers() {
     try {
       await this.connect();
-      const stmt = this.db.prepare('SELECT * FROM user_accounts ORDER BY created_at DESC');
-      const rows = stmt.all();
+      const result = await this.pool.request()
+        .query('SELECT * FROM user_accounts ORDER BY created_at DESC');
 
-      return rows.map(row => new UserAccount(row));
+      return result.recordset.map(row => new UserAccount(row));
     } catch (err) {
       console.error('Error getting all users:', err);
       throw err;
@@ -235,15 +102,16 @@ class DatabaseService {
   async createUser(telegramUserId, username) {
     try {
       await this.connect();
-      const stmt = this.db.prepare(`
-        INSERT INTO user_accounts (telegram_user_id, username)
-        VALUES (?, ?)
-      `);
+      const result = await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .input('username', sql.NVarChar(50), username)
+        .query(`
+          INSERT INTO user_accounts (telegram_user_id, username)
+          OUTPUT INSERTED.*
+          VALUES (@telegram_user_id, @username)
+        `);
 
-      const info = stmt.run(telegramUserId, username);
-
-      // Get the created user
-      return await this.getUserById(info.lastInsertRowid);
+      return new UserAccount(result.recordset[0]);
     } catch (err) {
       console.error('Error creating user:', err);
       throw err;
@@ -261,17 +129,19 @@ class DatabaseService {
       await this.connect();
       const plan = SubscriptionPlans[subscriptionType];
 
-      const stmt = this.db.prepare(`
-        UPDATE user_accounts 
-        SET SubscriptionType = ?,
-            AllowedAttempts = ?
-        WHERE id = ?
-      `);
+      const result = await this.pool.request()
+        .input('id', sql.Int, userId)
+        .input('subscription_type', sql.NVarChar(50), subscriptionType)
+        .input('allowed_attempts', sql.Int, plan.attempts)
+        .query(`
+          UPDATE user_accounts 
+          SET SubscriptionType = @subscription_type,
+              AllowedAttempts = @allowed_attempts
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
 
-      stmt.run(subscriptionType, plan.attempts, userId);
-
-      // Return updated user
-      return await this.getUserById(userId);
+      return new UserAccount(result.recordset[0]);
     } catch (err) {
       console.error('Error updating user subscription:', err);
       throw err;
@@ -295,17 +165,19 @@ class DatabaseService {
       // Renew attempts based on current plan
       const plan = SubscriptionPlans[user.SubscriptionType];
 
-      const stmt = this.db.prepare(`
-        UPDATE user_accounts 
-        SET SubscriptionExpiresAt = ?,
-            AllowedAttempts = ?
-        WHERE id = ?
-      `);
+      const result = await this.pool.request()
+        .input('id', sql.Int, userId)
+        .input('expiration', sql.DateTime2, newExpiration)
+        .input('attempts', sql.Int, plan.attempts)
+        .query(`
+          UPDATE user_accounts 
+          SET SubscriptionExpiresAt = @expiration,
+              AllowedAttempts = @attempts
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
 
-      stmt.run(newExpiration.toISOString(), plan.attempts, userId);
-
-      // Return updated user
-      return await this.getUserById(userId);
+      return new UserAccount(result.recordset[0]);
     } catch (err) {
       console.error('Error extending user subscription:', err);
       throw err;
@@ -321,16 +193,17 @@ class DatabaseService {
   async updateUserRole(userId, role) {
     try {
       await this.connect();
-      const stmt = this.db.prepare(`
-        UPDATE user_accounts 
-        SET role = ?
-        WHERE id = ?
-      `);
+      const result = await this.pool.request()
+        .input('id', sql.Int, userId)
+        .input('role', sql.NVarChar(20), role)
+        .query(`
+          UPDATE user_accounts 
+          SET role = @role
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
 
-      stmt.run(role, userId);
-
-      // Return updated user
-      return await this.getUserById(userId);
+      return new UserAccount(result.recordset[0]);
     } catch (err) {
       console.error('Error updating user role:', err);
       throw err;
@@ -345,8 +218,9 @@ class DatabaseService {
   async deleteUser(userId) {
     try {
       await this.connect();
-      const stmt = this.db.prepare('DELETE FROM user_accounts WHERE id = ?');
-      stmt.run(userId);
+      await this.pool.request()
+        .input('id', sql.Int, userId)
+        .query('DELETE FROM user_accounts WHERE id = @id');
 
       return true;
     } catch (err) {
@@ -363,23 +237,20 @@ class DatabaseService {
   async decrementUserAttempts(userId) {
     try {
       await this.connect();
+      const result = await this.pool.request()
+        .input('id', sql.Int, userId)
+        .query(`
+          UPDATE user_accounts 
+          SET AllowedAttempts = AllowedAttempts - 1
+          OUTPUT INSERTED.*
+          WHERE id = @id AND AllowedAttempts > 0
+        `);
 
-      // Check if user has attempts remaining
-      const user = await this.getUserById(userId);
-      if (!user || user.AllowedAttempts <= 0) {
+      if (result.recordset.length === 0) {
         throw new Error('No attempts remaining');
       }
 
-      const stmt = this.db.prepare(`
-        UPDATE user_accounts 
-        SET AllowedAttempts = AllowedAttempts - 1
-        WHERE id = ? AND AllowedAttempts > 0
-      `);
-
-      stmt.run(userId);
-
-      // Return updated user
-      return await this.getUserById(userId);
+      return new UserAccount(result.recordset[0]);
     } catch (err) {
       console.error('Error decrementing user attempts:', err);
       throw err;
@@ -394,10 +265,11 @@ class DatabaseService {
   async getUserOrders(userId) {
     try {
       await this.connect();
-      const stmt = this.db.prepare('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC');
-      const rows = stmt.all(userId);
+      const result = await this.pool.request()
+        .input('user_id', sql.Int, userId)
+        .query('SELECT * FROM orders WHERE user_id = @user_id ORDER BY created_at DESC');
 
-      return rows.map(row => new Order(row));
+      return result.recordset.map(row => new Order(row));
     } catch (err) {
       console.error('Error getting user orders:', err);
       throw err;
@@ -412,30 +284,13 @@ class DatabaseService {
   async getOrderById(orderId) {
     try {
       await this.connect();
-      const stmt = this.db.prepare('SELECT * FROM orders WHERE id = ?');
-      const row = stmt.get(orderId);
+      const result = await this.pool.request()
+        .input('id', sql.Int, orderId)
+        .query('SELECT * FROM orders WHERE id = @id');
 
-      return row ? new Order(row) : null;
+      return result.recordset.length > 0 ? new Order(result.recordset[0]) : null;
     } catch (err) {
       console.error('Error getting order:', err);
-      throw err;
-    }
-  }
-
-  /**
-   * Get purchases for an order
-   * @param {number} orderId - Order ID
-   * @returns {Promise<Purchase[]>} Array of purchases
-   */
-  async getOrderPurchases(orderId) {
-    try {
-      await this.connect();
-      const stmt = this.db.prepare('SELECT * FROM purchases WHERE order_id = ? ORDER BY created_at ASC');
-      const rows = stmt.all(orderId);
-
-      return rows.map(row => new Purchase(row));
-    } catch (err) {
-      console.error('Error getting order purchases:', err);
       throw err;
     }
   }
@@ -453,15 +308,18 @@ class DatabaseService {
 
       const totalCost = cardsCount * cardValue;
 
-      const stmt = this.db.prepare(`
-        INSERT INTO orders (user_id, cards_count, card_value, total_cost, status, completed_purchases)
-        VALUES (?, ?, ?, ?, 'pending', 0)
-      `);
+      const result = await this.pool.request()
+        .input('user_id', sql.Int, userId)
+        .input('cards_count', sql.Int, cardsCount)
+        .input('card_value', sql.Decimal(5, 2), cardValue)
+        .input('total_cost', sql.Decimal(10, 2), totalCost)
+        .query(`
+          INSERT INTO orders (user_id, cards_count, card_value, total_cost, status, completed_purchases)
+          OUTPUT INSERTED.*
+          VALUES (@user_id, @cards_count, @card_value, @total_cost, 'pending', 0)
+        `);
 
-      const info = stmt.run(userId, cardsCount, cardValue, totalCost);
-
-      // Return created order
-      return await this.getOrderById(info.lastInsertRowid);
+      return new Order(result.recordset[0]);
     } catch (err) {
       console.error('Error creating order:', err);
       throw err;
@@ -478,15 +336,17 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const stmt = this.db.prepare(`
-        UPDATE orders 
-        SET status = ?
-        WHERE id = ?
-      `);
+      const result = await this.pool.request()
+        .input('id', sql.Int, orderId)
+        .input('status', sql.NVarChar(50), status)
+        .query(`
+          UPDATE orders 
+          SET status = @status
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
 
-      stmt.run(status, orderId);
-
-      return await this.getOrderById(orderId);
+      return new Order(result.recordset[0]);
     } catch (err) {
       console.error('Error updating order status:', err);
       throw err;
@@ -502,17 +362,46 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const stmt = this.db.prepare(`
-        UPDATE orders 
-        SET completed_purchases = completed_purchases + 1
-        WHERE id = ?
-      `);
+      const result = await this.pool.request()
+        .input('id', sql.Int, orderId)
+        .query(`
+          UPDATE orders 
+          SET completed_purchases = completed_purchases + 1
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
 
-      stmt.run(orderId);
-
-      return await this.getOrderById(orderId);
+      return new Order(result.recordset[0]);
     } catch (err) {
       console.error('Error incrementing order purchases:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Get purchases for an order with decrypted card details
+   * @param {number} orderId - Order ID
+   * @returns {Promise<Purchase[]>} Array of purchases with decrypted data
+   */
+  async getOrderPurchases(orderId) {
+    try {
+      await this.connect();
+      const result = await this.pool.request()
+        .input('order_id', sql.Int, orderId)
+        .query('SELECT * FROM purchases WHERE order_id = @order_id ORDER BY created_at ASC');
+
+      // Decrypt card details for each purchase
+      return result.recordset.map(row => {
+        if (row.card_serial) {
+          row.card_serial = encryption.decrypt(row.card_serial);
+        }
+        if (row.card_code) {
+          row.card_code = encryption.decrypt(row.card_code);
+        }
+        return new Purchase(row);
+      });
+    } catch (err) {
+      console.error('Error getting order purchases:', err);
       throw err;
     }
   }
@@ -539,25 +428,32 @@ class DatabaseService {
       const encryptedSerial = cardSerial ? encryption.encrypt(cardSerial) : null;
       const encryptedCode = cardCode ? encryption.encrypt(cardCode) : null;
 
-      const stmt = this.db.prepare(`
-        INSERT INTO purchases (order_id, reference_id, payment_id, card_serial, card_value, card_code)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `);
-
-      const info = stmt.run(
-        orderId,
-        referenceId,
-        paymentId,
-        encryptedSerial,
-        cardValue,
-        encryptedCode
-      );
+      const result = await this.pool.request()
+        .input('order_id', sql.Int, orderId)
+        .input('reference_id', sql.NVarChar(100), referenceId)
+        .input('payment_id', sql.NVarChar(100), paymentId)
+        .input('card_serial', sql.NVarChar(255), encryptedSerial)
+        .input('card_value', sql.Decimal(5, 2), cardValue)
+        .input('card_code', sql.NVarChar(255), encryptedCode)
+        .query(`
+          INSERT INTO purchases (order_id, reference_id, payment_id, card_serial, card_value, card_code)
+          OUTPUT INSERTED.*
+          VALUES (@order_id, @reference_id, @payment_id, @card_serial, @card_value, @card_code)
+        `);
 
       // Increment the order's completed purchases count
       await this.incrementOrderPurchases(orderId);
 
-      // Return created purchase
-      return await this.getPurchaseById(info.lastInsertRowid);
+      // Decrypt before returning
+      const purchase = result.recordset[0];
+      if (purchase.card_serial) {
+        purchase.card_serial = encryption.decrypt(purchase.card_serial);
+      }
+      if (purchase.card_code) {
+        purchase.card_code = encryption.decrypt(purchase.card_code);
+      }
+
+      return new Purchase(purchase);
     } catch (err) {
       console.error('Error creating purchase:', err);
       throw err;
@@ -572,10 +468,13 @@ class DatabaseService {
   async getPurchaseById(purchaseId) {
     try {
       await this.connect();
-      const stmt = this.db.prepare('SELECT * FROM purchases WHERE id = ?');
-      const row = stmt.get(purchaseId);
+      const result = await this.pool.request()
+        .input('id', sql.Int, purchaseId)
+        .query('SELECT * FROM purchases WHERE id = @id');
 
-      if (!row) return null;
+      if (result.recordset.length === 0) return null;
+
+      const row = result.recordset[0];
 
       // Decrypt sensitive data before returning
       if (row.card_serial) {
@@ -593,40 +492,12 @@ class DatabaseService {
   }
 
   /**
-   * Get purchases for an order with decrypted card details
-   * Override the previous method to include decryption
-   * @param {number} orderId - Order ID
-   * @returns {Promise<Purchase[]>} Array of purchases with decrypted data
-   */
-  async getOrderPurchases(orderId) {
-    try {
-      await this.connect();
-      const stmt = this.db.prepare('SELECT * FROM purchases WHERE order_id = ? ORDER BY created_at ASC');
-      const rows = stmt.all(orderId);
-
-      // Decrypt card details for each purchase
-      return rows.map(row => {
-        if (row.card_serial) {
-          row.card_serial = encryption.decrypt(row.card_serial);
-        }
-        if (row.card_code) {
-          row.card_code = encryption.decrypt(row.card_code);
-        }
-        return new Purchase(row);
-      });
-    } catch (err) {
-      console.error('Error getting order purchases:', err);
-      throw err;
-    }
-  }
-
-  /**
    * Close database connection
    */
   async close() {
-    if (this.db) {
-      this.db.close();
-      this.db = null;
+    if (this.pool) {
+      await this.pool.close();
+      this.pool = null;
       console.log('🔒 Database connection closed');
     }
   }
