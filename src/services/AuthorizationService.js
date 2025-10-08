@@ -38,7 +38,7 @@ class AuthorizationService {
    */
   async checkAuthorization(telegramUserId) {
     try {
-      const user = await databaseService.getUserByTelegramId(telegramUserId);
+      const user = await databaseService.getUserByTelegramId(telegramUserId); //! need to update (very heavy load)
 
       if (!user) {
         console.log(`🔍 Authorization check for ${telegramUserId}: DENIED (not in database)`);

@@ -11,7 +11,6 @@
 
 const sql = require('mssql');
 const { UserAccount, Order, Purchase, SubscriptionPlans } = require('../models/DatabaseModels');
-const encryption = require('../utils/encryption');
 
 class DatabaseService {
   constructor() {
@@ -84,7 +83,7 @@ class DatabaseService {
     try {
       await this.connect();
       const result = await this.pool.request()
-        .query('SELECT * FROM user_accounts ORDER BY created_at DESC');
+        .query('SELECT * FROM user_accounts ORDER BY created_at ASC');
 
       return result.recordset.map(row => new UserAccount(row));
     } catch (err) {
@@ -299,24 +298,23 @@ class DatabaseService {
    * Create new order
    * @param {number} userId - User ID
    * @param {number} cardsCount - Number of cards to purchase
-   * @param {number} cardValue - Value of each card
+   * @param {string} cardValue - Card value/name (NVARCHAR)
+   * @param {string} gameName - Game name (NVARCHAR)
    * @returns {Promise<Order>} Created order
    */
-  async createOrder(userId, cardsCount, cardValue) {
+  async createOrder(userId, cardsCount, cardValue, gameName = null) {
     try {
       await this.connect();
-
-      const totalCost = cardsCount * cardValue;
 
       const result = await this.pool.request()
         .input('user_id', sql.Int, userId)
         .input('cards_count', sql.Int, cardsCount)
-        .input('card_value', sql.Decimal(5, 2), cardValue)
-        .input('total_cost', sql.Decimal(10, 2), totalCost)
+        .input('card_value', sql.NVarChar(100), cardValue)
+        .input('game_name', sql.NVarChar(100), gameName)
         .query(`
-          INSERT INTO orders (user_id, cards_count, card_value, total_cost, status, completed_purchases)
+          INSERT INTO orders (user_id, cards_count, card_value, game_name, status, completed_purchases)
           OUTPUT INSERTED.*
-          VALUES (@user_id, @cards_count, @card_value, @total_cost, 'pending', 0)
+          VALUES (@user_id, @cards_count, @card_value, @game_name, 'pending', 0)
         `);
 
       return new Order(result.recordset[0]);
@@ -379,9 +377,9 @@ class DatabaseService {
   }
 
   /**
-   * Get purchases for an order with decrypted card details
+   * Get purchases for an order
    * @param {number} orderId - Order ID
-   * @returns {Promise<Purchase[]>} Array of purchases with decrypted data
+   * @returns {Promise<Purchase[]>} Array of purchases (transaction_id only)
    */
   async getOrderPurchases(orderId) {
     try {
@@ -390,16 +388,7 @@ class DatabaseService {
         .input('order_id', sql.Int, orderId)
         .query('SELECT * FROM purchases WHERE order_id = @order_id ORDER BY created_at ASC');
 
-      // Decrypt card details for each purchase
-      return result.recordset.map(row => {
-        if (row.card_serial) {
-          row.card_serial = encryption.decrypt(row.card_serial);
-        }
-        if (row.card_code) {
-          row.card_code = encryption.decrypt(row.card_code);
-        }
-        return new Purchase(row);
-      });
+      return result.recordset.map(row => new Purchase(row));
     } catch (err) {
       console.error('Error getting order purchases:', err);
       throw err;
@@ -407,86 +396,26 @@ class DatabaseService {
   }
 
   /**
-   * Create new purchase with encrypted card details
-   * @param {Object} purchaseData - Purchase data
+   * Create purchase with transaction ID only (no pin data in database)
+   * @param {Object} purchaseData - Purchase data {orderId}
    * @returns {Promise<Purchase>} Created purchase
    */
-  async createPurchase(purchaseData) {
+  async createPurchaseTransaction({ orderId, transactionId }) {
     try {
       await this.connect();
-
-      const {
-        orderId,
-        referenceId,
-        paymentId,
-        cardSerial,
-        cardValue,
-        cardCode
-      } = purchaseData;
-
-      // Encrypt sensitive card data before storing
-      const encryptedSerial = cardSerial ? encryption.encrypt(cardSerial) : null;
-      const encryptedCode = cardCode ? encryption.encrypt(cardCode) : null;
 
       const result = await this.pool.request()
         .input('order_id', sql.Int, orderId)
-        .input('reference_id', sql.NVarChar(100), referenceId)
-        .input('payment_id', sql.NVarChar(100), paymentId)
-        .input('card_serial', sql.NVarChar(255), encryptedSerial)
-        .input('card_value', sql.Decimal(5, 2), cardValue)
-        .input('card_code', sql.NVarChar(255), encryptedCode)
+        .input('transaction_id', sql.NVarChar(100), transactionId)
         .query(`
-          INSERT INTO purchases (order_id, reference_id, payment_id, card_serial, card_value, card_code)
+          INSERT INTO purchases (order_id, transaction_id)
           OUTPUT INSERTED.*
-          VALUES (@order_id, @reference_id, @payment_id, @card_serial, @card_value, @card_code)
+          VALUES (@order_id, @transaction_id)
         `);
 
-      // Increment the order's completed purchases count
-      await this.incrementOrderPurchases(orderId);
-
-      // Decrypt before returning
-      const purchase = result.recordset[0];
-      if (purchase.card_serial) {
-        purchase.card_serial = encryption.decrypt(purchase.card_serial);
-      }
-      if (purchase.card_code) {
-        purchase.card_code = encryption.decrypt(purchase.card_code);
-      }
-
-      return new Purchase(purchase);
+      return new Purchase(result.recordset[0]);
     } catch (err) {
-      console.error('Error creating purchase:', err);
-      throw err;
-    }
-  }
-
-  /**
-   * Get purchase by ID with decrypted card details
-   * @param {number} purchaseId - Purchase ID
-   * @returns {Promise<Purchase|null>} Purchase with decrypted card details
-   */
-  async getPurchaseById(purchaseId) {
-    try {
-      await this.connect();
-      const result = await this.pool.request()
-        .input('id', sql.Int, purchaseId)
-        .query('SELECT * FROM purchases WHERE id = @id');
-
-      if (result.recordset.length === 0) return null;
-
-      const row = result.recordset[0];
-
-      // Decrypt sensitive data before returning
-      if (row.card_serial) {
-        row.card_serial = encryption.decrypt(row.card_serial);
-      }
-      if (row.card_code) {
-        row.card_code = encryption.decrypt(row.card_code);
-      }
-
-      return new Purchase(row);
-    } catch (err) {
-      console.error('Error getting purchase:', err);
+      console.error('Error creating purchase transaction:', err);
       throw err;
     }
   }

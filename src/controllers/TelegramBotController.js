@@ -16,6 +16,7 @@ const sessionManager = require('../services/SessionManager');
 const scraperService = require('../services/RazerScraperService');
 const adminService = require('../services/AdminService');
 const userService = require('../services/UserService');
+const orderFlowHandler = require('./OrderFlowHandler');
 
 class TelegramBotController {
   constructor() {
@@ -125,7 +126,7 @@ class TelegramBotController {
    */
   async showUserDashboard(chatId, user) {
     try {
-      const subInfo = await userService.getUserSubscriptionInfo(user.id);
+      const subInfo = await userService.getUserSubscriptionInfo(user);
 
       const message =
         `👋 **Welcome, ${user.username}!**\n\n` +
@@ -194,7 +195,8 @@ class TelegramBotController {
           });
         }
         await this.handleAdminCallback(chatId, callbackData, query.id, user);
-      } else if (callbackData.startsWith('user_')) {
+      } else if (callbackData.startsWith('user_') || callbackData.startsWith('order_') || callbackData === 'card_disabled') {
+        // Route user_ and order_ callbacks to user handler
         await this.handleUserCallback(chatId, callbackData, query.id, user);
       } else {
         // Generic callbacks (login, etc)
@@ -261,8 +263,31 @@ class TelegramBotController {
         break;
 
       case 'user_create_order':
-        this.bot.sendMessage(chatId, '📦 Create Order feature coming soon!');
-        this.bot.answerCallbackQuery(queryId);
+        // Answer callback query IMMEDIATELY
+        try {
+          await this.bot.answerCallbackQuery(queryId);
+        } catch (err) {
+          console.log('⚠️ Could not answer callback query (may be too old)');
+        }
+
+        // ⭐ Check if user is logged in
+        const session = sessionManager.getSession(chatId);
+
+        if (!session || !session.page) {
+          const keyboard = {
+            inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
+          };
+
+          return this.bot.sendMessage(
+            chatId,
+            '⚠️ You must login first to create orders.',
+            { reply_markup: keyboard }
+          );
+        }
+
+        // ⭐ Initialize order flow
+        orderFlowHandler.initSession(chatId);
+        await orderFlowHandler.showGameSelection(this.bot, chatId);
         break;
 
       case 'user_my_orders':
@@ -276,7 +301,86 @@ class TelegramBotController {
         break;
 
       default:
-        this.bot.answerCallbackQuery(queryId);
+        // ⭐ Handle order flow callbacks
+        if (callbackData.startsWith('order_game_')) {
+          // Answer callback query IMMEDIATELY
+          try {
+            await this.bot.answerCallbackQuery(queryId);
+          } catch (err) {
+            console.log('⚠️ Could not answer callback query (may be too old)');
+          }
+
+          // Check if user is still logged in
+          const session = sessionManager.getSession(chatId);
+          if (!session || !session.page) {
+            const keyboard = {
+              inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
+            };
+            return this.bot.sendMessage(
+              chatId,
+              '⚠️ Your session expired. Please login again.',
+              { reply_markup: keyboard }
+            );
+          }
+
+          const gameId = callbackData.replace('order_game_', '');
+          console.log(`📞 Order game callback received: ${gameId}`);
+          await orderFlowHandler.handleGameSelection(this.bot, chatId, gameId, user);
+        } else if (callbackData.startsWith('order_card_')) {
+          // Answer callback query IMMEDIATELY
+          try {
+            await this.bot.answerCallbackQuery(queryId);
+          } catch (err) {
+            console.log('⚠️ Could not answer callback query (may be too old)');
+          }
+
+          // Check if user is still logged in
+          const session = sessionManager.getSession(chatId);
+          if (!session || !session.page) {
+            const keyboard = {
+              inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
+            };
+            return this.bot.sendMessage(
+              chatId,
+              '⚠️ Your session expired. Please login again.',
+              { reply_markup: keyboard }
+            );
+          }
+
+          const parts = callbackData.replace('order_card_', '').split('_');
+          const cardIndex = parts[0];
+          const cardName = parts.slice(1).join('_');
+          console.log(`📞 Order card callback received: ${cardIndex} - ${cardName}`);
+          await orderFlowHandler.handleCardSelection(this.bot, chatId, cardIndex, cardName);
+        } else if (callbackData === 'order_cancel') {
+          console.log(`📞 Order cancel callback received`);
+          try {
+            await this.bot.answerCallbackQuery(queryId);
+          } catch (err) {
+            console.log('⚠️ Could not answer callback query (may be too old)');
+          }
+          await orderFlowHandler.handleCancel(this.bot, chatId);
+        } else if (callbackData === 'order_back_to_games') {
+          console.log(`📞 Order back callback received`);
+          try {
+            await this.bot.answerCallbackQuery(queryId);
+          } catch (err) {
+            console.log('⚠️ Could not answer callback query (may be too old)');
+          }
+          await orderFlowHandler.handleBack(this.bot, chatId);
+        } else if (callbackData === 'card_disabled') {
+          this.bot.answerCallbackQuery(queryId, {
+            text: 'This card is out of stock. Bot will wait for restock automatically.',
+            show_alert: true
+          });
+        } else {
+          console.log(`❓ Unknown callback: ${callbackData}`);
+          try {
+            await this.bot.answerCallbackQuery(queryId);
+          } catch (err) {
+            console.log('⚠️ Could not answer callback query (may be too old)');
+          }
+        }
     }
   }
 
@@ -330,7 +434,7 @@ class TelegramBotController {
    * Shows remaining attempts for user
    */
   async handleShowAttempts(chatId, user) {
-    const subInfo = await userService.getUserSubscriptionInfo(user.id);
+    const subInfo = await userService.getUserSubscriptionInfo(user);
     const message =
       `⚡ **Remaining Attempts**\n\n` +
       `Plan: ${subInfo.planDisplay}\n` +
@@ -372,10 +476,16 @@ class TelegramBotController {
   async handleCheckBalanceButton(chatId, queryId) {
     const session = sessionManager.getSession(chatId);
 
+    // Answer callback query IMMEDIATELY to stop loading spinner
+    try {
+      await this.bot.answerCallbackQuery(queryId);
+    } catch (err) {
+      // Ignore if query is already answered or too old
+      console.log('⚠️ Could not answer callback query (may be too old)');
+    }
+
     // Verify user has an active browser session
     if (!session || !session.page) {
-      this.bot.answerCallbackQuery(queryId);
-
       const keyboard = {
         inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
       };
@@ -391,8 +501,15 @@ class TelegramBotController {
     this.bot.sendMessage(chatId, '⏳ Checking your balance...');
 
     try {
-      // Call scraper service to get balance
-      const balance = await scraperService.getBalance(session.page);
+      // Get user from database for browser session management
+      const authResult = await authService.checkAuthorization(chatId);
+      if (!authResult.authorized) {
+        throw new Error('User not authorized');
+      }
+      const user = authResult.user;
+
+      // Call scraper service to get balance (pass user.id for browser management)
+      const balance = await scraperService.getBalance(user.id, session.page);
 
       // Send balance information to user
       this.bot.sendMessage(
@@ -418,9 +535,6 @@ class TelegramBotController {
       // Clear browser session on error
       await sessionManager.clearBrowserSession(chatId);
     }
-
-    // Acknowledge the button click
-    this.bot.answerCallbackQuery(queryId);
   }
 
   /**
@@ -459,6 +573,17 @@ class TelegramBotController {
           await this.handleEmailInput(chatId, text);
         } else if (session.state === 'awaiting_password') {
           await this.handlePasswordInput(chatId, text);
+        }
+      }
+
+      // ⭐ NEW: Handle order flow text input
+      const orderSession = orderFlowHandler.getSession(chatId);
+      if (orderSession) {
+        if (orderSession.step === 'enter_quantity') {
+          await orderFlowHandler.handleQuantityInput(this.bot, chatId, text);
+        } else if (orderSession.step === 'enter_backup_code') {
+          const telegramUserId = msg.from.id;
+          await orderFlowHandler.handleBackupCodeInput(this.bot, chatId, user, text);
         }
       }
     } catch (err) {
@@ -633,11 +758,19 @@ class TelegramBotController {
     sessionManager.setPassword(chatId, password.trim());
 
     // Inform user that login is in progress
-    this.bot.sendMessage(chatId, '⏳ Logging in to Razer...');
+    const logginMessage = this.bot.sendMessage(chatId, '⏳ Logging in to Razer...');
 
     try {
-      // Attempt login using scraper service
+      // Get user from database for browser session management
+      const authResult = await authService.checkAuthorization(chatId);
+      if (!authResult.authorized) {
+        throw new Error('User not authorized');
+      }
+      const user = authResult.user;
+
+      // Attempt login using scraper service (pass user.id for browser management)
       const { browser, page } = await scraperService.login(
+        user.id,  // User ID for browser session
         session.email,
         session.password
       );
@@ -647,14 +780,10 @@ class TelegramBotController {
       sessionManager.updateState(chatId, 'logged_in');
 
       // Inform user of success and show balance check button
+      this.bot.deleteMessage(chatId, (await logginMessage).message_id);
       this.bot.sendMessage(
         chatId,
         '✅ Logged in successfully!',
-        {
-          reply_markup: {
-            inline_keyboard: [[{ text: '💰 Check Balance', callback_data: 'check_balance' }]]
-          }
-        }
       );
     } catch (err) {
       // Handle login failure

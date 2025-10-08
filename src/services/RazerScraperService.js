@@ -7,34 +7,31 @@
  * Following Single Responsibility Principle (SRP):
  * - Only handles Razer website scraping logic
  * - No bot logic or session management
+ * - Uses BrowserManager for persistent browser instances
  */
 
-const puppeteer = require('puppeteer');
+const browserManager = require('./BrowserManager');
 
 class RazerScraperService {
   constructor() {
-    // Razer website URLs
+    //* Razer website URLs
     this.LOGIN_URL = 'https://razerid.razer.com';
     this.DASHBOARD_URL = 'https://razerid.razer.com/dashboard';
     this.DEFAULT_TIMEOUT = 30000; // 30 seconds
   }
 
   /**
-   * Logs into Razer account using provided credentials
+   //* Logs into Razer account using provided credentials
    * 
+   * @param {number} userId - User ID (for browser management)
    * @param {string} email - User's Razer account email
    * @param {string} password - User's Razer account password
    * @returns {Promise<{browser: Browser, page: Page}>} Browser and page instances
    * @throws {Error} If login fails
    */
-  async login(email, password) {
-    // Launch a headless browser (runs in background without GUI)
-    const browser = await puppeteer.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox'] // Security flags for server environments
-    });
-
-    // Create a new page (tab) in the browser
-    const page = await browser.newPage();
+  async login(userId, email, password) {
+    // Get or create browser for this user
+    const { browser, page } = await browserManager.getBrowser(userId);
     page.setDefaultTimeout(this.DEFAULT_TIMEOUT);
 
     try {
@@ -60,35 +57,35 @@ class RazerScraperService {
         await page.click('button[type="submit"]');
       await Promise.all([
         page.click('button[type="submit"]'),
-        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 120000 })
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
       ]);
 
       // Verify login success by checking if we're on the dashboard
       const currentUrl = page.url();
       if (currentUrl !== "https://razerid.razer.com" && currentUrl !== "https://razerid.razer.com/") {
         console.log('✅ Login successful!');
+        browserManager.updateActivity(userId);
         return { browser, page };
       } else {
-        // Login failed - close browser and throw error
-        await browser.close();
+        // Login failed - throw error (don't close browser, might be reused)
         throw new Error('Login failed');
       }
     } catch (err) {
-      // Cleanup: close browser if something went wrong
+      // Don't close browser on error - let user retry
       console.error('❌ Login error:', err.message);
-      await browser.close();
       throw err;
     }
   }
 
   /**
-   * Retrieves the Gold and Silver balance from Razer dashboard
+   //* Retrieves the Gold and Silver balance from Razer dashboard
    * 
+   * @param {number} userId - User ID (for browser management)
    * @param {Page} page - Puppeteer page instance (must be logged in)
    * @returns {Promise<{gold: string, silver: string}>} Balance information
    * @throws {Error} If balance retrieval fails
    */
-  async getBalance(page) {
+  async getBalance(userId, page) {
     try {
       // Navigate to dashboard page
       console.log('🛍️ Navigating to dashboard...');
@@ -110,6 +107,7 @@ class RazerScraperService {
       });
 
       console.log('✅ Balance retrieved:', balance);
+      browserManager.updateActivity(userId);
       return balance;
     } catch (err) {
       console.error('❌ Failed to get balance:', err.message);
@@ -118,15 +116,12 @@ class RazerScraperService {
   }
 
   /**
-   * Closes the browser instance
+   //* Closes the browser instance for a user
    * 
-   * @param {Browser} browser - Puppeteer browser instance to close
+   * @param {number} userId - User ID
    */
-  async closeBrowser(browser) {
-    if (browser) {
-      await browser.close();
-      console.log('🔒 Browser closed');
-    }
+  async closeBrowser(userId) {
+    await browserManager.closeBrowser(userId);
   }
 }
 

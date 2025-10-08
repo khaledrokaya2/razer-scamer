@@ -15,17 +15,11 @@ class UserService {
 
   /**
    * Get user's current subscription info
-   * @param {number} userId - User ID
+   * @param {User} user - User
    * @returns {Promise<Object>} Subscription information
    */
-  async getUserSubscriptionInfo(userId) {
+  async getUserSubscriptionInfo(user) {
     try {
-      const user = await databaseService.getUserById(userId);
-
-      if (!user) {
-        throw new Error('User not found');
-      }
-
       const isActive = user.hasActiveSubscription();
       const expirationDate = user.SubscriptionExpiresAt
         ? new Date(user.SubscriptionExpiresAt).toLocaleDateString('en-US', {
@@ -45,77 +39,6 @@ class UserService {
       };
     } catch (err) {
       console.error('Error getting subscription info:', err);
-      throw err;
-    }
-  }
-
-  /**
-   * Check if user can create an order (has attempts remaining)
-   * @param {number} userId - User ID
-   * @returns {Promise<{canOrder: boolean, reason: string}>}
-   */
-  async canCreateOrder(userId) {
-    try {
-      const user = await databaseService.getUserById(userId);
-
-      if (!user) {
-        return { canOrder: false, reason: 'User not found' };
-      }
-
-      // Free users cannot create orders
-      if (user.SubscriptionType === 'free') {
-        return {
-          canOrder: false,
-          reason: 'Free plan users cannot create orders. Please upgrade your subscription.'
-        };
-      }
-
-      // Check subscription expiration
-      if (!user.hasActiveSubscription()) {
-        return {
-          canOrder: false,
-          reason: 'Your subscription has expired. Please contact an administrator.'
-        };
-      }
-
-      // Check attempts
-      if (user.AllowedAttempts <= 0) {
-        return {
-          canOrder: false,
-          reason: 'You have no attempts remaining today. Your attempts will reset on subscription renewal.'
-        };
-      }
-
-      return { canOrder: true, reason: 'OK' };
-    } catch (err) {
-      console.error('Error checking order eligibility:', err);
-      return { canOrder: false, reason: 'System error' };
-    }
-  }
-
-  /**
-   * Create a new order for user
-   * @param {number} userId - User ID
-   * @returns {Promise<string>} Success message
-   */
-  async createOrder(userId) {
-    try {
-      // Check if user can create order
-      const eligibility = await this.canCreateOrder(userId);
-
-      if (!eligibility.canOrder) {
-        throw new Error(eligibility.reason);
-      }
-
-      // Decrement attempts
-      await databaseService.decrementUserAttempts(userId);
-
-      // TODO: Implement actual order creation logic
-      // This will be implemented when integrating with Razer purchase system
-
-      return 'Order creation functionality will be implemented soon.';
-    } catch (err) {
-      console.error('Error creating order:', err);
       throw err;
     }
   }
@@ -175,18 +98,16 @@ class UserService {
     const statusIcon = subscriptionInfo.isActive ? '✅' : '❌';
 
     return `
-╔═══════════════════════════════════════╗
-║      YOUR SUBSCRIPTION PLAN           ║
-╚═══════════════════════════════════════╝
+✨YOUR SUBSCRIPTION PLAN✨
 
 📊 **Plan Details**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     ━━━━━━━━━━━━━
 ${subscriptionInfo.planDisplay}
 Status: ${statusIcon} ${subscriptionInfo.isActive ? 'Active' : 'Expired'}
 Expires: ${subscriptionInfo.expiresAt}
 
 ⚡ **Usage Information**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     ━━━━━━━━━━━━━━━━━━
 Remaining Attempts Today: **${subscriptionInfo.attemptsRemaining}**
 
 ${subscriptionInfo.plan === 'free'
@@ -241,38 +162,6 @@ ${order.isCompleted()
         ? '✅ Order completed successfully!'
         : '⏳ Order is being processed...'}
     `.trim();
-  }
-
-  /**
-   * Format order pins for display
-   * @param {Purchase[]} purchases - Array of purchases
-   * @returns {string} Formatted message
-   */
-  formatOrderPins(purchases) {
-    if (purchases.length === 0) {
-      return '📭 No purchases found for this order.';
-    }
-
-    let message = '🎫 **ORDER PINS**\n\n';
-
-    purchases.forEach((purchase, index) => {
-      if (purchase.hasCardDetails()) {
-        message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        message += `**Card #${index + 1}**\n`;
-        message += `• Serial: \`${purchase.card_serial}\`\n`;
-        message += `• Code: \`${purchase.card_code}\`\n`;
-        message += `• Value: $${purchase.card_value}\n`;
-        message += `• Payment ID: \`${purchase.payment_id || 'N/A'}\`\n`;
-      } else {
-        message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        message += `**Card #${index + 1}**: ⏳ Processing...\n`;
-      }
-    });
-
-    message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-    message += `\n💡 **Tip**: Copy the codes by tapping them.`;
-
-    return message;
   }
 }
 

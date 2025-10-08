@@ -76,8 +76,8 @@ class Order {
     this.cards_count = data.cards_count;
     this.status = data.status || 'pending';
     this.created_at = data.created_at;
+    this.game_name = data.game_name;
     this.completed_purchases = data.completed_purchases || 0;
-    this.total_cost = data.total_cost;
     this.card_value = data.card_value;
   }
 
@@ -112,24 +112,15 @@ class Order {
 /**
  * Purchase Model
  * Represents a single card purchase within an order
+ * NOTE: Only stores transaction_id and order_id - NO PIN DATA
  */
 class Purchase {
   constructor(data) {
-    this.id = data.id;
+    this.transaction_id = data.transaction_id;  // RENAMED from id
     this.order_id = data.order_id;
-    this.reference_id = data.reference_id;
-    this.payment_id = data.payment_id;
     this.created_at = data.created_at;
-    this.card_serial = data.card_serial;
-    this.card_value = data.card_value;
-    this.card_code = data.card_code;
-  }
-
-  /**
-   * Check if card details are available
-   */
-  hasCardDetails() {
-    return !!(this.card_serial && this.card_code);
+    // NO card_serial, card_code, reference_id, payment_id
+    // Pin data stored in memory only for security
   }
 }
 
