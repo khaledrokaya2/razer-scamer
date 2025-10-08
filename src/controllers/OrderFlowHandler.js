@@ -151,7 +151,7 @@ class OrderFlowHandler {
       const keyboard = cards.map((card, index) => [
         {
           text: card.disabled ? `❌ ${card.name} (Out of Stock)` : `✅ ${card.name}`,
-          callback_data: card.disabled ? 'card_disabled' : `order_card_${index}_${card.name.replace(/\s+/g, '_')}`
+          callback_data: `order_card_${index}_${card.name.replace(/\s+/g, '_')}`
         }
       ]);
 
