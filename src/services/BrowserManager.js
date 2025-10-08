@@ -61,7 +61,6 @@ class BrowserManager {
 
     const browser = await puppeteer.launch({
       headless: !isDevelopment,
-      devtools: isDevelopment,
       slowMo: 0,
       args: [
         '--no-sandbox',
