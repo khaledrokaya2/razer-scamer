@@ -17,6 +17,148 @@ class OrderFlowHandler {
   constructor() {
     // Session data for order creation flow
     this.orderSessions = new Map(); // chatId -> {step, gameId, cardIndex, cardName, quantity}
+    // Track cancellation requests
+    this.cancellationRequests = new Set();
+  }
+
+  /**
+   * Create visual progress bar
+   * @param {number} completed - Completed items
+   * @param {number} total - Total items
+   * @returns {string} Progress bar string
+   */
+  createProgressBar(completed, total) {
+    const percentage = completed / total;
+    const barLength = 15;
+    const filledLength = Math.round(barLength * percentage);
+    const emptyLength = barLength - filledLength;
+
+    const filledBar = '█'.repeat(filledLength);
+    const emptyBar = '░'.repeat(emptyLength);
+
+    return `[${filledBar}${emptyBar}]`;
+  }
+
+  /**
+   * Check if order is cancelled
+   * @param {number} chatId - Chat ID
+   * @returns {boolean} True if cancelled
+   */
+  isCancelled(chatId) {
+    return this.cancellationRequests.has(chatId);
+  }
+
+  /**
+   * Mark order as cancelled
+   * @param {number} chatId - Chat ID
+   */
+  markAsCancelled(chatId) {
+    this.cancellationRequests.add(chatId);
+  }
+
+  /**
+   * Clear cancellation flag
+   * @param {number} chatId - Chat ID
+   */
+  clearCancellation(chatId) {
+    this.cancellationRequests.delete(chatId);
+  }
+
+  /**
+   * Map technical errors to user-friendly messages (UX FIX #17)
+   */
+  getUserFriendlyError(error) {
+    const errorMessage = error.message || '';
+
+    if (errorMessage.includes('Invalid backup code') || errorMessage.includes('incorrect')) {
+      return `╔═══════════════════════╗\n` +
+        `     ❌ *ERROR*     \n` +
+        `╚═══════════════════════╝\n\n` +
+        `*Invalid Backup Code*\n\n` +
+        `The backup code you entered\n` +
+        `is incorrect.\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `🔑 Please start a new order\n` +
+        `   and enter a valid 8-digit\n` +
+        `   backup code from your\n` +
+        `   Razer account.\n\n` +
+        `Use /start to try again.`;
+    }
+
+    if (errorMessage.includes('Insufficient Razer Gold balance')) {
+      return `╔═══════════════════════╗\n` +
+        `     ❌ *ERROR*     \n` +
+        `╚═══════════════════════╝\n\n` +
+        `*Insufficient Balance*\n\n` +
+        `Your Razer Gold balance\n` +
+        `is too low for this purchase.\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `💰 Please reload your Razer\n` +
+        `   Gold account and try again.\n\n` +
+        `Use /start to create a new order.`;
+    }
+
+    if (errorMessage.includes('out of stock') && errorMessage.includes('retrying')) {
+      return `╔═══════════════════════╗\n` +
+        `    ⏳ *AUTO-RETRY*    \n` +
+        `╚═══════════════════════╝\n\n` +
+        `Card went out of stock\n` +
+        `during purchase.\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `🔄 The bot is monitoring\n` +
+        `   stock and will automatically\n` +
+        `   retry when available.\n\n` +
+        `_Please wait..._`;
+    }
+
+    if (errorMessage.includes('out of stock')) {
+      return `╔═══════════════════════╗\n` +
+        `  ⚠️ *OUT OF STOCK*   \n` +
+        `╚═══════════════════════╝\n\n` +
+        `This card is currently\n` +
+        `unavailable.\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `⏱️ The bot will automatically\n` +
+        `   wait and purchase when it\n` +
+        `   becomes available.\n\n` +
+        `_Monitoring stock..._`;
+    }
+
+    if (errorMessage.includes('No active browser session')) {
+      return `╔═══════════════════════╗\n` +
+        `  ⚠️ *SESSION EXPIRED* \n` +
+        `╚═══════════════════════╝\n\n` +
+        `Your login session has\n` +
+        `timed out.\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `🔐 Please login again using\n` +
+        `   the /start command.`;
+    }
+
+    if (errorMessage.includes('Too many consecutive failures')) {
+      return `╔═══════════════════════╗\n` +
+        `     ❌ *ERROR*     \n` +
+        `╚═══════════════════════╝\n\n` +
+        `*Multiple Failures*\n\n` +
+        `The purchase process failed\n` +
+        `multiple times in a row.\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `🔄 Please try again later or\n` +
+        `   contact support if the issue\n` +
+        `   persists.\n\n` +
+        `Use /start to try again.`;
+    }
+
+    // Default error message
+    return `╔═══════════════════════╗\n` +
+      `     ❌ *ERROR*     \n` +
+      `╚═══════════════════════╝\n\n` +
+      `*Order Failed*\n\n` +
+      `${errorMessage}\n\n` +
+      `${'─'.repeat(30)}\n\n` +
+      `Please try again or contact\n` +
+      `support if the problem persists.\n\n` +
+      `Use /start to try again.`;
   }
 
   /**
@@ -93,14 +235,88 @@ class OrderFlowHandler {
       keyboard.push(row);
     }
 
-    await bot.sendMessage(chatId,
-      '🎮 *Select a Game*\n\n' +
-      'Choose the game you want to purchase cards for:',
-      {
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: keyboard }
-      }
-    );
+    // UX FIX #15: Add cancel button
+    keyboard.push([{ text: '❌ Cancel Order', callback_data: 'order_cancel' }]);
+
+    try {
+      await bot.sendMessage(chatId,
+        `╔═══════════════════════╗\n` +
+        `    🎮 *SELECT GAME*    \n` +
+        `╚═══════════════════════╝\n\n` +
+        `Choose the game you want to\n` +
+        `purchase cards for:\n\n` +
+        `${'─'.repeat(30)}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: keyboard }
+        }
+      );
+    } catch (err) {
+      console.error('Error showing game selection:', err);
+    }
+  }
+
+  /**
+   * Handle cancel order (UX FIX #15)
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   */
+  async handleCancel(bot, chatId) {
+    this.clearSession(chatId);
+    this.clearCancellation(chatId);
+    try {
+      await bot.sendMessage(chatId,
+        `╔═══════════════════════╗\n` +
+        `   ❌ *ORDER CANCELLED*   \n` +
+        `╚═══════════════════════╝\n\n` +
+        `Your order has been cancelled.\n\n` +
+        `Use /start to create a new order.`
+        , { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('Error sending cancel message:', err);
+    }
+  }
+
+  /**
+   * Handle cancel during processing
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   */
+  async handleCancelProcessing(bot, chatId) {
+    // Mark as cancelled
+    this.markAsCancelled(chatId);
+
+    try {
+      await bot.sendMessage(chatId,
+        `╔═══════════════════════╗\n` +
+        `  🛑 *CANCELLING ORDER*  \n` +
+        `╚═══════════════════════╝\n\n` +
+        `⏳ Stopping the purchase process...\n\n` +
+        `_Please wait for current operation_\n` +
+        `_to complete safely._`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('Error sending cancelling message:', err);
+    }
+  }
+
+  /**
+   * Handle back to games (UX FIX #15)
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   */
+  async handleBack(bot, chatId) {
+    const session = this.getSession(chatId);
+    if (session) {
+      session.step = 'select_game';
+      session.gameId = null;
+      session.gameName = null;
+      session.gameUrl = null;
+      session.cardIndex = null;
+      session.cardName = null;
+    }
+    await this.showGameSelection(bot, chatId);
   }
 
   /**
@@ -132,8 +348,13 @@ class OrderFlowHandler {
 
     // Show loading message
     const loadingMsg = await bot.sendMessage(chatId,
-      `🔄 Loading ${game.name} cards...\n\n` +
-      'Please wait while we fetch available cards...'
+      `╔═══════════════════════╗\n` +
+      `   🔄 *LOADING CARDS*    \n` +
+      `╚═══════════════════════╝\n\n` +
+      `⏳ *${game.name}*\n\n` +
+      `Fetching available cards...\n` +
+      `_Please wait..._`,
+      { parse_mode: 'Markdown' }
     );
 
     try {
@@ -144,8 +365,12 @@ class OrderFlowHandler {
 
       console.log(`✅ Found ${cards.length} cards`);
 
-      // Delete loading message
-      await bot.deleteMessage(chatId, loadingMsg.message_id);
+      // PERFORMANCE FIX #7: Better error handling around message deletion
+      try {
+        await bot.deleteMessage(chatId, loadingMsg.message_id);
+      } catch (delErr) {
+        console.log('⚠️ Could not delete loading message (may already be deleted)');
+      }
 
       // Create keyboard with card options
       const keyboard = cards.map((card, index) => [
@@ -155,10 +380,22 @@ class OrderFlowHandler {
         }
       ]);
 
+      // UX FIX #15: Add back and cancel buttons
+      keyboard.push([
+        { text: '⬅️ Back to Games', callback_data: 'order_back_to_games' },
+        { text: '❌ Cancel', callback_data: 'order_cancel' }
+      ]);
+
       await bot.sendMessage(chatId,
-        `🎮 *${game.name}*\n\n` +
-        '💎 *Select Card Value:*\n\n' +
-        '_Out of stock cards will be monitored and purchased when available_',
+        `╔═══════════════════════╗\n` +
+        `  💎 *SELECT CARD VALUE* \n` +
+        `╚═══════════════════════╝\n\n` +
+        `🎮 *Game:* ${game.name}\n\n` +
+        `Choose a card denomination:\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `_Out of stock cards will be_\n` +
+        `_monitored and auto-purchased_\n` +
+        `_when available._`,
         {
           parse_mode: 'Markdown',
           reply_markup: { inline_keyboard: keyboard }
@@ -169,15 +406,26 @@ class OrderFlowHandler {
       console.error(`❌ Error loading cards for ${game.name}:`, err.message);
       console.error(err.stack);
 
+      // PERFORMANCE FIX #7: Safe message deletion
       try {
         await bot.deleteMessage(chatId, loadingMsg.message_id);
       } catch (delErr) {
-        console.error('Failed to delete loading message:', delErr.message);
+        console.log('⚠️ Could not delete loading message');
       }
 
       await bot.sendMessage(chatId,
-        `❌ Failed to load cards: ${err.message}\n\n` +
-        'Please try again later or contact support.'
+        `╔═══════════════════════╗\n` +
+        `     ❌ *ERROR*     \n` +
+        `╚═══════════════════════╝\n\n` +
+        `Failed to load available cards.\n\n` +
+        `📋 *Reason:*\n` +
+        `${err.message}\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `Please try again later or\n` +
+        `contact support if the issue\n` +
+        `persists.\n\n` +
+        `Use /start to try again.`,
+        { parse_mode: 'Markdown' }
       );
       this.clearSession(chatId);
     }
@@ -194,7 +442,18 @@ class OrderFlowHandler {
     const session = this.getSession(chatId);
 
     if (!session) {
-      await bot.sendMessage(chatId, '❌ Session expired. Please start over.');
+      try {
+        await bot.sendMessage(chatId,
+          `╔═══════════════════════╗\n` +
+          `  ⚠️ *SESSION EXPIRED*  \n` +
+          `╚═══════════════════════╝\n\n` +
+          `Your session has timed out.\n\n` +
+          `Use /start to create a new order.`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        console.error('Error sending session expired message:', err);
+      }
       return;
     }
 
@@ -206,14 +465,25 @@ class OrderFlowHandler {
     });
 
     // Ask for quantity
-    await bot.sendMessage(chatId,
-      `*${cardName.replace(/_/g, ' ')}*\n\n` +
-      '📦 *How many cards do you want to purchase?*\n\n' +
-      'Enter a number between *1* and *100*:',
-      {
-        parse_mode: 'Markdown',
-      }
-    );
+    try {
+      await bot.sendMessage(chatId,
+        `╔═══════════════════════╗\n` +
+        `  📦 *ENTER QUANTITY*   \n` +
+        `╚═══════════════════════╝\n\n` +
+        `💎 *Selected Card:*\n` +
+        `     ${cardName.replace(/_/g, ' ')}\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `How many cards do you want\n` +
+        `to purchase?\n\n` +
+        `📊 *Valid range:* 1 - 100\n\n` +
+        `_Type a number or /start to cancel_`,
+        {
+          parse_mode: 'Markdown',
+        }
+      );
+    } catch (err) {
+      console.error('Error sending quantity prompt:', err);
+    }
   }
 
   /**
@@ -233,7 +503,13 @@ class OrderFlowHandler {
 
     if (isNaN(quantity) || quantity < 1 || quantity > 100) {
       await bot.sendMessage(chatId,
-        '❌ Invalid quantity. Please enter a number between 1 and 100.'
+        `╔═══════════════════════╗\n` +
+        `   ⚠️ *INVALID INPUT*    \n` +
+        `╚═══════════════════════╝\n\n` +
+        `Please enter a valid number\n` +
+        `between *1* and *100*.\n\n` +
+        `_Try again or /start to cancel_`,
+        { parse_mode: 'Markdown' }
       );
       return;
     }
@@ -246,10 +522,18 @@ class OrderFlowHandler {
 
     // Ask for backup code
     await bot.sendMessage(chatId,
-      `✅ Quantity: *${quantity} cards*\n\n` +
-      '🔐 *Enter your 2FA Backup Code*\n\n' +
-      'Please enter an 8-digit backup code from your Razer account:\n\n' +
-      '_(Example: 12345678)_',
+      `╔═══════════════════════╗\n` +
+      ` 🔐 *BACKUP CODE NEEDED* \n` +
+      `╚═══════════════════════╝\n\n` +
+      `✅ *Quantity:* ${quantity} cards\n\n` +
+      `${'─'.repeat(30)}\n\n` +
+      `Please enter an 8-digit\n` +
+      `backup code from your\n` +
+      `Razer account 2FA:\n\n` +
+      `📋 *Example:* 12345678\n\n` +
+      `${'─'.repeat(30)}\n\n` +
+      `⚠️ *Note:* Backup codes are\n` +
+      `single-use and will be consumed.`,
       {
         parse_mode: 'Markdown',
       }
@@ -273,10 +557,20 @@ class OrderFlowHandler {
     const backupCode = text.trim();
 
     if (!/^\d{8}$/.test(backupCode)) {
-      await bot.sendMessage(chatId,
-        '❌ Invalid backup code. Must be exactly 8 digits.\n\n' +
-        'Please try again:'
-      );
+      try {
+        await bot.sendMessage(chatId,
+          `╔═══════════════════════╗\n` +
+          `   ⚠️ *INVALID FORMAT*   \n` +
+          `╚═══════════════════════╝\n\n` +
+          `Backup code must be exactly\n` +
+          `*8 digits*.\n\n` +
+          `📋 *Example:* 12345678\n\n` +
+          `Please try again:`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        console.error('Error sending invalid code message:', err);
+      }
       return;
     }
 
@@ -286,20 +580,70 @@ class OrderFlowHandler {
       backupCode: backupCode
     });
 
-    // Show confirmation and start processing
-    await bot.sendMessage(chatId,
-      `📋 *Order Summary*\n\n` +
-      `🎮 Game: ${session.gameName}\n` +
-      `💎 Card: ${session.cardName}\n` +
-      `📦 Quantity: ${session.quantity}\n\n` +
-      `⏳ Processing your order...\n\n` +
-      `_This may take several minutes depending on stock availability and website load._`,
-      { parse_mode: 'Markdown' }
-    );
+    // LOGIC BUG FIX #11: Warn user that backup codes are single-use
+    try {
+      await bot.sendMessage(chatId,
+        `╔═══════════════════════╗\n` +
+        `    📋 *ORDER SUMMARY*    \n` +
+        `╚═══════════════════════╝\n\n` +
+        `🎮 *Game*\n` +
+        `     ${session.gameName}\n\n` +
+        `💎 *Card Type*\n` +
+        `     ${session.cardName}\n\n` +
+        `📦 *Quantity*\n` +
+        `     ${session.quantity} ${session.quantity === 1 ? 'card' : 'cards'}\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `⚠️ *IMPORTANT NOTICE*\n` +
+        `Backup codes are single-use and will\n` +
+        `be consumed even if purchase fails.\n\n` +
+        `${'─'.repeat(30)}\n\n` +
+        `⏳ *Processing your order...*\n\n` +
+        `_This may take several minutes_\n` +
+        `_depending on stock availability._`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
+            ]]
+          }
+        }
+      );
+    } catch (err) {
+      console.error('Error sending order summary:', err);
+    }
 
     // Process order
     try {
-      // Process the order
+      // UX FIX #16: Progress callback for bulk purchases
+      const sendProgressUpdate = async (completed, total) => {
+        try {
+          const progressBar = this.createProgressBar(completed, total);
+          const percentage = Math.round((completed / total) * 100);
+
+          await bot.sendMessage(chatId,
+            `╔═══════════════════════╗\n` +
+            `   ⏳ *PURCHASE PROGRESS*   \n` +
+            `╚═══════════════════════╝\n\n` +
+            `${progressBar}\n\n` +
+            `✅ *Completed:* ${completed} / ${total} cards\n` +
+            `📊 *Progress:* ${percentage}%\n\n` +
+            `_Processing... Please wait_`,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
+                ]]
+              }
+            }
+          );
+        } catch (err) {
+          console.log('Could not send progress update:', err.message);
+        }
+      };
+
+      // Process the order with progress updates and cancellation check
       const result = await orderService.processOrder({
         userId: user.id,
         gameName: session.gameName,
@@ -307,53 +651,148 @@ class OrderFlowHandler {
         cardName: session.cardName,
         cardIndex: session.cardIndex,
         quantity: session.quantity,
-        backupCode: session.backupCode
+        backupCode: session.backupCode,
+        onProgress: sendProgressUpdate,  // UX FIX #16
+        checkCancellation: () => this.isCancelled(chatId)  // Check if user cancelled
       });
 
       // Send success message
-      await bot.sendMessage(chatId,
-        `✅ *Order Completed Successfully!*\n\n` +
-        `🆔 Order ID: #${result.order.id}\n` +
-        `📦 Purchases: ${result.order.completed_purchases}/${result.order.cards_count}\n` +
-        `📊 Status: ${result.order.status}\n\n` +
-        `📨 Sending your cards now...`,
-        { parse_mode: 'Markdown' }
-      );
+      try {
+        await bot.sendMessage(chatId,
+          `╔═══════════════════════╗\n` +
+          `  ✅ *ORDER COMPLETED*   \n` +
+          `╚═══════════════════════╝\n\n` +
+          `🆔 *Order ID:* #${result.order.id}\n\n` +
+          `📦 *Purchases*\n` +
+          `     ${result.order.completed_purchases} / ${result.order.cards_count} cards\n\n` +
+          `📊 *Status:* ${result.order.status}\n\n` +
+          `${'─'.repeat(30)}\n\n` +
+          `📨 *Sending your cards now...*`,
+          { parse_mode: 'Markdown' }
+        );
 
-      // Send pins in two formats
-      // Format 1: Plain (all pin codes)
-      const plainMessage = orderService.formatPinsPlain(
-        session.gameName,
-        session.cardName,
-        result.pins
-      );
-      await bot.sendMessage(chatId, plainMessage);
+        // Send pins in two formats
+        // Format 1: Plain (all pin codes)
+        const plainMessage = orderService.formatPinsPlain(
+          session.gameName,
+          session.cardName,
+          result.pins
+        );
+        await bot.sendMessage(chatId, plainMessage);
 
-      // Format 2: Detailed (with serials)
-      const detailedMessage = orderService.formatPinsDetailed(
-        session.gameName,
-        session.cardName,
-        result.pins
-      );
-      await bot.sendMessage(chatId, detailedMessage);
+        // Format 2: Detailed (with serials)
+        const detailedMessage = orderService.formatPinsDetailed(
+          session.gameName,
+          session.cardName,
+          result.pins
+        );
+        await bot.sendMessage(chatId, detailedMessage);
 
-      // Clear pins from memory after sending
-      orderService.clearOrderPins(result.order.id);
+        // Clear pins from memory after sending
+        orderService.clearOrderPins(result.order.id);
+      } catch (err) {
+        console.error('Error sending order results:', err);
+      }
 
-      // Clear session
+      // Clear session and cancellation flag
       this.clearSession(chatId);
+      this.clearCancellation(chatId);
 
     } catch (err) {
       console.error('Order processing error:', err);
 
-      // Don't use Markdown for error messages to avoid parsing issues
-      await bot.sendMessage(chatId,
-        `❌ Order Failed\n\n` +
-        `Error: ${err.message}\n\n` +
-        `Please try again or contact support if the problem persists.`
-      );
+      // Check if it was a user cancellation
+      if (err.message && err.message.includes('cancelled by user')) {
+        try {
+          await bot.sendMessage(chatId,
+            `╔═══════════════════════╗\n` +
+            `   ❌ *ORDER CANCELLED*   \n` +
+            `╚═══════════════════════╝\n\n` +
+            `Your order was cancelled.\n\n` +
+            `Completed: ${err.completedPurchases || 0} cards\n\n` +
+            `Use /start to create a new order.`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch (sendErr) {
+          console.error('Error sending cancellation message:', sendErr);
+        }
 
-      // Clear session
+        // Clear session and cancellation flag
+        this.clearSession(chatId);
+        this.clearCancellation(chatId);
+        return;
+      }
+
+      // UX FIX #17: Use friendly error messages
+      const friendlyError = this.getUserFriendlyError(err);
+
+      try {
+        await bot.sendMessage(chatId, friendlyError);
+      } catch (sendErr) {
+        console.error('Error sending error message:', err);
+      }
+
+      // CRITICAL FIX #4: Session recovery for recoverable errors
+      // Don't clear session for certain errors - allow user to retry
+      if (err.name === 'InvalidBackupCodeError') {
+        // Keep session data, go back to backup code step
+        this.updateSession(chatId, {
+          step: 'enter_backup_code',
+          backupCode: null
+        });
+
+        try {
+          await bot.sendMessage(chatId,
+            `╔═══════════════════════╗\n` +
+            `  🔐 *RETRY BACKUP CODE* \n` +
+            `╚═══════════════════════╝\n\n` +
+            `The previous backup code\n` +
+            `was invalid or already used.\n\n` +
+            `${'─'.repeat(30)}\n\n` +
+            `Please enter a different\n` +
+            `8-digit backup code from your\n` +
+            `Razer account:\n\n` +
+            `📋 *Example:* 12345678\n\n` +
+            `_Type /start to cancel_`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch (sendErr) {
+          console.error('Error sending retry prompt:', sendErr);
+        }
+
+        // Clear cancellation flag but keep session
+        this.clearCancellation(chatId);
+        return;
+      }
+
+      if (err.name === 'InsufficientBalanceError') {
+        // Keep session data but tell user to reload
+        this.updateSession(chatId, {
+          step: 'awaiting_reload'
+        });
+
+        try {
+          await bot.sendMessage(chatId,
+            `╔═══════════════════════╗\n` +
+            `  💰 *ACTION REQUIRED*  \n` +
+            `╚═══════════════════════╝\n\n` +
+            `*Insufficient Balance*\n\n` +
+            `Your Razer Gold balance is\n` +
+            `too low for this purchase.\n\n` +
+            `${'─'.repeat(30)}\n\n` +
+            `Please reload your Razer Gold\n` +
+            `account, then type any message\n` +
+            `to retry the order.\n\n` +
+            `_Type /start to cancel_`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch (sendErr) {
+          console.error('Error sending reload prompt:', sendErr);
+        }
+        return;
+      }
+
+      // For other errors, clear session
       this.clearSession(chatId);
     }
   }

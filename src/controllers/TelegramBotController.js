@@ -23,6 +23,11 @@ class TelegramBotController {
     this.bot = null;
     // State management for multi-step admin interactions
     this.userStates = {};
+    // Rate limiting: chatId -> last request timestamp
+    this.rateLimits = new Map();
+    this.RATE_LIMIT_MS = 3000; // 3 seconds between requests
+    // State locking to prevent race conditions
+    this.processingCallbacks = new Set();
   }
 
   /**
@@ -41,6 +46,42 @@ class TelegramBotController {
 
     // Register all command and message handlers
     this.registerHandlers();
+  }
+
+  /**
+   * Check rate limit for user (SCALABILITY FIX #19)
+   * @param {string} chatId - Chat ID
+   * @returns {boolean} True if rate limit passed
+   */
+  checkRateLimit(chatId) {
+    const now = Date.now();
+    const lastRequest = this.rateLimits.get(chatId);
+
+    if (lastRequest && (now - lastRequest) < this.RATE_LIMIT_MS) {
+      return false;
+    }
+
+    this.rateLimits.set(chatId, now);
+    return true;
+  }
+
+  /**
+   * Safe bot message sender with error handling (LOGIC BUG FIX #13)
+   * @param {string} chatId - Chat ID
+   * @param {string} text - Message text
+   * @param {Object} options - Additional options
+   * @returns {Promise<Message|null>} Message or null on error
+   */
+  async safeSendMessage(chatId, text, options = {}) {
+    try {
+      return await this.bot.sendMessage(chatId, text, options);
+    } catch (err) {
+      console.error(`❌ Failed to send message to ${chatId}:`, err.message);
+      if (err.response && err.response.body && err.response.body.description) {
+        console.error(`   Telegram Error: ${err.response.body.description}`);
+      }
+      return null;
+    }
   }
 
   /**
@@ -175,14 +216,40 @@ class TelegramBotController {
     const chatId = query.message.chat.id.toString();
     const callbackData = query.data;
 
+    // CRITICAL FIX #2: Prevent race conditions with state locking
+    const lockKey = `${chatId}:${callbackData}`;
+    if (this.processingCallbacks.has(lockKey)) {
+      console.log(`⚠️ Callback already processing: ${lockKey}`);
+      try {
+        await this.bot.answerCallbackQuery(query.id, {
+          text: 'Please wait, processing your previous request...'
+        });
+      } catch (err) {
+        console.log('Could not answer duplicate callback');
+      }
+      return;
+    }
+
+    this.processingCallbacks.add(lockKey);
+
     try {
+      // SCALABILITY FIX #19: Rate limiting
+      if (!this.checkRateLimit(chatId)) {
+        await this.bot.answerCallbackQuery(query.id, {
+          text: 'Please wait a moment before trying again.',
+          show_alert: false
+        });
+        return;
+      }
+
       // Check authorization from database
       const authResult = await authService.checkAuthorization(chatId);
 
       if (!authResult.authorized) {
-        return this.bot.answerCallbackQuery(query.id, {
+        await this.bot.answerCallbackQuery(query.id, {
           text: 'Access denied.'
         });
+        return;
       }
 
       const user = authResult.user;
@@ -190,9 +257,10 @@ class TelegramBotController {
       // Route based on callback data prefix
       if (callbackData.startsWith('admin_')) {
         if (!user.isAdmin()) {
-          return this.bot.answerCallbackQuery(query.id, {
+          await this.bot.answerCallbackQuery(query.id, {
             text: 'Admin access required.'
           });
+          return;
         }
         await this.handleAdminCallback(chatId, callbackData, query.id, user);
       } else if (callbackData.startsWith('user_') || callbackData.startsWith('order_') || callbackData === 'card_disabled') {
@@ -204,9 +272,16 @@ class TelegramBotController {
       }
     } catch (err) {
       console.error('Error handling callback:', err);
-      this.bot.answerCallbackQuery(query.id, {
-        text: 'An error occurred.'
-      });
+      try {
+        await this.bot.answerCallbackQuery(query.id, {
+          text: 'An error occurred.'
+        });
+      } catch (answerErr) {
+        console.log('Could not answer callback query');
+      }
+    } finally {
+      // Release lock
+      this.processingCallbacks.delete(lockKey);
     }
   }
 
@@ -214,173 +289,201 @@ class TelegramBotController {
    * Handles admin-specific callbacks
    */
   async handleAdminCallback(chatId, callbackData, queryId, user) {
-    switch (callbackData) {
-      case 'admin_add_user':
-        this.userStates[chatId] = { state: 'awaiting_new_user_telegram_id' };
-        this.bot.sendMessage(chatId, '👤 Enter the Telegram User ID:');
-        break;
+    try {
+      switch (callbackData) {
+        case 'admin_add_user':
+          this.userStates[chatId] = { state: 'awaiting_new_user_telegram_id' };
+          await this.safeSendMessage(chatId, '👤 Enter the Telegram User ID:');
+          break;
 
-      case 'admin_change_plan':
-        this.userStates[chatId] = { state: 'awaiting_user_id_for_plan_change' };
-        this.bot.sendMessage(chatId, '📊 Enter the User ID:');
-        break;
+        case 'admin_change_plan':
+          this.userStates[chatId] = { state: 'awaiting_user_id_for_plan_change' };
+          await this.safeSendMessage(chatId, '📊 Enter the User ID:');
+          break;
 
-      case 'admin_extend_sub':
-        this.userStates[chatId] = { state: 'awaiting_user_id_for_extend' };
-        this.bot.sendMessage(chatId, '📅 Enter the User ID:');
-        break;
+        case 'admin_extend_sub':
+          this.userStates[chatId] = { state: 'awaiting_user_id_for_extend' };
+          await this.safeSendMessage(chatId, '📅 Enter the User ID:');
+          break;
 
-      case 'admin_remove_user':
-        this.userStates[chatId] = { state: 'awaiting_user_id_for_remove' };
-        this.bot.sendMessage(chatId, '🗑️ ⚠️ WARNING: This cannot be undone!\nEnter User ID:');
-        break;
+        case 'admin_remove_user':
+          this.userStates[chatId] = { state: 'awaiting_user_id_for_remove' };
+          await this.safeSendMessage(chatId, '🗑️ ⚠️ WARNING: This cannot be undone!\nEnter User ID:');
+          break;
 
-      case 'admin_user_details':
-        this.userStates[chatId] = { state: 'awaiting_user_id_for_details' };
-        this.bot.sendMessage(chatId, '📋 Enter User ID or Telegram ID:');
-        break;
+        case 'admin_user_details':
+          this.userStates[chatId] = { state: 'awaiting_user_id_for_details' };
+          await this.safeSendMessage(chatId, '📋 Enter User ID or Telegram ID:');
+          break;
 
-      case 'admin_list_users':
-        await this.handleListAllUsers(chatId);
-        break;
+        case 'admin_list_users':
+          await this.handleListAllUsers(chatId);
+          break;
 
-      default:
-        if (callbackData.startsWith('admin_select_plan_')) {
-          const plan = callbackData.replace('admin_select_plan_', '');
-          await this.handlePlanSelection(chatId, plan);
-        }
+        default:
+          if (callbackData.startsWith('admin_select_plan_')) {
+            const plan = callbackData.replace('admin_select_plan_', '');
+            await this.handlePlanSelection(chatId, plan);
+          }
+      }
+      await this.bot.answerCallbackQuery(queryId);
+    } catch (err) {
+      console.error('Error in admin callback:', err);
+      // SECURITY FIX #9: Clear admin state on error
+      delete this.userStates[chatId];
+      try {
+        await this.bot.answerCallbackQuery(queryId, {
+          text: 'An error occurred. Please try again.'
+        });
+      } catch (answerErr) {
+        console.log('Could not answer callback');
+      }
     }
-    this.bot.answerCallbackQuery(queryId);
   }
 
   /**
    * Handles user-specific callbacks
    */
   async handleUserCallback(chatId, callbackData, queryId, user) {
-    switch (callbackData) {
-      case 'user_check_balance':
-        await this.handleCheckBalanceButton(chatId, queryId);
-        break;
+    // LOGIC BUG FIX #14: Answer callback immediately to prevent timeout
+    try {
+      await this.bot.answerCallbackQuery(queryId);
+    } catch (err) {
+      console.log('⚠️ Could not answer callback query (may be too old)');
+    }
 
-      case 'user_create_order':
-        // Answer callback query IMMEDIATELY
-        try {
-          await this.bot.answerCallbackQuery(queryId);
-        } catch (err) {
-          console.log('⚠️ Could not answer callback query (may be too old)');
-        }
+    try {
+      switch (callbackData) {
+        case 'user_check_balance':
+          await this.handleCheckBalanceButton(chatId, queryId);
+          break;
 
-        // ⭐ Check if user is logged in
-        const session = sessionManager.getSession(chatId);
-
-        if (!session || !session.page) {
-          const keyboard = {
-            inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
-          };
-
-          return this.bot.sendMessage(
-            chatId,
-            '⚠️ You must login first to create orders.',
-            { reply_markup: keyboard }
-          );
-        }
-
-        // ⭐ Initialize order flow
-        orderFlowHandler.initSession(chatId);
-        await orderFlowHandler.showGameSelection(this.bot, chatId);
-        break;
-
-      case 'user_my_orders':
-        this.bot.sendMessage(chatId, '📋 My Orders feature coming soon!');
-        this.bot.answerCallbackQuery(queryId);
-        break;
-
-      case 'user_attempts':
-        await this.handleShowAttempts(chatId, user);
-        this.bot.answerCallbackQuery(queryId);
-        break;
-
-      default:
-        // ⭐ Handle order flow callbacks
-        if (callbackData.startsWith('order_game_')) {
-          // Answer callback query IMMEDIATELY
-          try {
-            await this.bot.answerCallbackQuery(queryId);
-          } catch (err) {
-            console.log('⚠️ Could not answer callback query (may be too old)');
+        case 'user_create_order':
+          // SECURITY FIX #10: Validate user ownership
+          if (user.telegram_user_id !== chatId) {
+            console.error(`⚠️ Security: User ID mismatch - ${user.telegram_user_id} vs ${chatId}`);
+            await this.safeSendMessage(chatId, '❌ Security error: Session mismatch. Please restart with /start');
+            return;
           }
 
-          // Check if user is still logged in
-          const session = sessionManager.getSession(chatId);
-          if (!session || !session.page) {
+          // Check if user is logged in (using BrowserManager)
+          const browserManager = require('../services/BrowserManager');
+          const page = browserManager.getPage(user.id);
+
+          if (!page) {
             const keyboard = {
               inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
             };
-            return this.bot.sendMessage(
+
+            await this.safeSendMessage(
               chatId,
-              '⚠️ Your session expired. Please login again.',
+              '⚠️ You must login first to create orders.',
               { reply_markup: keyboard }
             );
+            return;
           }
 
-          const gameId = callbackData.replace('order_game_', '');
-          console.log(`📞 Order game callback received: ${gameId}`);
-          await orderFlowHandler.handleGameSelection(this.bot, chatId, gameId, user);
-        } else if (callbackData.startsWith('order_card_')) {
-          // Answer callback query IMMEDIATELY
-          try {
-            await this.bot.answerCallbackQuery(queryId);
-          } catch (err) {
-            console.log('⚠️ Could not answer callback query (may be too old)');
-          }
+          // Initialize order flow
+          orderFlowHandler.initSession(chatId);
+          await orderFlowHandler.showGameSelection(this.bot, chatId);
+          break;
 
-          // Check if user is still logged in
-          const session = sessionManager.getSession(chatId);
-          if (!session || !session.page) {
-            const keyboard = {
-              inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
-            };
-            return this.bot.sendMessage(
-              chatId,
-              '⚠️ Your session expired. Please login again.',
-              { reply_markup: keyboard }
-            );
-          }
+        case 'user_my_orders':
+          await this.safeSendMessage(chatId, '📋 My Orders feature coming soon!');
+          break;
 
-          const parts = callbackData.replace('order_card_', '').split('_');
-          const cardIndex = parts[0];
-          const cardName = parts.slice(1).join('_');
-          console.log(`📞 Order card callback received: ${cardIndex} - ${cardName}`);
-          await orderFlowHandler.handleCardSelection(this.bot, chatId, cardIndex, cardName);
-        } else if (callbackData === 'order_cancel') {
-          console.log(`📞 Order cancel callback received`);
-          try {
-            await this.bot.answerCallbackQuery(queryId);
-          } catch (err) {
-            console.log('⚠️ Could not answer callback query (may be too old)');
+        case 'user_attempts':
+          await this.handleShowAttempts(chatId, user);
+          break;
+
+        default:
+          // Handle order flow callbacks
+          if (callbackData.startsWith('order_game_')) {
+            // SECURITY FIX #10: Validate user ownership
+            if (user.telegram_user_id !== chatId) {
+              console.error(`⚠️ Security: User ID mismatch`);
+              await this.safeSendMessage(chatId, '❌ Security error: Session mismatch. Please restart with /start');
+              return;
+            }
+
+            // LOGIC BUG FIX #12: Check if browser session still exists
+            const browserManager = require('../services/BrowserManager');
+            const page = browserManager.getPage(user.id);
+
+            if (!page) {
+              // LOGIC BUG FIX #12: Clear order session when browser session expired
+              orderFlowHandler.clearSession(chatId);
+
+              const keyboard = {
+                inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
+              };
+              await this.safeSendMessage(
+                chatId,
+                '⚠️ Your session expired. Please login again.',
+                { reply_markup: keyboard }
+              );
+              return;
+            }
+
+            const gameId = callbackData.replace('order_game_', '');
+            console.log(`📞 Order game callback received: ${gameId}`);
+            await orderFlowHandler.handleGameSelection(this.bot, chatId, gameId, user);
+
+          } else if (callbackData.startsWith('order_card_')) {
+            // SECURITY FIX #10: Validate user ownership
+            if (user.telegram_user_id !== chatId) {
+              console.error(`⚠️ Security: User ID mismatch`);
+              await this.safeSendMessage(chatId, '❌ Security error: Session mismatch. Please restart with /start');
+              return;
+            }
+
+            // LOGIC BUG FIX #12: Check if browser session still exists
+            const browserManager = require('../services/BrowserManager');
+            const page = browserManager.getPage(user.id);
+
+            if (!page) {
+              // LOGIC BUG FIX #12: Clear order session when browser session expired
+              orderFlowHandler.clearSession(chatId);
+
+              const keyboard = {
+                inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
+              };
+              await this.safeSendMessage(
+                chatId,
+                '⚠️ Your session expired. Please login again.',
+                { reply_markup: keyboard }
+              );
+              return;
+            }
+
+            const parts = callbackData.replace('order_card_', '').split('_');
+            const cardIndex = parts[0];
+            const cardName = parts.slice(1).join('_');
+            console.log(`📞 Order card callback received: ${cardIndex} - ${cardName}`);
+            await orderFlowHandler.handleCardSelection(this.bot, chatId, cardIndex, cardName);
+
+          } else if (callbackData === 'order_cancel') {
+            console.log(`📞 Order cancel callback received`);
+            await orderFlowHandler.handleCancel(this.bot, chatId);
+
+          } else if (callbackData === 'order_cancel_processing') {
+            console.log(`📞 Order cancel processing callback received`);
+            await orderFlowHandler.handleCancelProcessing(this.bot, chatId);
+
+          } else if (callbackData === 'order_back_to_games') {
+            console.log(`📞 Order back callback received`);
+            await orderFlowHandler.handleBack(this.bot, chatId);
+
+          } else if (callbackData === 'card_disabled') {
+            // This was already answered, no action needed
+
+          } else {
+            console.log(`❓ Unknown callback: ${callbackData}`);
           }
-          await orderFlowHandler.handleCancel(this.bot, chatId);
-        } else if (callbackData === 'order_back_to_games') {
-          console.log(`📞 Order back callback received`);
-          try {
-            await this.bot.answerCallbackQuery(queryId);
-          } catch (err) {
-            console.log('⚠️ Could not answer callback query (may be too old)');
-          }
-          await orderFlowHandler.handleBack(this.bot, chatId);
-        } else if (callbackData === 'card_disabled') {
-          this.bot.answerCallbackQuery(queryId, {
-            text: 'This card is out of stock. Bot will wait for restock automatically.',
-            show_alert: true
-          });
-        } else {
-          console.log(`❓ Unknown callback: ${callbackData}`);
-          try {
-            await this.bot.answerCallbackQuery(queryId);
-          } catch (err) {
-            console.log('⚠️ Could not answer callback query (may be too old)');
-          }
-        }
+      }
+    } catch (err) {
+      console.error('Error in user callback:', err);
+      await this.safeSendMessage(chatId, '❌ An error occurred. Please try again.');
     }
   }
 
@@ -754,11 +857,11 @@ class TelegramBotController {
   async handlePasswordInput(chatId, password) {
     const session = sessionManager.getSession(chatId);
 
-    // Store password in session
+    // Store password in session temporarily
     sessionManager.setPassword(chatId, password.trim());
 
     // Inform user that login is in progress
-    const logginMessage = this.bot.sendMessage(chatId, '⏳ Logging in to Razer...');
+    const logginMessage = await this.safeSendMessage(chatId, '⏳ Logging in to Razer...');
 
     try {
       // Get user from database for browser session management
@@ -775,20 +878,31 @@ class TelegramBotController {
         session.password
       );
 
+      // SECURITY FIX #8: Clear credentials from memory immediately after successful login
+      sessionManager.clearCredentials(chatId);
+
       // Store browser session
       sessionManager.setBrowserSession(chatId, browser, page);
       sessionManager.updateState(chatId, 'logged_in');
 
-      // Inform user of success and show balance check button
-      this.bot.deleteMessage(chatId, (await logginMessage).message_id);
-      this.bot.sendMessage(
-        chatId,
-        '✅ Logged in successfully!',
-      );
+      // Inform user of success
+      if (logginMessage) {
+        try {
+          await this.bot.deleteMessage(chatId, logginMessage.message_id);
+        } catch (delErr) {
+          console.log('Could not delete loading message');
+        }
+      }
+      await this.safeSendMessage(chatId, '✅ Logged in successfully!');
+
     } catch (err) {
       // Handle login failure
       console.error('Login error:', err);
-      this.bot.sendMessage(
+
+      // SECURITY FIX #8: Clear credentials on error too
+      sessionManager.clearCredentials(chatId);
+
+      await this.safeSendMessage(
         chatId,
         '❌ Login failed. Please check your credentials and try again.',
         {

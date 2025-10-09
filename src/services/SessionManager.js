@@ -15,6 +15,30 @@ class SessionManager {
     // Key: Telegram chat ID (string)
     // Value: Session object containing state, credentials, browser, and page
     this.sessions = {};
+
+    // Auto-cleanup inactive sessions after 30 minutes
+    this.SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+    this.startCleanupInterval();
+  }
+
+  /**
+   * Start cleanup interval to remove expired sessions
+   */
+  startCleanupInterval() {
+    setInterval(() => {
+      const now = Date.now();
+      console.log('🧹 Running session cleanup...');
+
+      for (const [chatId, session] of Object.entries(this.sessions)) {
+        if (session.lastActivity) {
+          const inactiveTime = now - session.lastActivity;
+          if (inactiveTime > this.SESSION_TIMEOUT) {
+            console.log(`⏰ Session for chat ${chatId} expired - cleaning up...`);
+            delete this.sessions[chatId];
+          }
+        }
+      }
+    }, 5 * 60 * 1000); // Check every 5 minutes
   }
 
   /**
@@ -25,8 +49,9 @@ class SessionManager {
   createSession(chatId) {
     this.sessions[chatId] = {
       state: 'idle',           // Current state: idle, awaiting_email, awaiting_password, logged_in
-      browser: null,           // Puppeteer browser instance
-      page: null               // Puppeteer page instance
+      browser: null,           // Puppeteer browser instance (deprecated - use BrowserManager)
+      page: null,              // Puppeteer page instance (deprecated - use BrowserManager)
+      lastActivity: Date.now() // Track last activity for cleanup
     };
     console.log(`📝 Session created for user ${chatId}`);
   }
@@ -50,6 +75,7 @@ class SessionManager {
   updateState(chatId, state) {
     if (this.sessions[chatId]) {
       this.sessions[chatId].state = state;
+      this.sessions[chatId].lastActivity = Date.now();
       console.log(`🔄 Session state updated for ${chatId}: ${state}`);
     }
   }
@@ -68,7 +94,7 @@ class SessionManager {
   }
 
   /**
-   * Stores password in the session
+   * Stores password in the session (SECURITY: Clear after use)
    * 
    * @param {string} chatId - Telegram chat ID
    * @param {string} password - User's password
@@ -76,21 +102,38 @@ class SessionManager {
   setPassword(chatId, password) {
     if (this.sessions[chatId]) {
       this.sessions[chatId].password = password;
+      this.sessions[chatId].lastActivity = Date.now();
       console.log(`🔑 Password stored for ${chatId}`);
     }
   }
 
   /**
-   * Stores browser and page instances in the session
+   * Clear sensitive credentials from session (SECURITY FIX #8)
    * 
    * @param {string} chatId - Telegram chat ID
-   * @param {Browser} browser - Puppeteer browser instance
-   * @param {Page} page - Puppeteer page instance
+   */
+  clearCredentials(chatId) {
+    if (this.sessions[chatId]) {
+      delete this.sessions[chatId].email;
+      delete this.sessions[chatId].password;
+      console.log(`🔒 Credentials cleared for ${chatId}`);
+    }
+  }
+
+  /**
+   * Stores browser and page instances in the session
+   * NOTE: Browser is now managed by BrowserManager using userId
+   * This is kept for backward compatibility but marks session as logged in
+   * 
+   * @param {string} chatId - Telegram chat ID
+   * @param {Browser} browser - Puppeteer browser instance (deprecated)
+   * @param {Page} page - Puppeteer page instance (deprecated)
    */
   setBrowserSession(chatId, browser, page) {
     if (this.sessions[chatId]) {
       this.sessions[chatId].browser = browser;
       this.sessions[chatId].page = page;
+      this.sessions[chatId].lastActivity = Date.now();
       console.log(`🌐 Browser session stored for ${chatId}`);
     }
   }

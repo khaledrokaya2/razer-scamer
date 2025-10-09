@@ -54,7 +54,9 @@ class OrderService {
     cardName,
     cardIndex,
     quantity,
-    backupCode
+    backupCode,
+    onProgress,  // UX FIX #16: Progress callback
+    checkCancellation  // Cancellation check callback
   }) {
     let order = null;
 
@@ -74,14 +76,16 @@ class OrderService {
       console.log(`   Quantity: ${quantity}`);
       console.log(`${'='.repeat(60)}\n`);
 
-      // Step 2: Process purchases
+      // Step 2: Process purchases with progress callback
       const purchases = await purchaseService.processBulkPurchases({
         userId,
         gameUrl,
         cardIndex,
         cardName,
         quantity,
-        backupCode
+        backupCode,
+        onProgress,  // Pass through progress callback
+        checkCancellation  // Pass through cancellation check
       });
 
       // Step 3: Save purchases to database and memory
