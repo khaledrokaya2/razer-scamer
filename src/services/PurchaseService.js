@@ -54,8 +54,9 @@ class PurchaseService {
       console.log('⏳ Waiting for cards to load...');
       await page.waitForSelector("div[class*='selection-tile__text']", {
         visible: true,
-        timeout: 20000
+        timeout: 30000
       });
+      console.log('✅ Cards loaded, extracting options...');
 
       // Get card names
       const cardsData = await page.evaluate(() => {
