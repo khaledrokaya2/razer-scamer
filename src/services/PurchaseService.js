@@ -50,15 +50,6 @@ class PurchaseService {
     const page = await browserManager.navigateToUrl(userId, gameUrl);
 
     try {
-      // Wait for cards container to appear first
-      console.log('⏳ Waiting for cards container...');
-      await page.waitForSelector("div[class*='catalog-products'], div[class*='product-list'], div[class*='selection-container']", {
-        visible: true,
-        timeout: 30000
-      }).catch(() => {
-        console.log('⚠️ Cards container not found with main selectors, trying alternatives...');
-      });
-
       // Wait for cards to load with multiple possitible selectors
       console.log('⏳ Waiting for cards to load...');
       const cardSelectors = [
@@ -357,7 +348,7 @@ class PurchaseService {
 
       // Find the Razer Gold payment method specifically
       const razerGoldContainer = await page.$("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
-      
+
       if (!razerGoldContainer) {
         throw new Error('❌ Could not find Razer Gold payment container');
       }
@@ -376,7 +367,7 @@ class PurchaseService {
         }
       } catch (err) {
         console.log('⚠️ Label click failed, trying radio input...');
-        
+
         // Fallback: click the radio input directly
         try {
           const radioInput = await razerGoldContainer.$('input[type="radio"][name="paymentChannelItem"]');
@@ -388,7 +379,7 @@ class PurchaseService {
           }
         } catch (radioErr) {
           console.log('⚠️ Radio input click failed, trying container...');
-          
+
           // Final fallback: click the container itself
           await razerGoldContainer.click();
           console.log('✅ Clicked Razer Gold container');
@@ -406,26 +397,26 @@ class PurchaseService {
 
       if (!isRazerGoldSelected) {
         console.log('⚠️ Razer Gold not selected, trying alternative selection...');
-        
+
         // Alternative selection method using JavaScript
         await page.evaluate(() => {
           const razerGoldRadio = document.querySelector('div[data-cs-override-id="purchase-paychann-razergoldwallet"] input[type="radio"]');
           if (razerGoldRadio) {
             razerGoldRadio.checked = true;
             razerGoldRadio.click();
-            
+
             // Trigger change event
             const event = new Event('change', { bubbles: true });
             razerGoldRadio.dispatchEvent(event);
           }
         });
-        
+
         // Check again
         const isSelectedNow = await page.evaluate(() => {
           const razerGoldRadio = document.querySelector('div[data-cs-override-id="purchase-paychann-razergoldwallet"] input[type="radio"]');
           return razerGoldRadio && razerGoldRadio.checked;
         });
-        
+
         if (!isSelectedNow) {
           throw new Error('❌ Failed to select Razer Gold payment method');
         }
@@ -434,7 +425,7 @@ class PurchaseService {
       console.log('✅ Razer Gold payment method selected successfully');
       // Click checkout
       console.log('🛒 Clicking checkout...');
-      
+
       // Try multiple selectors for checkout button
       let checkoutButton = null;
       const checkoutSelectors = [
@@ -445,7 +436,7 @@ class PurchaseService {
         "button[data-v-3ca6ed43][class*='btn-primary']",
         "button[data-v-75e3a125][data-v-3ca6ed43]" // Original selector as fallback
       ];
-      
+
       for (const selector of checkoutSelectors) {
         try {
           checkoutButton = await page.waitForSelector(selector, {
@@ -461,7 +452,7 @@ class PurchaseService {
           continue;
         }
       }
-      
+
       if (!checkoutButton) {
         // Fallback: try to find by text content
         checkoutButton = await page.evaluateHandle(() => {
@@ -475,11 +466,11 @@ class PurchaseService {
           return null;
         });
       }
-      
+
       if (!checkoutButton || checkoutButton.asElement() === null) {
         throw new Error('❌ Could not find checkout button');
       }
-      
+
       await checkoutButton.click();
       console.log('✅ Checkout button clicked successfully');
 
