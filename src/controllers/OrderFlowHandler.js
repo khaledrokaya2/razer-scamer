@@ -220,7 +220,7 @@ class OrderFlowHandler {
     try {
       await bot.sendMessage(chatId,
         `🎮 *SELECT GAME*    \n` +
-        `Choose the game you want:\n` +
+        `Choose the game you want:\n`,
         {
           parse_mode: 'Markdown',
           reply_markup: { inline_keyboard: keyboard }
