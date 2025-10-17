@@ -14,10 +14,10 @@ class BrowserManager {
     // Map of userId -> { browser, page, lastActivity }
     this.userBrowsers = new Map();
 
-    // Auto-close inactive browsers after 10 minutes
-    this.INACTIVITY_TIMEOUT = 10 * 60 * 1000; // 10 minutes
+    // Auto-close inactive browsers after 30 minutes (extended for login sessions)
+    this.INACTIVITY_TIMEOUT = 30 * 60 * 1000; // 30 minutes
 
-    // Start cleanup interval (check every minute)
+    // Start cleanup interval (check every 5 minutes)
     this.startCleanupInterval();
   }
 
@@ -40,7 +40,16 @@ class BrowserManager {
     console.log(`🆕 Creating new browser for user ${userId}`);
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
-    page.setDefaultTimeout(30000);
+
+    // Configure page for better session handling
+    await page.setDefaultTimeout(30000);
+    await page.setDefaultNavigationTimeout(60000);
+
+    // Set user agent to avoid detection
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+    // Enable cookies and session persistence
+    await page.setRequestInterception(false);
 
     // Store in map
     this.userBrowsers.set(userId, {
@@ -90,8 +99,31 @@ class BrowserManager {
     const { page } = await this.getBrowser(userId);
 
     console.log(`🔗 Navigating to: ${url}`);
-    await page.goto(url, { waitUntil: 'networkidle2' });
-    return page;
+
+    try {
+      // Navigate with extended timeout and multiple wait conditions
+      await page.goto(url, {
+        waitUntil: 'networkidle2',
+        timeout: 60000
+      });
+
+      // Update activity after successful navigation
+      this.updateActivity(userId);
+
+      return page;
+    } catch (err) {
+      console.error(`❌ Navigation failed to ${url}:`, err.message);
+
+      // If navigation fails, try one more time
+      console.log('🔄 Retrying navigation...');
+      await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
+      });
+
+      this.updateActivity(userId);
+      return page;
+    }
   }
 
   /**
@@ -150,7 +182,7 @@ class BrowserManager {
           this.closeBrowser(userId);
         }
       }
-    }, 60000); // Check every minute
+    }, 5 * 60000); // Check every 5 minutes
   }
 
   /**
@@ -174,13 +206,40 @@ class BrowserManager {
   }
 
   /**
+   * Check if user has an active browser session
+   * @param {number} userId - User ID
+   * @returns {boolean} True if user has active browser
+   */
+  hasActiveBrowser(userId) {
+    const existing = this.userBrowsers.get(userId);
+    return existing && existing.browser.isConnected();
+  }
+
+  /**
+   * Get session age for user
+   * @param {number} userId - User ID
+   * @returns {number} Age in minutes, -1 if no session
+   */
+  getSessionAge(userId) {
+    const existing = this.userBrowsers.get(userId);
+    if (!existing) return -1;
+
+    return Math.round((Date.now() - existing.lastActivity) / 1000 / 60);
+  }
+
+  /**
    * Get browser stats
    * @returns {Object} Statistics
    */
   getStats() {
     return {
       activeBrowsers: this.userBrowsers.size,
-      users: Array.from(this.userBrowsers.keys())
+      users: Array.from(this.userBrowsers.keys()),
+      sessions: Array.from(this.userBrowsers.entries()).map(([userId, session]) => ({
+        userId,
+        ageMinutes: Math.round((Date.now() - session.lastActivity) / 1000 / 60),
+        isConnected: session.browser.isConnected()
+      }))
     };
   }
 }
