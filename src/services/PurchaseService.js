@@ -50,32 +50,188 @@ class PurchaseService {
     const page = await browserManager.navigateToUrl(userId, gameUrl);
 
     try {
-      // Wait for cards to load
-      console.log('⏳ Waiting for cards to load...');
-      await page.waitForSelector("div[class*='selection-tile__text']", {
+      // Wait for cards container to appear first
+      console.log('⏳ Waiting for cards container...');
+      await page.waitForSelector("div[class*='catalog-products'], div[class*='product-list'], div[class*='selection-container']", {
         visible: true,
         timeout: 30000
+      }).catch(() => {
+        console.log('⚠️ Cards container not found with main selectors, trying alternatives...');
       });
+
+      // Wait for cards to load with multiple possitible selectors
+      console.log('⏳ Waiting for cards to load...');
+      const cardSelectors = [
+        "div[class*='selection-tile__text']",
+        "div[class*='product-tile'] span",
+        "div[class*='catalog-item'] .title",
+        "div[class*='card-title']",
+        ".product-name",
+        "[data-testid*='product-name']"
+      ];
+
+      let cardsFound = false;
+      let finalSelector = null;
+
+      for (const selector of cardSelectors) {
+        try {
+          await page.waitForSelector(selector, {
+            visible: true,
+            timeout: 10000
+          });
+
+          // Check if we actually found cards
+          const cardCount = await page.evaluate((sel) => {
+            return document.querySelectorAll(sel).length;
+          }, selector);
+
+          if (cardCount > 0) {
+            console.log(`✅ Found ${cardCount} cards with selector: ${selector}`);
+            finalSelector = selector;
+            cardsFound = true;
+            break;
+          }
+        } catch (err) {
+          console.log(`⚠️ Selector failed: ${selector}`);
+          continue;
+        }
+      }
+
+      if (!cardsFound) {
+        // Fallback: try to find any clickable elements that might be cards
+        console.log('🔍 Trying fallback card detection...');
+        const fallbackCards = await page.evaluate(() => {
+          // Look for common card patterns
+          const possibleCards = [
+            ...document.querySelectorAll("div[class*='tile']"),
+            ...document.querySelectorAll("div[class*='card']"),
+            ...document.querySelectorAll("div[class*='product']"),
+            ...document.querySelectorAll("div[class*='item']")
+          ].filter(el => {
+            const text = el.textContent.trim();
+            return text && text.length > 0 && text.length < 200; // Reasonable card title length
+          });
+
+          return possibleCards.length;
+        });
+
+        if (fallbackCards === 0) {
+          throw new Error('No cards found on the page. The page might not have loaded correctly or selectors have changed.');
+        }
+
+        console.log(`ℹ️ Found ${fallbackCards} potential cards with fallback method`);
+      }
+
       console.log('✅ Cards loaded, extracting options...');
 
-      // Get card names
-      const cardsData = await page.evaluate(() => {
-        const cardElements = document.querySelectorAll("div[class*='selection-tile__text']");
-        const radioInputs = document.querySelectorAll("input[type='radio'][data-v-498979e2]");
+      // Get card names and states with improved detection
+      const cardsData = await page.evaluate((cardSelector) => {
+        let cardElements = [];
+        let radioInputs = [];
 
-        return Array.from(cardElements).map((el, index) => ({
-          name: el.textContent.trim(),
-          index: index,
-          disabled: radioInputs[index] ? radioInputs[index].disabled : true
-        }));
+        if (cardSelector) {
+          cardElements = document.querySelectorAll(cardSelector);
+        } else {
+          // Fallback detection
+          cardElements = [
+            ...document.querySelectorAll("div[class*='tile']"),
+            ...document.querySelectorAll("div[class*='card']"),
+            ...document.querySelectorAll("div[class*='product']")
+          ].filter(el => {
+            const text = el.textContent.trim();
+            return text && text.length > 0 && text.length < 200;
+          });
+        }
+
+        // Try multiple selectors for radio inputs
+        const radioSelectors = [
+          "input[type='radio'][data-v-498979e2]",
+          "input[type='radio']",
+          "input[name*='product']",
+          "input[name*='card']",
+          "[type='radio']"
+        ];
+
+        for (const radioSel of radioSelectors) {
+          radioInputs = document.querySelectorAll(radioSel);
+          if (radioInputs.length > 0) break;
+        }
+
+        console.log(`Found ${cardElements.length} card elements and ${radioInputs.length} radio inputs`);
+
+        return Array.from(cardElements).map((el, index) => {
+          let name = '';
+
+          // Try different ways to extract card name
+          if (el.textContent) {
+            name = el.textContent.trim();
+          } else if (el.querySelector('[class*="title"], [class*="name"]')) {
+            name = el.querySelector('[class*="title"], [class*="name"]').textContent.trim();
+          } else if (el.getAttribute('title')) {
+            name = el.getAttribute('title').trim();
+          }
+
+          // Clean up the name
+          name = name.replace(/\s+/g, ' ').trim();
+
+          // Determine if disabled
+          let disabled = true;
+          if (radioInputs[index]) {
+            disabled = radioInputs[index].disabled;
+          } else {
+            // Check if parent element has disabled class or attribute
+            const parent = el.closest('[class*="tile"], [class*="card"], [class*="product"]');
+            if (parent) {
+              disabled = parent.classList.contains('disabled') ||
+                parent.classList.contains('out-of-stock') ||
+                parent.hasAttribute('disabled');
+            } else {
+              disabled = false; // Assume available if we can't determine
+            }
+          }
+
+          return {
+            name: name,
+            index: index,
+            disabled: disabled
+          };
+        }).filter(card => card.name && card.name.length > 0); // Filter out empty cards
+      }, finalSelector);
+
+      console.log(`✅ Successfully extracted ${cardsData.length} card options`);
+
+      // Log card details for debugging
+      cardsData.forEach((card, idx) => {
+        console.log(`   ${idx}: ${card.name} ${card.disabled ? '(OUT OF STOCK)' : '(AVAILABLE)'}`);
       });
 
-      console.log(`✅ Found ${cardsData.length} card options`);
+      if (cardsData.length === 0) {
+        throw new Error('No valid cards found. The page structure might have changed.');
+      }
+
       browserManager.updateActivity(userId);
       return cardsData;
 
     } catch (err) {
       console.error('❌ Error getting available cards:', err.message);
+
+      // Additional debugging info
+      console.log('🔍 Page debugging info:');
+      try {
+        const pageInfo = await page.evaluate(() => ({
+          url: window.location.href,
+          title: document.title,
+          bodyText: document.body ? document.body.textContent.substring(0, 500) : 'No body',
+          elementCount: document.querySelectorAll('*').length
+        }));
+        console.log('   URL:', pageInfo.url);
+        console.log('   Title:', pageInfo.title);
+        console.log('   Elements:', pageInfo.elementCount);
+        console.log('   Body preview:', pageInfo.bodyText);
+      } catch (debugErr) {
+        console.log('   Could not get page debug info:', debugErr.message);
+      }
+
       throw err;
     }
   }
@@ -143,10 +299,46 @@ class PurchaseService {
         await this.waitForCardInStock(page, cardIndex);
       }
 
-      // Select card
-      console.log('📦 Selecting card...');
-      const selectedCard = await page.$$("div[class*='selection-tile__text']").then(els => els[cardIndex]);
+      // Select card - ensure we click the right one
+      console.log(`📦 Selecting card at index ${cardIndex}...`);
+
+      // Wait for card elements to be fully loaded and clickable
+      await page.waitForSelector("div[class*='selection-tile']", {
+        visible: true,
+        timeout: 20000
+      });
+
+      // Get all card elements and verify count
+      const cardElements = await page.$$("div[class*='selection-tile']");
+      console.log(`Found ${cardElements.length} card elements`);
+
+      if (cardIndex >= cardElements.length) {
+        throw new Error(`Card index ${cardIndex} is out of range. Available cards: ${cardElements.length}`);
+      }
+
+      // Click the specific card by index
+      const selectedCard = cardElements[cardIndex];
       await selectedCard.click();
+
+      // Verify the card was selected by checking for active/selected state
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const isSelected = await page.evaluate((index) => {
+        const radioInputs = document.querySelectorAll("input[type='radio'][data-v-498979e2]");
+        return radioInputs[index] ? radioInputs[index].checked : false;
+      }, cardIndex);
+
+      if (!isSelected) {
+        console.log('⚠️ Card not selected, trying alternative selection method...');
+        // Try clicking the radio input directly
+        await page.evaluate((index) => {
+          const radioInputs = document.querySelectorAll("input[type='radio'][data-v-498979e2]");
+          if (radioInputs[index]) {
+            radioInputs[index].click();
+          }
+        }, cardIndex);
+      }
+
+      console.log(`✅ Card ${cardIndex} selected successfully`);
 
       // Wait for cards
       await page.waitForSelector("div[class*='selection-tile__text']", {
@@ -156,19 +348,140 @@ class PurchaseService {
 
       // Select Razer Gold as payment method
       console.log('💳 Selecting Razer Gold payment...');
-      const razerGoldPayment = await page.waitForSelector(
-        "div[data-cs-override-id='purchase-paychann-razergoldwallet']",
-        { visible: true, timeout: 20000 }
-      );
-      await razerGoldPayment.click();
 
+      // Wait for payment methods container to load
+      await page.waitForSelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']", {
+        visible: true,
+        timeout: 20000
+      });
+
+      // Find the Razer Gold payment method specifically
+      const razerGoldContainer = await page.$("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
+      
+      if (!razerGoldContainer) {
+        throw new Error('❌ Could not find Razer Gold payment container');
+      }
+
+      console.log('✅ Found Razer Gold payment container');
+
+      // Try clicking the label first (most reliable method based on HTML structure)
+      try {
+        console.log('🎯 Trying to click the label...');
+        const label = await razerGoldContainer.$('label');
+        if (label) {
+          await label.click();
+          console.log('✅ Clicked Razer Gold label');
+        } else {
+          throw new Error('Label not found');
+        }
+      } catch (err) {
+        console.log('⚠️ Label click failed, trying radio input...');
+        
+        // Fallback: click the radio input directly
+        try {
+          const radioInput = await razerGoldContainer.$('input[type="radio"][name="paymentChannelItem"]');
+          if (radioInput) {
+            await radioInput.click();
+            console.log('✅ Clicked Razer Gold radio input');
+          } else {
+            throw new Error('Radio input not found');
+          }
+        } catch (radioErr) {
+          console.log('⚠️ Radio input click failed, trying container...');
+          
+          // Final fallback: click the container itself
+          await razerGoldContainer.click();
+          console.log('✅ Clicked Razer Gold container');
+        }
+      }
+
+      // Wait a moment for selection to register
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Verify Razer Gold was selected by checking the radio input
+      const isRazerGoldSelected = await page.evaluate(() => {
+        const razerGoldRadio = document.querySelector('div[data-cs-override-id="purchase-paychann-razergoldwallet"] input[type="radio"]');
+        return razerGoldRadio && razerGoldRadio.checked;
+      });
+
+      if (!isRazerGoldSelected) {
+        console.log('⚠️ Razer Gold not selected, trying alternative selection...');
+        
+        // Alternative selection method using JavaScript
+        await page.evaluate(() => {
+          const razerGoldRadio = document.querySelector('div[data-cs-override-id="purchase-paychann-razergoldwallet"] input[type="radio"]');
+          if (razerGoldRadio) {
+            razerGoldRadio.checked = true;
+            razerGoldRadio.click();
+            
+            // Trigger change event
+            const event = new Event('change', { bubbles: true });
+            razerGoldRadio.dispatchEvent(event);
+          }
+        });
+        
+        // Check again
+        const isSelectedNow = await page.evaluate(() => {
+          const razerGoldRadio = document.querySelector('div[data-cs-override-id="purchase-paychann-razergoldwallet"] input[type="radio"]');
+          return razerGoldRadio && razerGoldRadio.checked;
+        });
+        
+        if (!isSelectedNow) {
+          throw new Error('❌ Failed to select Razer Gold payment method');
+        }
+      }
+
+      console.log('✅ Razer Gold payment method selected successfully');
       // Click checkout
       console.log('🛒 Clicking checkout...');
-      const checkoutButton = await page.waitForSelector(
-        "button[data-v-75e3a125][data-v-3ca6ed43]",
-        { visible: true, timeout: 20000 }
-      );
+      
+      // Try multiple selectors for checkout button
+      let checkoutButton = null;
+      const checkoutSelectors = [
+        "button[data-cs-override-id='purchase-webshop-checkout-btn']",
+        "button[data-cs-override-id='purchase-webshop-reload-checkout-btn']",
+        "button[aria-label='Checkout']",
+        "button[aria-label='RELOAD TO CHECKOUT']",
+        "button[data-v-3ca6ed43][class*='btn-primary']",
+        "button[data-v-75e3a125][data-v-3ca6ed43]" // Original selector as fallback
+      ];
+      
+      for (const selector of checkoutSelectors) {
+        try {
+          checkoutButton = await page.waitForSelector(selector, {
+            visible: true,
+            timeout: 5000
+          });
+          if (checkoutButton) {
+            console.log(`✅ Found checkout button with selector: ${selector}`);
+            break;
+          }
+        } catch (err) {
+          console.log(`⚠️ Checkout selector failed: ${selector}`);
+          continue;
+        }
+      }
+      
+      if (!checkoutButton) {
+        // Fallback: try to find by text content
+        checkoutButton = await page.evaluateHandle(() => {
+          const buttons = document.querySelectorAll("button");
+          for (const btn of buttons) {
+            const text = btn.textContent.toLowerCase().trim();
+            if (text.includes('checkout') || text.includes('reload to checkout')) {
+              return btn;
+            }
+          }
+          return null;
+        });
+      }
+      
+      if (!checkoutButton || checkoutButton.asElement() === null) {
+        throw new Error('❌ Could not find checkout button');
+      }
+      
       await checkoutButton.click();
+      console.log('✅ Checkout button clicked successfully');
 
       // Wait for navigation after checkout
       console.log('⏳ Waiting for page to load after checkout...');

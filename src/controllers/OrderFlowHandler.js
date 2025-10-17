@@ -691,30 +691,6 @@ class OrderFlowHandler {
         return;
       }
 
-      if (err.name === 'InsufficientBalanceError') {
-        // Keep session data but tell user to reload
-        this.updateSession(chatId, {
-          step: 'awaiting_reload'
-        });
-
-        try {
-          await bot.sendMessage(chatId,
-            `💰 *ACTION REQUIRED*  \n` +
-            `*Insufficient Balance*\n\n` +
-            `Your Razer Gold balance is\n` +
-            `too low for this purchase.\n\n` +
-            `Please reload your Razer Gold\n` +
-            `account, then type any message\n` +
-            `to retry the order.\n\n` +
-            `_Type /start to cancel_`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (sendErr) {
-          console.error('Error sending reload prompt:', sendErr);
-        }
-        return;
-      }
-
       // For other errors, clear session
       this.clearSession(chatId);
     }
