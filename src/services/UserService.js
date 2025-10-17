@@ -99,13 +99,13 @@ class UserService {
 
     return `
 📊 **Plan Details**
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━
 ${subscriptionInfo.planDisplay}
 Status: ${statusIcon} ${subscriptionInfo.isActive ? 'Active' : 'Expired'}
 Expires: ${subscriptionInfo.expiresAt}
 
 ⚡ **Usage Information**
-━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━
 Remaining Attempts Today: **${subscriptionInfo.attemptsRemaining}**
 
 `.trim();

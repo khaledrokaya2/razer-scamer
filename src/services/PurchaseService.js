@@ -50,150 +50,82 @@ class PurchaseService {
     const page = await browserManager.navigateToUrl(userId, gameUrl);
 
     try {
-      // Wait for cards to load with multiple possitible selectors
-      console.log('⏳ Waiting for cards to load...');
-      const cardSelectors = [
-        "div[class*='selection-tile__text']",
-        "div[class*='product-tile'] span",
-        "div[class*='catalog-item'] .title",
-        "div[class*='card-title']",
-        ".product-name",
-        "[data-testid*='product-name']"
-      ];
+      // Wait for page to fully load (Puppeteer method)
+      console.log('⏳ Waiting for page to load...');
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {
+        console.log('ℹ️ NetworkIdle timeout, continuing...');
+      });
 
-      let cardsFound = false;
-      let finalSelector = null;
+      // Wait for the main cards container (based on HTML structure)
+      console.log('⏳ Waiting for cards container...');
+      await page.waitForSelector('#webshop_step_sku .card-body.skus', {
+        visible: true,
+        timeout: 30000
+      });
 
-      for (const selector of cardSelectors) {
-        try {
-          await page.waitForSelector(selector, {
-            visible: true,
-            timeout: 10000
-          });
-
-          // Check if we actually found cards
-          const cardCount = await page.evaluate((sel) => {
-            return document.querySelectorAll(sel).length;
-          }, selector);
-
-          if (cardCount > 0) {
-            console.log(`✅ Found ${cardCount} cards with selector: ${selector}`);
-            finalSelector = selector;
-            cardsFound = true;
-            break;
-          }
-        } catch (err) {
-          console.log(`⚠️ Selector failed: ${selector}`);
-          continue;
-        }
-      }
-
-      if (!cardsFound) {
-        // Fallback: try to find any clickable elements that might be cards
-        console.log('🔍 Trying fallback card detection...');
-        const fallbackCards = await page.evaluate(() => {
-          // Look for common card patterns
-          const possibleCards = [
-            ...document.querySelectorAll("div[class*='tile']"),
-            ...document.querySelectorAll("div[class*='card']"),
-            ...document.querySelectorAll("div[class*='product']"),
-            ...document.querySelectorAll("div[class*='item']")
-          ].filter(el => {
-            const text = el.textContent.trim();
-            return text && text.length > 0 && text.length < 200; // Reasonable card title length
-          });
-
-          return possibleCards.length;
-        });
-
-        if (fallbackCards === 0) {
-          throw new Error('No cards found on the page. The page might not have loaded correctly or selectors have changed.');
-        }
-
-        console.log(`ℹ️ Found ${fallbackCards} potential cards with fallback method`);
-      }
+      // Wait for card tiles to load (based on actual HTML structure)
+      console.log('⏳ Waiting for card tiles...');
+      await page.waitForSelector('div[class*="selection-tile"] input[name="paymentAmountItem"]', {
+        visible: true,
+        timeout: 20000
+      });
 
       console.log('✅ Cards loaded, extracting options...');
 
-      // Get card names and states with improved detection
-      const cardsData = await page.evaluate((cardSelector) => {
-        let cardElements = [];
-        let radioInputs = [];
+      // Extract card data based on actual HTML structure
+      const cardsData = await page.evaluate(() => {
+        // Find all card containers
+        const cardContainers = document.querySelectorAll('#webshop_step_sku .selection-tile');
 
-        if (cardSelector) {
-          cardElements = document.querySelectorAll(cardSelector);
-        } else {
-          // Fallback detection
-          cardElements = [
-            ...document.querySelectorAll("div[class*='tile']"),
-            ...document.querySelectorAll("div[class*='card']"),
-            ...document.querySelectorAll("div[class*='product']")
-          ].filter(el => {
-            const text = el.textContent.trim();
-            return text && text.length > 0 && text.length < 200;
-          });
-        }
+        return Array.from(cardContainers).map((container, index) => {
+          // Get the radio input for this card
+          const radioInput = container.querySelector('input[type="radio"][name="paymentAmountItem"]');
 
-        // Try multiple selectors for radio inputs
-        const radioSelectors = [
-          "input[type='radio'][data-v-498979e2]",
-          "input[type='radio']",
-          "input[name*='product']",
-          "input[name*='card']",
-          "[type='radio']"
-        ];
-
-        for (const radioSel of radioSelectors) {
-          radioInputs = document.querySelectorAll(radioSel);
-          if (radioInputs.length > 0) break;
-        }
-
-        console.log(`Found ${cardElements.length} card elements and ${radioInputs.length} radio inputs`);
-
-        return Array.from(cardElements).map((el, index) => {
+          // Get the card text/name
+          const textElement = container.querySelector('.selection-tile__text');
           let name = '';
 
-          // Try different ways to extract card name
-          if (el.textContent) {
-            name = el.textContent.trim();
-          } else if (el.querySelector('[class*="title"], [class*="name"]')) {
-            name = el.querySelector('[class*="title"], [class*="name"]').textContent.trim();
-          } else if (el.getAttribute('title')) {
-            name = el.getAttribute('title').trim();
+          if (textElement) {
+            name = textElement.textContent.trim();
           }
 
-          // Clean up the name
-          name = name.replace(/\s+/g, ' ').trim();
+          // Check if disabled
+          let disabled = false;
+          if (radioInput) {
+            disabled = radioInput.disabled;
+          }
 
-          // Determine if disabled
-          let disabled = true;
-          if (radioInputs[index]) {
-            disabled = radioInputs[index].disabled;
-          } else {
-            // Check if parent element has disabled class or attribute
-            const parent = el.closest('[class*="tile"], [class*="card"], [class*="product"]');
-            if (parent) {
-              disabled = parent.classList.contains('disabled') ||
-                parent.classList.contains('out-of-stock') ||
-                parent.hasAttribute('disabled');
-            } else {
-              disabled = false; // Assume available if we can't determine
-            }
+          // Also check for disabled styling/classes
+          const content = container.querySelector('.selection-tile__content');
+          if (content) {
+            disabled = disabled ||
+              content.classList.contains('disable-hover') ||
+              content.classList.contains('disabled') ||
+              container.querySelector('.disabled') !== null;
+          }
+
+          // Check for "Out of stock" text
+          const outOfStockIndicator = container.querySelector('.selection-tile__detail');
+          if (outOfStockIndicator && outOfStockIndicator.textContent.toLowerCase().includes('out of stock')) {
+            disabled = true;
           }
 
           return {
             name: name,
             index: index,
-            disabled: disabled
+            disabled: disabled,
+            radioId: radioInput ? radioInput.id : null,
+            radioValue: radioInput ? radioInput.value : null
           };
         }).filter(card => card.name && card.name.length > 0); // Filter out empty cards
-      }, finalSelector);
+      });
 
       console.log(`✅ Successfully extracted ${cardsData.length} card options`);
 
       // Log card details for debugging
       cardsData.forEach((card, idx) => {
-        console.log(`   ${idx}: ${card.name} ${card.disabled ? '(OUT OF STOCK)' : '(AVAILABLE)'}`);
+        const status = card.disabled ? '(OUT OF STOCK)' : '(AVAILABLE)';
+        console.log(`   ${idx}: ${card.name} ${status} [ID: ${card.radioId}]`);
       });
 
       if (cardsData.length === 0) {
@@ -212,13 +144,15 @@ class PurchaseService {
         const pageInfo = await page.evaluate(() => ({
           url: window.location.href,
           title: document.title,
-          bodyText: document.body ? document.body.textContent.substring(0, 500) : 'No body',
-          elementCount: document.querySelectorAll('*').length
+          hasCardsContainer: !!document.querySelector('#webshop_step_sku'),
+          cardContainers: document.querySelectorAll('.selection-tile').length,
+          radioInputs: document.querySelectorAll('input[name="paymentAmountItem"]').length
         }));
         console.log('   URL:', pageInfo.url);
         console.log('   Title:', pageInfo.title);
-        console.log('   Elements:', pageInfo.elementCount);
-        console.log('   Body preview:', pageInfo.bodyText);
+        console.log('   Cards Container Found:', pageInfo.hasCardsContainer);
+        console.log('   Card Containers:', pageInfo.cardContainers);
+        console.log('   Radio Inputs:', pageInfo.radioInputs);
       } catch (debugErr) {
         console.log('   Could not get page debug info:', debugErr.message);
       }
@@ -290,49 +224,99 @@ class PurchaseService {
         await this.waitForCardInStock(page, cardIndex);
       }
 
-      // Select card - ensure we click the right one
+      // Select card - ensure we click the right one based on actual HTML structure
       console.log(`📦 Selecting card at index ${cardIndex}...`);
 
-      // Wait for card elements to be fully loaded and clickable
-      await page.waitForSelector("div[class*='selection-tile']", {
+      // Wait for card containers to be fully loaded and clickable
+      await page.waitForSelector('#webshop_step_sku .selection-tile', {
         visible: true,
         timeout: 20000
       });
 
-      // Get all card elements and verify count
-      const cardElements = await page.$$("div[class*='selection-tile']");
-      console.log(`Found ${cardElements.length} card elements`);
+      // Get all card containers from the cards section
+      const cardContainers = await page.$$('#webshop_step_sku .selection-tile');
+      console.log(`Found ${cardContainers.length} card containers`);
 
-      if (cardIndex >= cardElements.length) {
-        throw new Error(`Card index ${cardIndex} is out of range. Available cards: ${cardElements.length}`);
+      if (cardIndex >= cardContainers.length) {
+        throw new Error(`Card index ${cardIndex} is out of range. Available cards: ${cardContainers.length}`);
       }
 
-      // Click the specific card by index
-      const selectedCard = cardElements[cardIndex];
-      await selectedCard.click();
+      // Get the specific card container
+      const selectedCardContainer = cardContainers[cardIndex];
 
-      // Verify the card was selected by checking for active/selected state
+      // Try multiple selection methods for reliability
+      let cardSelected = false;
+
+      // Method 1: Click the label (most reliable for radio inputs)
+      try {
+        console.log('🎯 Trying to click card label...');
+        const label = await selectedCardContainer.$('label');
+        if (label) {
+          await label.click();
+          console.log('✅ Clicked card label');
+          cardSelected = true;
+        }
+      } catch (err) {
+        console.log('⚠️ Label click failed, trying radio input...');
+      }
+
+      // Method 2: Click the radio input directly
+      if (!cardSelected) {
+        try {
+          const radioInput = await selectedCardContainer.$('input[type="radio"][name="paymentAmountItem"]');
+          if (radioInput) {
+            await radioInput.click();
+            console.log('✅ Clicked card radio input');
+            cardSelected = true;
+          }
+        } catch (err) {
+          console.log('⚠️ Radio input click failed, trying container...');
+        }
+      }
+
+      // Method 3: Click the container itself
+      if (!cardSelected) {
+        await selectedCardContainer.click();
+        console.log('✅ Clicked card container');
+        cardSelected = true;
+      }
+
+      // Wait for selection to register
       await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Verify the card was selected by checking the radio input state
       const isSelected = await page.evaluate((index) => {
-        const radioInputs = document.querySelectorAll("input[type='radio'][data-v-498979e2]");
-        return radioInputs[index] ? radioInputs[index].checked : false;
+        const cardContainers = document.querySelectorAll('#webshop_step_sku .selection-tile');
+        if (cardContainers[index]) {
+          const radioInput = cardContainers[index].querySelector('input[type="radio"][name="paymentAmountItem"]');
+          return radioInput ? radioInput.checked : false;
+        }
+        return false;
       }, cardIndex);
 
       if (!isSelected) {
-        console.log('⚠️ Card not selected, trying alternative selection method...');
-        // Try clicking the radio input directly
+        console.log('⚠️ Card not selected, trying JavaScript selection...');
+        // Final fallback: use JavaScript to directly select the radio button
         await page.evaluate((index) => {
-          const radioInputs = document.querySelectorAll("input[type='radio'][data-v-498979e2]");
-          if (radioInputs[index]) {
-            radioInputs[index].click();
+          const cardContainers = document.querySelectorAll('#webshop_step_sku .selection-tile');
+          if (cardContainers[index]) {
+            const radioInput = cardContainers[index].querySelector('input[type="radio"][name="paymentAmountItem"]');
+            if (radioInput) {
+              radioInput.checked = true;
+              radioInput.click();
+
+              // Trigger change event
+              const event = new Event('change', { bubbles: true });
+              radioInput.dispatchEvent(event);
+            }
           }
         }, cardIndex);
       }
 
       console.log(`✅ Card ${cardIndex} selected successfully`);
 
-      // Wait for cards
-      await page.waitForSelector("div[class*='selection-tile__text']", {
+      // Wait for payment methods section to load
+      await page.waitForSelector("#webshop_step_payment_channels", {
         visible: true,
         timeout: 20000
       });
