@@ -50,86 +50,236 @@ class PurchaseService {
     const page = await browserManager.navigateToUrl(userId, gameUrl);
 
     try {
-      // Wait for page to fully load (Puppeteer method)
+      // Quick page load check - don't wait too long
       console.log('⏳ Waiting for page to load...');
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {
-        console.log('ℹ️ NetworkIdle timeout, continuing...');
+
+      // Check if page loaded successfully and user is logged in
+      await page.waitForSelector('body', { timeout: 10000 });
+
+      // Check for access denied or login required (improved logic)
+      const pageStatus = await page.evaluate(() => {
+        const title = document.title.toLowerCase();
+        const bodyText = document.body.textContent.toLowerCase();
+
+        // Check for actual login/auth issues (more specific)
+        const hasLoginForm = !!document.querySelector('form[action*="login"]') ||
+          !!document.querySelector('input[type="password"]') ||
+          !!document.querySelector('.login-form') ||
+          !!document.querySelector('[class*="auth"]');
+
+        const hasCards = document.querySelectorAll('input[name="paymentAmountItem"]').length > 0;
+        const hasPaymentMethods = document.querySelectorAll('input[name="paymentChannelItem"]').length > 0;
+
+        return {
+          title: document.title,
+          isAccessDenied: title.includes('access denied') || title.includes('forbidden') || title.includes('error'),
+          needsLogin: hasLoginForm && !hasCards, // Only consider login needed if no cards are found
+          hasMainContent: !!document.querySelector('main') || !!document.querySelector('#main_content'),
+          hasCards: hasCards,
+          hasPaymentMethods: hasPaymentMethods,
+          cardCount: document.querySelectorAll('input[name="paymentAmountItem"]').length,
+          paymentCount: document.querySelectorAll('input[name="paymentChannelItem"]').length
+        };
       });
 
-      // Wait for the main cards container (based on HTML structure)
-      console.log('⏳ Waiting for cards container...');
-      await page.waitForSelector('#webshop_step_sku .card-body.skus', {
-        visible: true,
-        timeout: 30000
-      });
+      if (pageStatus.isAccessDenied) {
+        throw new Error('Access denied - user may need to login or page is not accessible');
+      }
 
-      // Wait for card tiles to load (based on actual HTML structure)
-      console.log('⏳ Waiting for card tiles...');
-      await page.waitForSelector('div[class*="selection-tile"] input[name="paymentAmountItem"]', {
-        visible: true,
-        timeout: 20000
-      });
+      // Only throw login error if we don't have any cards AND there's a login form
+      if (pageStatus.needsLogin && !pageStatus.hasCards) {
+        throw new Error('Login required - user needs to authenticate first');
+      }
 
-      console.log('✅ Cards loaded, extracting options...');
+      console.log(`📄 Page loaded: ${pageStatus.title}`);
+      console.log(`🎯 Quick scan: ${pageStatus.cardCount} cards, ${pageStatus.paymentCount} payment methods`);
 
-      // Extract card data based on actual HTML structure
-      const cardsData = await page.evaluate(() => {
-        // Find all card containers
-        const cardContainers = document.querySelectorAll('#webshop_step_sku .selection-tile');
+      // If we already found cards in the quick scan, use fast path
+      if (pageStatus.hasCards && pageStatus.cardCount > 0) {
+        console.log('⚡ Fast path: Cards detected, extracting directly...');
 
-        return Array.from(cardContainers).map((container, index) => {
-          // Get the radio input for this card
-          const radioInput = container.querySelector('input[type="radio"][name="paymentAmountItem"]');
+        const cardsData = await page.evaluate(() => {
+          const containers = document.querySelectorAll('#webshop_step_sku .selection-tile, .sku-list__item .selection-tile, [class*="sku"] .selection-tile');
 
-          // Get the card text/name
-          const textElement = container.querySelector('.selection-tile__text');
-          let name = '';
+          return Array.from(containers).map((container, index) => {
+            const radioInput = container.querySelector('input[type="radio"][name="paymentAmountItem"]');
+            if (!radioInput) return null; // Skip non-card containers
 
-          if (textElement) {
-            name = textElement.textContent.trim();
-          }
+            // Get card name
+            const textElement = container.querySelector('.selection-tile__text') ||
+              container.querySelector('[class*="title"]') ||
+              container.querySelector('label');
 
-          // Check if disabled
-          let disabled = false;
-          if (radioInput) {
-            disabled = radioInput.disabled;
-          }
+            let name = textElement ? textElement.textContent.trim() : '';
 
-          // Also check for disabled styling/classes
-          const content = container.querySelector('.selection-tile__content');
-          if (content) {
+            // Check if disabled
+            let disabled = radioInput.disabled ||
+              container.classList.contains('disabled') ||
+              container.querySelector('.disabled') !== null ||
+              (container.textContent && container.textContent.toLowerCase().includes('out of stock'));
+
+            return {
+              name: name,
+              index: index,
+              disabled: disabled,
+              radioId: radioInput.id,
+              radioValue: radioInput.value
+            };
+          }).filter(card => card && card.name && card.name.length > 0);
+        });
+
+        console.log(`✅ Fast extraction: Found ${cardsData.length} cards`);
+
+        if (cardsData.length > 0) {
+          // Log card details
+          cardsData.forEach((card, idx) => {
+            const status = card.disabled ? '(OUT OF STOCK)' : '(AVAILABLE)';
+            console.log(`   ${idx}: ${card.name} ${status}`);
+          });
+
+          browserManager.updateActivity(userId);
+          return cardsData;
+        }
+      }
+
+      // Fallback: If fast path didn't work, try slower detection methods
+      console.log('🔍 Fast path failed, trying detailed scanning...');
+
+      let cardsData = [];
+      let detectionMethod = '';
+
+      // Method 1: Try the specific structure first (2 second timeout)
+      try {
+        await page.waitForSelector('div[class*="selection-tile"]', { timeout: 2000 });
+        cardsData = await page.evaluate(() => {
+          // Look for card containers in multiple possible locations
+          const containers = [
+            ...document.querySelectorAll('#webshop_step_sku .selection-tile'),
+            ...document.querySelectorAll('div[class*="selection-tile"]'),
+            ...document.querySelectorAll('.sku-list__item .selection-tile'),
+            ...document.querySelectorAll('[class*="catalog"] .selection-tile')
+          ];
+
+          const uniqueContainers = [...new Set(containers)]; // Remove duplicates
+
+          return uniqueContainers.map((container, index) => {
+            // Get radio input
+            const radioInput = container.querySelector('input[type="radio"]');
+
+            // Get card name from multiple possible locations
+            let name = '';
+            const textElement = container.querySelector('.selection-tile__text') ||
+              container.querySelector('[class*="title"]') ||
+              container.querySelector('[class*="name"]') ||
+              container.querySelector('label');
+
+            if (textElement) {
+              name = textElement.textContent.trim();
+            }
+
+            // Check if disabled
+            let disabled = false;
+            if (radioInput) {
+              disabled = radioInput.disabled;
+            }
+
+            // Check for disabled styling
             disabled = disabled ||
-              content.classList.contains('disable-hover') ||
-              content.classList.contains('disabled') ||
-              container.querySelector('.disabled') !== null;
-          }
+              container.classList.contains('disabled') ||
+              container.querySelector('.disabled') !== null ||
+              container.querySelector('[class*="out-of-stock"]') !== null ||
+              (container.textContent && container.textContent.toLowerCase().includes('out of stock'));
 
-          // Check for "Out of stock" text
-          const outOfStockIndicator = container.querySelector('.selection-tile__detail');
-          if (outOfStockIndicator && outOfStockIndicator.textContent.toLowerCase().includes('out of stock')) {
-            disabled = true;
-          }
+            return {
+              name: name,
+              index: index,
+              disabled: disabled,
+              radioId: radioInput ? radioInput.id : null,
+              radioValue: radioInput ? radioInput.value : null
+            };
+          }).filter(card => card.name && card.name.length > 0);
+        });
 
-          return {
-            name: name,
-            index: index,
-            disabled: disabled,
-            radioId: radioInput ? radioInput.id : null,
-            radioValue: radioInput ? radioInput.value : null
-          };
-        }).filter(card => card.name && card.name.length > 0); // Filter out empty cards
-      });
+        if (cardsData.length > 0) {
+          detectionMethod = 'Specific structure';
+        }
+      } catch (err) {
+        console.log('⚠️ Specific structure detection failed, trying fallback...');
+      }
 
-      console.log(`✅ Successfully extracted ${cardsData.length} card options`);
+      // Method 2: Generic fallback detection
+      if (cardsData.length === 0) {
+        cardsData = await page.evaluate(() => {
+          // Look for any radio inputs that might be cards
+          const radioInputs = document.querySelectorAll('input[type="radio"]');
+          const cardCandidates = [];
+
+          radioInputs.forEach((radio, index) => {
+            // Skip payment method radios
+            const name = radio.getAttribute('name') || '';
+            if (name.includes('payment') && !name.includes('amount')) {
+              return;
+            }
+
+            // Find the label or text associated with this radio
+            let labelText = '';
+
+            // Try to find label by 'for' attribute
+            if (radio.id) {
+              const label = document.querySelector(`label[for="${radio.id}"]`);
+              if (label) {
+                labelText = label.textContent.trim();
+              }
+            }
+
+            // If no label found, look in parent container
+            if (!labelText) {
+              const parent = radio.closest('div');
+              if (parent) {
+                labelText = parent.textContent.trim();
+                // Clean up text (remove extra whitespace, etc.)
+                labelText = labelText.replace(/\s+/g, ' ').substring(0, 100);
+              }
+            }
+
+            if (labelText && labelText.length > 0) {
+              cardCandidates.push({
+                name: labelText,
+                index: index,
+                disabled: radio.disabled,
+                radioId: radio.id,
+                radioValue: radio.value
+              });
+            }
+          });
+
+          // Filter to likely product cards (exclude very short names, payment methods, etc.)
+          return cardCandidates.filter(card => {
+            const name = card.name.toLowerCase();
+            return name.length > 3 &&
+              !name.includes('razer gold') &&
+              !name.includes('paypal') &&
+              !name.includes('credit card') &&
+              !name.includes('payment');
+          });
+        });
+
+        if (cardsData.length > 0) {
+          detectionMethod = 'Generic fallback';
+        }
+      }
+
+      console.log(`✅ Cards detected using: ${detectionMethod}`);
+      console.log(`📦 Found ${cardsData.length} card options`);
 
       // Log card details for debugging
       cardsData.forEach((card, idx) => {
         const status = card.disabled ? '(OUT OF STOCK)' : '(AVAILABLE)';
-        console.log(`   ${idx}: ${card.name} ${status} [ID: ${card.radioId}]`);
+        console.log(`   ${idx}: ${card.name} ${status}`);
       });
 
       if (cardsData.length === 0) {
-        throw new Error('No valid cards found. The page structure might have changed.');
+        throw new Error('No cards found. The page might not have loaded properly or the game might not be available.');
       }
 
       browserManager.updateActivity(userId);
@@ -138,7 +288,7 @@ class PurchaseService {
     } catch (err) {
       console.error('❌ Error getting available cards:', err.message);
 
-      // Additional debugging info
+      // Enhanced debugging info
       console.log('🔍 Page debugging info:');
       try {
         const pageInfo = await page.evaluate(() => ({
@@ -146,13 +296,17 @@ class PurchaseService {
           title: document.title,
           hasCardsContainer: !!document.querySelector('#webshop_step_sku'),
           cardContainers: document.querySelectorAll('.selection-tile').length,
-          radioInputs: document.querySelectorAll('input[name="paymentAmountItem"]').length
+          radioInputs: document.querySelectorAll('input[type="radio"]').length,
+          allRadioNames: [...document.querySelectorAll('input[type="radio"]')].map(r => r.getAttribute('name')).filter(Boolean),
+          bodyText: document.body ? document.body.textContent.substring(0, 200) : 'No body'
         }));
         console.log('   URL:', pageInfo.url);
         console.log('   Title:', pageInfo.title);
         console.log('   Cards Container Found:', pageInfo.hasCardsContainer);
         console.log('   Card Containers:', pageInfo.cardContainers);
         console.log('   Radio Inputs:', pageInfo.radioInputs);
+        console.log('   Radio Names:', pageInfo.allRadioNames);
+        console.log('   Body Preview:', pageInfo.bodyText);
       } catch (debugErr) {
         console.log('   Could not get page debug info:', debugErr.message);
       }
