@@ -98,24 +98,17 @@ class UserService {
     const statusIcon = subscriptionInfo.isActive ? '✅' : '❌';
 
     return `
-✨YOUR SUBSCRIPTION PLAN✨
-
 📊 **Plan Details**
-     ━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━
 ${subscriptionInfo.planDisplay}
 Status: ${statusIcon} ${subscriptionInfo.isActive ? 'Active' : 'Expired'}
 Expires: ${subscriptionInfo.expiresAt}
 
 ⚡ **Usage Information**
-     ━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━
 Remaining Attempts Today: **${subscriptionInfo.attemptsRemaining}**
 
-${subscriptionInfo.plan === 'free'
-        ? '💡 Upgrade to a paid plan to create orders!'
-        : subscriptionInfo.attemptsRemaining === 0
-          ? '⚠️ No attempts remaining. Renew subscription to continue.'
-          : '✨ You can create orders using the button below!'}
-    `.trim();
+`.trim();
   }
 
   /**

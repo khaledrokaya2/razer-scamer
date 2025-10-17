@@ -71,13 +71,10 @@ class OrderFlowHandler {
     const errorMessage = error.message || '';
 
     if (errorMessage.includes('Invalid backup code') || errorMessage.includes('incorrect')) {
-      return `╔═══════════════════════╗\n` +
-        `     ❌ *ERROR*     \n` +
-        `╚═══════════════════════╝\n\n` +
+      return `❌ *ERROR*     \n` +
         `*Invalid Backup Code*\n\n` +
         `The backup code you entered\n` +
         `is incorrect.\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `🔑 Please start a new order\n` +
         `   and enter a valid 8-digit\n` +
         `   backup code from your\n` +
@@ -86,25 +83,19 @@ class OrderFlowHandler {
     }
 
     if (errorMessage.includes('Insufficient Razer Gold balance')) {
-      return `╔═══════════════════════╗\n` +
-        `     ❌ *ERROR*     \n` +
-        `╚═══════════════════════╝\n\n` +
+      return `❌ *ERROR*     \n` +
         `*Insufficient Balance*\n\n` +
         `Your Razer Gold balance\n` +
         `is too low for this purchase.\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `💰 Please reload your Razer\n` +
         `   Gold account and try again.\n\n` +
         `Use /start to create a new order.`;
     }
 
     if (errorMessage.includes('out of stock') && errorMessage.includes('retrying')) {
-      return `╔═══════════════════════╗\n` +
-        `    ⏳ *AUTO-RETRY*    \n` +
-        `╚═══════════════════════╝\n\n` +
+      return `⏳ *AUTO-RETRY*    \n` +
         `Card went out of stock\n` +
         `during purchase.\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `🔄 The bot is monitoring\n` +
         `   stock and will automatically\n` +
         `   retry when available.\n\n` +
@@ -112,12 +103,9 @@ class OrderFlowHandler {
     }
 
     if (errorMessage.includes('out of stock')) {
-      return `╔═══════════════════════╗\n` +
-        `  ⚠️ *OUT OF STOCK*   \n` +
-        `╚═══════════════════════╝\n\n` +
+      return `⚠️ *OUT OF STOCK*   \n` +
         `This card is currently\n` +
         `unavailable.\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `⏱️ The bot will automatically\n` +
         `   wait and purchase when it\n` +
         `   becomes available.\n\n` +
@@ -125,24 +113,18 @@ class OrderFlowHandler {
     }
 
     if (errorMessage.includes('No active browser session')) {
-      return `╔═══════════════════════╗\n` +
-        `  ⚠️ *SESSION EXPIRED* \n` +
-        `╚═══════════════════════╝\n\n` +
+      return `⚠️ *SESSION EXPIRED* \n` +
         `Your login session has\n` +
         `timed out.\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `🔐 Please login again using\n` +
         `   the /start command.`;
     }
 
     if (errorMessage.includes('Too many consecutive failures')) {
-      return `╔═══════════════════════╗\n` +
-        `     ❌ *ERROR*     \n` +
-        `╚═══════════════════════╝\n\n` +
+      return `❌ *ERROR*     \n` +
         `*Multiple Failures*\n\n` +
         `The purchase process failed\n` +
         `multiple times in a row.\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `🔄 Please try again later or\n` +
         `   contact support if the issue\n` +
         `   persists.\n\n` +
@@ -150,12 +132,9 @@ class OrderFlowHandler {
     }
 
     // Default error message
-    return `╔═══════════════════════╗\n` +
-      `     ❌ *ERROR*     \n` +
-      `╚═══════════════════════╝\n\n` +
+    return `❌ *ERROR*     \n` +
       `*Order Failed*\n\n` +
       `${errorMessage}\n\n` +
-      `${'─'.repeat(30)}\n\n` +
       `Please try again or contact\n` +
       `support if the problem persists.\n\n` +
       `Use /start to try again.`;
@@ -240,12 +219,8 @@ class OrderFlowHandler {
 
     try {
       await bot.sendMessage(chatId,
-        `╔═══════════════════════╗\n` +
-        `    🎮 *SELECT GAME*    \n` +
-        `╚═══════════════════════╝\n\n` +
-        `Choose the game you want to\n` +
-        `purchase cards for:\n\n` +
-        `${'─'.repeat(30)}`,
+        `🎮 *SELECT GAME*    \n` +
+        `Choose the game you want:\n` +
         {
           parse_mode: 'Markdown',
           reply_markup: { inline_keyboard: keyboard }
@@ -266,9 +241,7 @@ class OrderFlowHandler {
     this.clearCancellation(chatId);
     try {
       await bot.sendMessage(chatId,
-        `╔═══════════════════════╗\n` +
-        `   ❌ *ORDER CANCELLED*   \n` +
-        `╚═══════════════════════╝\n\n` +
+        `❌ *ORDER CANCELLED*   \n` +
         `Your order has been cancelled.\n\n` +
         `Use /start to create a new order.`
         , { parse_mode: 'Markdown' });
@@ -288,9 +261,7 @@ class OrderFlowHandler {
 
     try {
       await bot.sendMessage(chatId,
-        `╔═══════════════════════╗\n` +
-        `  🛑 *CANCELLING ORDER*  \n` +
-        `╚═══════════════════════╝\n\n` +
+        `🛑 *CANCELLING ORDER*  \n` +
         `⏳ Stopping the purchase process...\n\n` +
         `_Please wait for current operation_\n` +
         `_to complete safely._`,
@@ -387,12 +358,9 @@ class OrderFlowHandler {
       ]);
 
       await bot.sendMessage(chatId,
-        `╔═══════════════════════╗\n` +
-        `  💎 *SELECT CARD VALUE* \n` +
-        `╚═══════════════════════╝\n\n` +
+        `💎 *SELECT CARD VALUE* \n` +
         `🎮 *Game:* ${game.name}\n\n` +
         `Choose a card denomination:\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `_Out of stock cards will be_\n` +
         `_monitored and auto-purchased_\n` +
         `_when available._`,
@@ -414,13 +382,8 @@ class OrderFlowHandler {
       }
 
       await bot.sendMessage(chatId,
-        `╔═══════════════════════╗\n` +
-        `     ❌ *ERROR*     \n` +
-        `╚═══════════════════════╝\n\n` +
+        `❌ *ERROR*     \n` +
         `Failed to load available cards.\n\n` +
-        `📋 *Reason:*\n` +
-        `${err.message}\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `Please try again later or\n` +
         `contact support if the issue\n` +
         `persists.\n\n` +
@@ -444,9 +407,7 @@ class OrderFlowHandler {
     if (!session) {
       try {
         await bot.sendMessage(chatId,
-          `╔═══════════════════════╗\n` +
-          `  ⚠️ *SESSION EXPIRED*  \n` +
-          `╚═══════════════════════╝\n\n` +
+          `⚠️ *SESSION EXPIRED*  \n` +
           `Your session has timed out.\n\n` +
           `Use /start to create a new order.`,
           { parse_mode: 'Markdown' }
@@ -467,12 +428,9 @@ class OrderFlowHandler {
     // Ask for quantity
     try {
       await bot.sendMessage(chatId,
-        `╔═══════════════════════╗\n` +
-        `  📦 *ENTER QUANTITY*   \n` +
-        `╚═══════════════════════╝\n\n` +
+        `📦 *ENTER QUANTITY*   \n` +
         `💎 *Selected Card:*\n` +
         `     ${cardName.replace(/_/g, ' ')}\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `How many cards do you want\n` +
         `to purchase?\n\n` +
         `📊 *Valid range:* 1 - 100\n\n` +
@@ -503,9 +461,7 @@ class OrderFlowHandler {
 
     if (isNaN(quantity) || quantity < 1 || quantity > 100) {
       await bot.sendMessage(chatId,
-        `╔═══════════════════════╗\n` +
-        `   ⚠️ *INVALID INPUT*    \n` +
-        `╚═══════════════════════╝\n\n` +
+        `⚠️ *INVALID INPUT*    \n` +
         `Please enter a valid number\n` +
         `between *1* and *100*.\n\n` +
         `_Try again or /start to cancel_`,
@@ -522,16 +478,9 @@ class OrderFlowHandler {
 
     // Ask for backup code
     await bot.sendMessage(chatId,
-      `╔═══════════════════════╗\n` +
-      ` 🔐 *BACKUP CODE NEEDED* \n` +
-      `╚═══════════════════════╝\n\n` +
+      `🔐 *BACKUP CODE NEEDED* \n` +
       `✅ *Quantity:* ${quantity} cards\n\n` +
-      `${'─'.repeat(30)}\n\n` +
-      `Please enter an 8-digit\n` +
-      `backup code from your\n` +
-      `Razer account 2FA:\n\n` +
-      `📋 *Example:* 12345678\n\n` +
-      `${'─'.repeat(30)}\n\n` +
+      `Please enter an 8-digit 2FA Code:\n` +
       `⚠️ *Note:* Backup codes are\n` +
       `single-use and will be consumed.`,
       {
@@ -559,12 +508,9 @@ class OrderFlowHandler {
     if (!/^\d{8}$/.test(backupCode)) {
       try {
         await bot.sendMessage(chatId,
-          `╔═══════════════════════╗\n` +
-          `   ⚠️ *INVALID FORMAT*   \n` +
-          `╚═══════════════════════╝\n\n` +
+          `⚠️ *INVALID FORMAT*   \n` +
           `Backup code must be exactly\n` +
           `*8 digits*.\n\n` +
-          `📋 *Example:* 12345678\n\n` +
           `Please try again:`,
           { parse_mode: 'Markdown' }
         );
@@ -583,20 +529,13 @@ class OrderFlowHandler {
     // LOGIC BUG FIX #11: Warn user that backup codes are single-use
     try {
       await bot.sendMessage(chatId,
-        `╔═══════════════════════╗\n` +
-        `    📋 *ORDER SUMMARY*    \n` +
-        `╚═══════════════════════╝\n\n` +
+        `📋 *ORDER SUMMARY*    \n` +
         `🎮 *Game*\n` +
         `     ${session.gameName}\n\n` +
         `💎 *Card Type*\n` +
         `     ${session.cardName}\n\n` +
         `📦 *Quantity*\n` +
         `     ${session.quantity} ${session.quantity === 1 ? 'card' : 'cards'}\n\n` +
-        `${'─'.repeat(30)}\n\n` +
-        `⚠️ *IMPORTANT NOTICE*\n` +
-        `Backup codes are single-use and will\n` +
-        `be consumed even if purchase fails.\n\n` +
-        `${'─'.repeat(30)}\n\n` +
         `⏳ *Processing your order...*\n\n` +
         `_This may take several minutes_\n` +
         `_depending on stock availability._`,
@@ -622,9 +561,7 @@ class OrderFlowHandler {
           const percentage = Math.round((completed / total) * 100);
 
           await bot.sendMessage(chatId,
-            `╔═══════════════════════╗\n` +
-            `   ⏳ *PURCHASE PROGRESS*   \n` +
-            `╚═══════════════════════╝\n\n` +
+            `⏳ *PURCHASE PROGRESS*   \n` +
             `${progressBar}\n\n` +
             `✅ *Completed:* ${completed} / ${total} cards\n` +
             `📊 *Progress:* ${percentage}%\n\n` +
@@ -659,14 +596,11 @@ class OrderFlowHandler {
       // Send success message
       try {
         await bot.sendMessage(chatId,
-          `╔═══════════════════════╗\n` +
-          `  ✅ *ORDER COMPLETED*   \n` +
-          `╚═══════════════════════╝\n\n` +
+          `✅ *ORDER COMPLETED*   \n` +
           `🆔 *Order ID:* #${result.order.id}\n\n` +
           `📦 *Purchases*\n` +
           `     ${result.order.completed_purchases} / ${result.order.cards_count} cards\n\n` +
           `📊 *Status:* ${result.order.status}\n\n` +
-          `${'─'.repeat(30)}\n\n` +
           `📨 *Sending your cards now...*`,
           { parse_mode: 'Markdown' }
         );
@@ -705,9 +639,7 @@ class OrderFlowHandler {
       if (err.message && err.message.includes('cancelled by user')) {
         try {
           await bot.sendMessage(chatId,
-            `╔═══════════════════════╗\n` +
-            `   ❌ *ORDER CANCELLED*   \n` +
-            `╚═══════════════════════╝\n\n` +
+            `❌ *ORDER CANCELLED*   \n` +
             `Your order was cancelled.\n\n` +
             `Completed: ${err.completedPurchases || 0} cards\n\n` +
             `Use /start to create a new order.`,
@@ -743,16 +675,10 @@ class OrderFlowHandler {
 
         try {
           await bot.sendMessage(chatId,
-            `╔═══════════════════════╗\n` +
-            `  🔐 *RETRY BACKUP CODE* \n` +
-            `╚═══════════════════════╝\n\n` +
+            `🔐 *RETRY BACKUP CODE* \n` +
             `The previous backup code\n` +
             `was invalid or already used.\n\n` +
-            `${'─'.repeat(30)}\n\n` +
-            `Please enter a different\n` +
-            `8-digit backup code from your\n` +
-            `Razer account:\n\n` +
-            `📋 *Example:* 12345678\n\n` +
+            `Please enter a different:\n` +
             `_Type /start to cancel_`,
             { parse_mode: 'Markdown' }
           );
@@ -773,13 +699,10 @@ class OrderFlowHandler {
 
         try {
           await bot.sendMessage(chatId,
-            `╔═══════════════════════╗\n` +
-            `  💰 *ACTION REQUIRED*  \n` +
-            `╚═══════════════════════╝\n\n` +
+            `💰 *ACTION REQUIRED*  \n` +
             `*Insufficient Balance*\n\n` +
             `Your Razer Gold balance is\n` +
             `too low for this purchase.\n\n` +
-            `${'─'.repeat(30)}\n\n` +
             `Please reload your Razer Gold\n` +
             `account, then type any message\n` +
             `to retry the order.\n\n` +

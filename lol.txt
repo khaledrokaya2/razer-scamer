@@ -1,0 +1,40 @@
+samehrazer40+63@gmail.com
+razerrazer123@
+
+
+choose another way button:
+button[class*='arrowed']"
+
+
+choose backup Codes:
+document.querySelectorAll("button")[1].innerHTML === "Backup Codes"
+
+
+otp:
+<div class="input-group-otp-2"><label for="otp-input-0"><input id="otp-input-0" type="number" pattern="[0-9]" class=" input-otp" maxlength="1" autocomplete="one-time-code" aria-label="One-time password Digit 1" role="textbox"></label><label for="otp-input-1"><input id="otp-input-1" type="number" pattern="[0-9]" class=" input-otp" maxlength="1" autocomplete="one-time-code" aria-label="One-time password Digit 2" role="textbox"></label><label for="otp-input-2"><input id="otp-input-2" type="number" pattern="[0-9]" class=" input-otp" maxlength="1" autocomplete="one-time-code" aria-label="One-time password Digit 3" role="textbox"></label><label for="otp-input-3"><input id="otp-input-3" type="number" pattern="[0-9]" class=" input-otp" maxlength="1" autocomplete="one-time-code" aria-label="One-time password Digit 4" role="textbox"></label><label for="otp-input-4"><input id="otp-input-4" type="number" pattern="[0-9]" class=" input-otp" maxlength="1" autocomplete="one-time-code" aria-label="One-time password Digit 5" role="textbox"></label><label for="otp-input-5"><input id="otp-input-5" type="number" pattern="[0-9]" class=" input-otp" maxlength="1" autocomplete="one-time-code" aria-label="One-time password Digit 6" role="textbox"></label><label for="otp-input-6"><input id="otp-input-6" type="number" pattern="[0-9]" class=" input-otp" maxlength="1" autocomplete="one-time-code" aria-label="One-time password Digit 7" role="textbox"></label><label for="otp-input-7"><input id="otp-input-7" type="number" pattern="[0-9]" class=" input-otp" maxlength="1" autocomplete="one-time-code" aria-label="One-time password Digit 8" role="textbox"></label></div>
+
+
+
+pin-code:
+document.querySelectorAll("div[class='pin-code']")[0].innerHTML
+
+
+
+serial:
+document.querySelectorAll("div[class='pin-serial-number']")[0].innerHTML
+' S/N: 760928980'
+
+
+order Details:
+document.querySelectorAll("span[data-v-175ddd8f]")
+0:Transaction Date
+1:Payment Method
+2:Transaction Number
+3:Status
+
+
+Payment:
+document.querySelectorAll("div[data-v-175ddd8f] span[class*='text--zgold']")
+0: Payment Amount
+1: Subtotal
+

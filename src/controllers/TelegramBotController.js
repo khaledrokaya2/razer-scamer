@@ -25,7 +25,7 @@ class TelegramBotController {
     this.userStates = {};
     // Rate limiting: chatId -> last request timestamp
     this.rateLimits = new Map();
-    this.RATE_LIMIT_MS = 3000; // 3 seconds between requests
+    this.RATE_LIMIT_MS = 1500; // 1.5 seconds between requests
     // State locking to prevent race conditions
     this.processingCallbacks = new Set();
   }

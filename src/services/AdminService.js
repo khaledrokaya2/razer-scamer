@@ -130,26 +130,20 @@ class AdminService {
     const isActive = user.hasActiveSubscription() ? '✅ Active' : '❌ Expired';
 
     return `
-════════════════════════════════════════
-              USER DETAILS                
-════════════════════════════════════════
-
 👤 **User Information**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━
 • User ID: \`${user.id}\`
 • Telegram ID: \`${user.telegram_user_id}\`
 • Username: @${user.username}
 • Role: ${user.role === 'admin' ? '👑 Administrator' : '👤 User'}
 • Joined: ${new Date(user.created_at).toLocaleDateString()}
 
-📊 **Subscription Details**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 **Subscription**
+━━━━━━━━━━━━━━━━━━━━
 • Plan: ${user.getSubscriptionDisplay()}
 • Status: ${isActive}
 • Expires: ${expirationDate}
 • Remaining Attempts: ${user.AllowedAttempts}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     `.trim();
   }
 
