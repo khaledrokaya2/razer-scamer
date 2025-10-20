@@ -20,9 +20,15 @@ const gamesCatalog = [
   },
   {
     id: 'pubg-mobile',
-    name: '🎮 PUBG Mobile',
+    name: '🔫 PUBG Mobile',
     link: 'https://gold.razer.com/global/en/gold/catalog/pubg-mobile-uc-code',
     description: 'PUBG Mobile UC'
+  },
+  {
+    id: "xbox-live-usa",
+    name: "❎ Xbox Live USA",
+    link: "https://gold.razer.com/global/en/gold/catalog/xbox-live-usa",
+    description: "Xbox Live USA"
   }
 ];
 

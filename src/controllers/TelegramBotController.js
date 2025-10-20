@@ -377,7 +377,7 @@ class TelegramBotController {
 
             await this.safeSendMessage(
               chatId,
-              '⚠️ You must login first to create orders.',
+              '⚠️ You must login first.',
               { reply_markup: keyboard }
             );
             return;
@@ -601,7 +601,7 @@ class TelegramBotController {
     }
 
     // Inform user that balance check is in progress
-    this.bot.sendMessage(chatId, '⏳ Checking your balance...');
+    const checkBalanceMessage = this.bot.sendMessage(chatId, '⏳ Checking your balance...');
 
     try {
       // Get user from database for browser session management
@@ -614,11 +614,18 @@ class TelegramBotController {
       // Call scraper service to get balance (pass user.id for browser management)
       const balance = await scraperService.getBalance(user.id, session.page);
 
+      // Delete the loading message
+      checkBalanceMessage.then(msg => {
+        this.bot.deleteMessage(chatId, msg.message_id).catch(() => {
+          console.log('Could not delete loading message');
+        });
+      });
+
       // Send balance information to user
       this.bot.sendMessage(
         chatId,
         `💰 **Your Razer Balance:**\n\n` +
-        `🟡 Gold: ${balance.gold}\n` +
+        `🥇 Gold: ${balance.gold}\n` +
         `🥈 Silver: ${balance.silver}`,
         { parse_mode: 'Markdown' }
       );

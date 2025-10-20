@@ -659,7 +659,7 @@ class OrderFlowHandler {
       const friendlyError = this.getUserFriendlyError(err);
 
       try {
-        await bot.sendMessage(chatId, friendlyError);
+        await bot.sendMessage(chatId, friendlyError, { parse_mode: 'Markdown' });
       } catch (sendErr) {
         console.error('Error sending error message:', err);
       }
