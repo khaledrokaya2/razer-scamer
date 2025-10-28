@@ -19,6 +19,8 @@ class OrderFlowHandler {
     this.orderSessions = new Map(); // chatId -> {step, gameId, cardIndex, cardName, quantity}
     // Track cancellation requests
     this.cancellationRequests = new Set();
+    // Track progress message IDs for editing
+    this.progressMessages = new Map(); // chatId -> messageId
   }
 
   /**
@@ -560,21 +562,53 @@ class OrderFlowHandler {
           const progressBar = this.createProgressBar(completed, total);
           const percentage = Math.round((completed / total) * 100);
 
-          await bot.sendMessage(chatId,
-            `⏳ *PURCHASE PROGRESS*   \n` +
+          const progressText = `⏳ *PURCHASE PROGRESS*   \n` +
             `${progressBar}\n\n` +
             `✅ *Completed:* ${completed} / ${total} cards\n` +
             `📊 *Progress:* ${percentage}%\n\n` +
-            `_Processing... Please wait_`,
-            {
+            `_Processing... Please wait_`;
+
+          // Check if we have a previous progress message to edit
+          const existingMessageId = this.progressMessages.get(chatId);
+
+          if (existingMessageId) {
+            // Edit existing message
+            try {
+              await bot.editMessageText(progressText, {
+                chat_id: chatId,
+                message_id: existingMessageId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
+                  ]]
+                }
+              });
+            } catch (editErr) {
+              // If edit fails (message too old or deleted), send new message
+              console.log('Could not edit progress message, sending new one');
+              const newMsg = await bot.sendMessage(chatId, progressText, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
+                  ]]
+                }
+              });
+              this.progressMessages.set(chatId, newMsg.message_id);
+            }
+          } else {
+            // Send new message and store its ID
+            const msg = await bot.sendMessage(chatId, progressText, {
               parse_mode: 'Markdown',
               reply_markup: {
                 inline_keyboard: [[
                   { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
                 ]]
               }
-            }
-          );
+            });
+            this.progressMessages.set(chatId, msg.message_id);
+          }
         } catch (err) {
           console.log('Could not send progress update:', err.message);
         }
@@ -628,9 +662,10 @@ class OrderFlowHandler {
         console.error('Error sending order results:', err);
       }
 
-      // Clear session and cancellation flag
+      // Clear session, cancellation flag, and progress message
       this.clearSession(chatId);
       this.clearCancellation(chatId);
+      this.progressMessages.delete(chatId);
 
     } catch (err) {
       console.error('Order processing error:', err);
@@ -649,9 +684,10 @@ class OrderFlowHandler {
           console.error('Error sending cancellation message:', sendErr);
         }
 
-        // Clear session and cancellation flag
+        // Clear session, cancellation flag, and progress message
         this.clearSession(chatId);
         this.clearCancellation(chatId);
+        this.progressMessages.delete(chatId);
         return;
       }
 
@@ -686,13 +722,16 @@ class OrderFlowHandler {
           console.error('Error sending retry prompt:', sendErr);
         }
 
-        // Clear cancellation flag but keep session
+        // Clear cancellation flag and progress message but keep session
         this.clearCancellation(chatId);
+        this.progressMessages.delete(chatId);
         return;
       }
 
-      // For other errors, clear session
+      // For other errors, clear session, cancellation, and progress message
       this.clearSession(chatId);
+      this.clearCancellation(chatId);
+      this.progressMessages.delete(chatId);
     }
   }
 

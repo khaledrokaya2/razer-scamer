@@ -379,7 +379,7 @@ class DatabaseService {
   /**
    * Get purchases for an order
    * @param {number} orderId - Order ID
-   * @returns {Promise<Purchase[]>} Array of purchases (transaction_id only)
+   * @returns {Promise<Purchase[]>} Array of purchases
    */
   async getOrderPurchases(orderId) {
     try {
@@ -396,8 +396,8 @@ class DatabaseService {
   }
 
   /**
-   * Create purchase with transaction ID only (no pin data in database)
-   * @param {Object} purchaseData - Purchase data {orderId}
+   * Create purchase record with Razer transaction ID (no pin data in database)
+   * @param {Object} purchaseData - Purchase data {orderId, transactionId}
    * @returns {Promise<Purchase>} Created purchase
    */
   async createPurchaseTransaction({ orderId, transactionId }) {
@@ -406,11 +406,11 @@ class DatabaseService {
 
       const result = await this.pool.request()
         .input('order_id', sql.Int, orderId)
-        .input('transaction_id', sql.NVarChar(100), transactionId)
+        .input('razer_transaction_id', sql.NVarChar(100), transactionId)
         .query(`
-          INSERT INTO purchases (order_id, transaction_id)
+          INSERT INTO purchases (order_id, razer_transaction_id)
           OUTPUT INSERTED.*
-          VALUES (@order_id, @transaction_id)
+          VALUES (@order_id, @razer_transaction_id)
         `);
 
       return new Purchase(result.recordset[0]);

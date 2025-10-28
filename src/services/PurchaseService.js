@@ -637,140 +637,153 @@ class PurchaseService {
         throw new Error(`Unexpected redirect to: ${urlAfterCheckout}. Order processing cancelled.`);
       }
 
-      console.log('✅ Checkout successful, proceeding to 2FA...');
+      console.log('✅ Checkout successful, checking next step...');
 
-      // Wait for either 2FA modal OR redirect to reload page
-      console.log('🔐 Waiting for 2FA page...');
-      const result = await Promise.race([
-        // Wait for 2FA modal to appear (normal flow)
+      // Wait for either 2FA modal OR direct transaction page (two scenarios)
+      console.log('� Checking if 2FA is required or direct processing...');
+
+      const checkoutResult = await Promise.race([
+        // Scenario 1: 2FA modal appears (requires backup code)
         page.waitForFunction(() => {
           const modal = document.querySelector('#purchaseOtpModal');
           if (!modal) return false;
           const style = window.getComputedStyle(modal);
           return style.display !== 'none' && style.visibility !== 'hidden';
-        }, { polling: 'mutation', timeout: 30000 }).then(() => ({ type: '2fa' })),
+        }, { polling: 'mutation', timeout: 10000 }).then(() => ({ type: '2fa' })).catch(() => null),
 
-        // Watch for redirect to reload page (insufficient balance)
+        // Scenario 2: Direct redirect to transaction page (no 2FA)
+        page.waitForFunction(() => {
+          return window.location.href.includes('/transaction/');
+        }, { polling: 500, timeout: 10000 }).then(() => ({ type: 'direct' })).catch(() => null),
+
+        // Scenario 3: Redirect to reload page (insufficient balance)
         page.waitForFunction(() => {
           return window.location.href.includes('/gold/reload');
-        }, { polling: 500, timeout: 30000 }).then(() => ({ type: 'reload' }))
-      ]);
+        }, { polling: 500, timeout: 10000 }).then(() => ({ type: 'reload' })).catch(() => null)
+      ]).then(result => result || { type: 'unknown' });
 
-      // If redirected to reload page, throw error
-      if (result.type === 'reload') {
-        console.error('❌ Redirected to reload page during 2FA wait - insufficient balance');
+      // Handle reload page redirect
+      if (checkoutResult.type === 'reload') {
+        console.error('❌ Redirected to reload page - insufficient balance');
         throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
       }
 
-      console.log('✅ 2FA modal detected');
-
-      // Step 2: Wait for any OTP iframe (first one)
-      await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 30000 });
-      let frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
-      let frame = await frameHandle.contentFrame();
-
-      // Step 3: Click “Choose another method” inside iframe
-      console.log('🔄 Clicking choose another method...');
-      const chooseAnother = await frame.waitForSelector("button[class*='arrowed']", { visible: true, timeout: 20000 });
-      await chooseAnother.click();
-
-      // Step 4: Wait for the new iframe (otp-iframe-4) to appear after clicking
-      await page.waitForFunction(() => {
-        const newIframe = document.querySelector('#purchaseOtpModal iframe[id^="otp-iframe-"]');
-        return newIframe && newIframe.id !== 'otp-iframe-3';
-      }, { polling: 'mutation', timeout: 30000 });
-
-      // Step 5: Switch to the new iframe
-      frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
-      frame = await frameHandle.contentFrame();
-
-      // Step 6: Wait for and click “Backup Codes” button
-      // Try clicking the one with “Backup” in its text
-      console.log('🔑 Selecting backup code option...');
-      const backupButton = await frame.$$("ul[class*='alt-menu'] button");
-      await backupButton[1].click();
-
-      // Enter backup code (8 digits)
-      console.log('🔢 Entering backup code...');
-
-      if (!backupCode || backupCode.length !== 8) {
-        throw new Error('Invalid backup code - must be 8 digits');
+      // Handle direct transaction (no 2FA required)
+      if (checkoutResult.type === 'direct') {
+        console.log('✅ No 2FA required - proceeding directly to transaction page');
+        // Skip 2FA section and go directly to transaction handling
       }
+      // Handle 2FA flow
+      else if (checkoutResult.type === '2fa') {
+        console.log('✅ 2FA modal detected - processing backup code...');
 
-      // Wait for iframe and get its frame context
-      await page.waitForSelector('iframe[id^="otp-iframe-"]', { visible: true, timeout: 10000 });
-      const otpFrameElement = await page.$('iframe[id^="otp-iframe-"]');
-      const otpFrame = await otpFrameElement.contentFrame();
+        // Step 2: Wait for any OTP iframe (first one)
+        await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 30000 });
+        let frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
+        let frame = await frameHandle.contentFrame();
 
-      if (!otpFrame) throw new Error('❌ Could not access OTP iframe');
+        // Step 3: Click “Choose another method” inside iframe
+        console.log('🔄 Clicking choose another method...');
+        const chooseAnother = await frame.waitForSelector("button[class*='arrowed']", { visible: true, timeout: 20000 });
+        await chooseAnother.click();
 
-      // Type digits into inputs inside iframe
-      for (let i = 0; i < 8; i++) {
-        const inputSelector = `#otp-input-${i}`;
-        await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 5000 });
-        await otpFrame.type(inputSelector, backupCode[i]);
-      }
+        // Step 4: Wait for the new iframe (otp-iframe-4) to appear after clicking
+        await page.waitForFunction(() => {
+          const newIframe = document.querySelector('#purchaseOtpModal iframe[id^="otp-iframe-"]');
+          return newIframe && newIframe.id !== 'otp-iframe-3';
+        }, { polling: 'mutation', timeout: 30000 });
 
-      // Wait a moment for error message to appear or navigation to start
-      console.log('⏳ Checking for backup code validation...');
+        // Step 5: Switch to the new iframe
+        frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
+        frame = await frameHandle.contentFrame();
 
-      // Check for invalid code error OR successful navigation
-      // Use Promise.race to handle both scenarios
-      const validationResult = await Promise.race([
-        // Check for error message in iframe (with detachment protection)
-        (async () => {
+        // Step 6: Wait for and click “Backup Codes” button
+        // Try clicking the one with “Backup” in its text
+        console.log('🔑 Selecting backup code option...');
+        const backupButton = await frame.$$("ul[class*='alt-menu'] button");
+        await backupButton[1].click();
+
+        // Enter backup code (8 digits)
+        console.log('🔢 Entering backup code...');
+
+        if (!backupCode || backupCode.length !== 8) {
+          throw new Error('Invalid backup code - must be 8 digits');
+        }
+
+        // Wait for iframe and get its frame context
+        await page.waitForSelector('iframe[id^="otp-iframe-"]', { visible: true, timeout: 10000 });
+        const otpFrameElement = await page.$('iframe[id^="otp-iframe-"]');
+        const otpFrame = await otpFrameElement.contentFrame();
+
+        if (!otpFrame) throw new Error('❌ Could not access OTP iframe');
+
+        // Type digits into inputs inside iframe
+        for (let i = 0; i < 8; i++) {
+          const inputSelector = `#otp-input-${i}`;
+          await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 5000 });
+          await otpFrame.type(inputSelector, backupCode[i]);
+        }
+
+        // After entering all digits, the form auto-submits and page navigates
+        // We need to wait for navigation without trying to access the detached frame
+        console.log('⏳ Backup code entered, waiting for validation...');
+
+        // Wait for navigation to start (URL change from game page)
+        try {
+          await page.waitForFunction(
+            (gameUrl) => {
+              const currentUrl = window.location.href;
+              return currentUrl !== gameUrl && !currentUrl.includes(gameUrl);
+            },
+            { timeout: 10000 },
+            gameUrl
+          );
+          console.log('✅ Navigation detected after backup code submission');
+        } catch (navErr) {
+          // If navigation didn't happen, check for error in iframe
+          console.log('⚠️ No navigation detected, checking for errors...');
+
           try {
-            await new Promise(resolve => setTimeout(resolve, 2000));
-
-            // Try to check for error - might fail if frame is detached (which is OK - means navigation started)
             const hasError = await otpFrame.evaluate(() => {
               const errorDialog = document.querySelector('div.dialog');
               if (errorDialog && errorDialog.textContent.includes('Invalid code')) {
                 return true;
               }
               return false;
-            }).catch(() => false); // Catch detached frame error - means navigation started
+            }).catch(() => false);
 
-            return { type: 'error_check', hasError };
-          } catch (err) {
-            // Frame detached - navigation likely started (successful code)
-            return { type: 'error_check', hasError: false };
+            if (hasError) {
+              console.error('❌ Invalid backup code detected');
+              throw new InvalidBackupCodeError('The backup code you entered is incorrect. Please enter another valid backup code.');
+            }
+          } catch (frameErr) {
+            // Frame is detached, which likely means navigation happened
+            console.log('⚠️ Could not check error (frame detached) - assuming navigation started');
           }
-        })(),
 
-        // Wait for navigation (successful code)
-        (async () => {
-          try {
-            await page.waitForFunction(
-              (gameUrl) => window.location.href !== gameUrl,
-              { timeout: 5000 },
-              gameUrl
-            );
-            return { type: 'navigation', success: true };
-          } catch (err) {
-            return { type: 'navigation', success: false };
-          }
-        })()
-      ]);
-
-      // If we detected an error dialog, throw error
-      if (validationResult.type === 'error_check' && validationResult.hasError) {
-        console.error('❌ Invalid backup code detected');
-        throw new InvalidBackupCodeError('The backup code you entered is incorrect. Please enter another valid backup code.');
+          // Try waiting for navigation again with longer timeout
+          console.log('⏳ Waiting for transaction to complete...');
+          await page.waitForFunction(
+            (gameUrl) => window.location.href !== gameUrl,
+            { timeout: 60000 },
+            gameUrl
+          ).catch(() => {
+            console.log('⚠️ Navigation timeout, checking current URL...');
+          });
+        }
       }
+      else {
+        // Unknown state - check current URL
+        console.log('⚠️ Unknown state after checkout, checking current URL...');
+        const currentCheckUrl = page.url();
 
-      // If navigation didn't start yet, wait for it
-      if (validationResult.type === 'error_check' && !validationResult.hasError) {
-        console.log('⏳ Waiting for transaction to complete...');
-        await page.waitForFunction(
-          (gameUrl) => window.location.href !== gameUrl,
-          { timeout: 60000 },
-          gameUrl
-        );
+        if (!currentCheckUrl.includes('/transaction/') && !currentCheckUrl.includes(gameUrl)) {
+          throw new Error(`Unexpected state after checkout. URL: ${currentCheckUrl}`);
+        }
       }
 
       // Navigation successful - check where we landed
-      console.log('✅ Successfully navigated from OTP page');
+      console.log('✅ Proceeding to check transaction result');
 
       const currentUrl = page.url();
       console.log('📍 Current URL:', currentUrl);
@@ -781,29 +794,66 @@ class PurchaseService {
         throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
       }
 
-      // Check if successful transaction page
-      if (currentUrl.includes('/gold/purchase/transaction/')) {
+      // Check if successful transaction page (URL contains /transaction/)
+      if (currentUrl.includes('/transaction/')) {
         console.log('✅ Reached transaction page!');
 
         // Extract transaction ID from URL
         const transactionId = currentUrl.split('/transaction/')[1];
         console.log('🆔 Transaction ID:', transactionId);
 
-        // Check transaction status
+        // Wait for the "Order processing..." page to finish and show "Congratulations!"
+        console.log('⏳ Waiting for order to complete processing...');
+
+        try {
+          // Wait for the success message to appear (indicates processing is done)
+          await page.waitForFunction(() => {
+            const h2 = document.querySelector('h2[data-v-621e38f9]');
+            return h2 && h2.textContent.includes('Congratulations');
+          }, { timeout: 60000 }); // Give it up to 60 seconds for processing
+
+          console.log('✅ Order processing completed - "Congratulations!" page loaded');
+        } catch (waitErr) {
+          console.log('⚠️ Timeout waiting for congratulations message, checking current page state...');
+        }
+
+        // Additional wait for PIN block to be visible
+        try {
+          await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 10000 });
+          console.log('✅ PIN block is visible');
+        } catch (pinWaitErr) {
+          console.log('⚠️ PIN block not found with selector, will try extraction anyway...');
+        }
+
+        // Give a moment for all content to settle
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Check transaction status from the page
         console.log('🔍 Checking transaction status...');
         const statusCheck = await page.evaluate(() => {
-          const statusSuccess = document.querySelector("span.status-success[data-v-175ddd8f]");
-          const statusFailed = document.querySelector("span.status-failed[data-v-175ddd8f]");
-
-          if (statusSuccess) {
-            return { status: 'success', message: statusSuccess.textContent.trim() };
-          } else if (statusFailed) {
-            return { status: 'failed', message: statusFailed.textContent.trim() };
+          // Look for status in the order summary section
+          const statusElement = document.querySelector('.status-success');
+          if (statusElement) {
+            return { status: 'success', message: statusElement.textContent.trim() };
           }
+
+          // Fallback: check for "Congratulations!" heading
+          const h2 = document.querySelector('h2[data-v-621e38f9]');
+          if (h2 && h2.textContent.includes('Congratulations')) {
+            return { status: 'success', message: 'Successful' };
+          }
+
           return { status: 'unknown', message: 'Unknown status' };
         });
 
         console.log(`📊 Transaction Status: ${statusCheck.status} - ${statusCheck.message}`);
+
+        // If status is still unknown, assume success since we're on the transaction page
+        if (statusCheck.status === 'unknown') {
+          console.log('⚠️ Could not extract status, but we are on transaction page - assuming SUCCESS');
+          statusCheck.status = 'success';
+          statusCheck.message = 'SUCCESS';
+        }
 
         // If out of stock, wait for restock and retry
         if (statusCheck.status === 'failed' && statusCheck.message.toLowerCase().includes('out of stock')) {
@@ -831,39 +881,65 @@ class PurchaseService {
           throw new Error(`Transaction failed with status: ${statusCheck.message}`);
         }
 
-        // Extract pin and serial (only if successful)
-        console.log('📄 Extracting purchase data...');
+        // Extract pin and serial from the success page
+        console.log('📄 Extracting purchase data from success page...');
+
         const purchaseData = await page.evaluate(() => {
-          const pinCode = document.querySelector("div[class='pin-code']")?.innerHTML?.trim() || '';
-          const serialRaw = document.querySelector("div[class='pin-serial-number']")?.innerHTML?.trim() || '';
+          // Extract PIN and Serial from the pin-block
+          const pinCodeElement = document.querySelector('div.pin-code');
+          const serialElement = document.querySelector('div.pin-serial-number');
+
+          const pinCode = pinCodeElement ? pinCodeElement.textContent.trim() : '';
+          const serialRaw = serialElement ? serialElement.textContent.trim() : '';
           const serial = serialRaw.replace('S/N:', '').trim();
 
-          // Get order details
-          const orderDetails = Array.from(document.querySelectorAll("span[data-v-175ddd8f]"))
-            .map(el => el.textContent.trim());
+          // Extract product name
+          const productElement = document.querySelector('strong[data-v-621e38f9].text--white');
+          const productName = productElement ? productElement.textContent.trim() : '';
 
-          // Get payment amounts
-          const paymentAmounts = Array.from(
-            document.querySelectorAll("div[data-v-175ddd8f] span[class*='text--zgold']")
-          ).map(el => el.textContent.trim());
+          // Extract transaction ID from the order summary
+          const transactionElements = document.querySelectorAll('span[data-v-175ddd8f]');
+          let transactionNumber = '';
+
+          for (let i = 0; i < transactionElements.length; i++) {
+            const text = transactionElements[i].textContent.trim();
+            // Look for transaction number pattern (alphanumeric, usually 20+ chars)
+            // Skip dates, amounts, and short texts
+            if (text.length > 15 && /^[A-Z0-9]+$/i.test(text) && !text.includes('/') && !text.includes('.')) {
+              transactionNumber = text;
+              break;
+            }
+          }
 
           return {
             pinCode,
             serial,
-            transactionDate: orderDetails[0] || '',
-            paymentMethod: orderDetails[1] || '',
-            transactionNumber: orderDetails[2] || '',
-            status: orderDetails[3] || '',
-            paymentAmount: paymentAmounts[0] || '',
-            subtotal: paymentAmounts[1] || ''
+            transactionId: transactionNumber,
+            productName
           };
-        });
+        });        // Validate that we got the essential data
+        if (!purchaseData.pinCode || !purchaseData.serial) {
+          console.error('⚠️ Missing PIN or Serial in extracted data!');
+          console.log('📋 Extracted data:', purchaseData);
+
+          // Try to get page content for debugging
+          const pageContent = await page.evaluate(() => document.body.innerText).catch(() => 'Could not get page content');
+          console.log('📄 Page content preview:', pageContent.substring(0, 500));
+
+          throw new Error(`Failed to extract purchase details. PIN: ${purchaseData.pinCode ? 'Found' : 'Missing'}, Serial: ${purchaseData.serial ? 'Found' : 'Missing'}`);
+        }
 
         console.log('✅ Transaction completed successfully!');
+        console.log(`📦 Product: ${purchaseData.productName}`);
+        console.log(`🆔 Transaction ID: ${purchaseData.transactionId || transactionId}`);
+        console.log(`🔑 PIN: ${purchaseData.pinCode}`);
+        console.log(`📋 Serial: ${purchaseData.serial}`);
+
         return {
           success: true,
-          transactionId,
-          ...purchaseData
+          transactionId: purchaseData.transactionId || transactionId,
+          pinCode: purchaseData.pinCode,
+          serial: purchaseData.serial
         };
 
       } else {

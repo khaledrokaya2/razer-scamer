@@ -110,6 +110,18 @@ class OrderService {
       // Step 4: Mark order as completed
       await databaseService.updateOrderStatus(order.id, 'completed');
 
+      // Step 5: Decrement user's allowed attempts (if not free plan)
+      try {
+        const user = await databaseService.getUserById(userId);
+        if (user && user.SubscriptionType !== 'free' && user.AllowedAttempts > 0) {
+          await databaseService.decrementUserAttempts(userId);
+          console.log(`✅ User attempts decremented: ${user.AllowedAttempts} -> ${user.AllowedAttempts - 1}`);
+        }
+      } catch (attemptErr) {
+        console.error('⚠️ Could not decrement user attempts:', attemptErr.message);
+        // Don't fail the order if this fails
+      }
+
       // Get final order state
       order = await databaseService.getOrderById(order.id);
 

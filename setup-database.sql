@@ -87,10 +87,12 @@ GO
 -- Pin codes and serials stored in memory only, sent to user, then cleared
 CREATE TABLE dbo.purchases
 (
-  transaction_id INT IDENTITY(1,1) PRIMARY KEY,
-  -- ⭐ RENAMED from 'id'
+  id INT IDENTITY(1,1) PRIMARY KEY,
+  -- Auto-increment ID
   order_id INT NULL,
   -- Allow NULL, order can be deleted
+  razer_transaction_id NVARCHAR(100) NULL,
+  -- ⭐ Razer's transaction reference (e.g., 122GZ...)
   created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
   -- ⭐ NO card_serial, card_code, reference_id, payment_id fields
   -- All pin data is stored in memory only for security

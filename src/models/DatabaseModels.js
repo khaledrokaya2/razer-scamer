@@ -112,14 +112,15 @@ class Order {
 /**
  * Purchase Model
  * Represents a single card purchase within an order
- * NOTE: Only stores transaction_id and order_id - NO PIN DATA
+ * NOTE: Only stores id, razer_transaction_id and order_id - NO PIN DATA
  */
 class Purchase {
   constructor(data) {
-    this.transaction_id = data.transaction_id;  // RENAMED from id
+    this.id = data.id;  // Auto-increment ID
     this.order_id = data.order_id;
+    this.razer_transaction_id = data.razer_transaction_id;  // Razer's transaction reference
     this.created_at = data.created_at;
-    // NO card_serial, card_code, reference_id, payment_id
+    // NO card_serial, card_code, pin_code
     // Pin data stored in memory only for security
   }
 }
