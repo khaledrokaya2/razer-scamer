@@ -319,12 +319,19 @@ class PurchaseService {
    * Wait for card to be in stock (with retries)
    * @param {Page} page - Puppeteer page
    * @param {number} cardIndex - Index of card to check
+   * @param {Function} checkCancellation - Function to check if order was cancelled
    * @returns {Promise<boolean>} True if in stock
    */
-  async waitForCardInStock(page, cardIndex) {
+  async waitForCardInStock(page, cardIndex, checkCancellation) {
     let attempts = 0;
 
     while (attempts < this.MAX_RELOAD_ATTEMPTS) {
+      // Check if order was cancelled
+      if (checkCancellation && checkCancellation()) {
+        console.log('🛑 Stock check cancelled by user');
+        throw new Error('Order cancelled by user');
+      }
+
       console.log(`🔄 Checking stock status... (Attempt ${attempts + 1}/${this.MAX_RELOAD_ATTEMPTS})`);
 
       const isInStock = await page.evaluate((index) => {
@@ -354,7 +361,7 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters
    * @returns {Promise<Object>} Purchase data
    */
-  async completePurchase({ userId, page, gameUrl, cardIndex, backupCode }) {
+  async completePurchase({ userId, page, gameUrl, cardIndex, backupCode, checkCancellation }) {
     try {
       console.log('🛒 Starting purchase process...');
 
@@ -375,7 +382,7 @@ class PurchaseService {
 
       if (!isInStock) {
         console.log('⚠️ Card is OUT OF STOCK, waiting for restock...');
-        await this.waitForCardInStock(page, cardIndex);
+        await this.waitForCardInStock(page, cardIndex, checkCancellation);
       }
 
       // Select card - ensure we click the right one based on actual HTML structure
@@ -994,7 +1001,8 @@ class PurchaseService {
             page,
             gameUrl,
             cardIndex,
-            backupCode
+            backupCode,
+            checkCancellation  // Pass cancellation check to completePurchase
           });
 
           purchases.push(result);
@@ -1005,8 +1013,8 @@ class PurchaseService {
           console.log(`   Pin Code: ${result.pinCode}`);
           console.log(`   Serial: ${result.serial}`);
 
-          // UX FIX #16: Call progress callback every 5 purchases or on completion
-          if (onProgress && (successCount % 5 === 0 || successCount === quantity)) {
+          // UX FIX #16: Call progress callback after EVERY successful purchase
+          if (onProgress) {
             try {
               await onProgress(successCount, quantity);
             } catch (progressErr) {
@@ -1047,6 +1055,15 @@ class PurchaseService {
 
     } catch (err) {
       console.error('💥 Bulk purchase process failed:', err.message);
+
+      // If order was cancelled, return what we have so far
+      if (err.message && err.message.includes('cancelled by user')) {
+        console.log(`🛑 Order cancelled - returning ${purchases.length} completed purchases`);
+        // Attach the purchases to the error so they can be retrieved
+        err.purchases = purchases;
+        err.completedCount = successCount;
+      }
+
       throw err;
     }
   }

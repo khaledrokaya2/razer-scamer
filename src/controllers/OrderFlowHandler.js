@@ -673,13 +673,52 @@ class OrderFlowHandler {
       // Check if it was a user cancellation
       if (err.message && err.message.includes('cancelled by user')) {
         try {
-          await bot.sendMessage(chatId,
-            `❌ *ORDER CANCELLED*   \n` +
-            `Your order was cancelled.\n\n` +
-            `Completed: ${err.completedPurchases || 0} cards\n\n` +
-            `Use /start to create a new order.`,
-            { parse_mode: 'Markdown' }
-          );
+          // Check if there were any completed purchases
+          if (err.partialOrder && err.partialOrder.pins && err.partialOrder.pins.length > 0) {
+            // Send cancellation message with partial results
+            await bot.sendMessage(chatId,
+              `🛑 *ORDER CANCELLED*   \n` +
+              `🆔 *Order ID:* #${err.partialOrder.order.id}\n\n` +
+              `✅ *Completed:* ${err.partialOrder.order.completed_purchases} / ${err.partialOrder.order.cards_count} cards\n\n` +
+              `📨 *Sending completed cards...*`,
+              { parse_mode: 'Markdown' }
+            );
+
+            // Send the pins that were successfully purchased
+            // Format 1: Plain (all pin codes)
+            const plainMessage = orderService.formatPinsPlain(
+              session.gameName,
+              session.cardName,
+              err.partialOrder.pins
+            );
+            await bot.sendMessage(chatId, plainMessage);
+
+            // Format 2: Detailed (with serials)
+            const detailedMessage = orderService.formatPinsDetailed(
+              session.gameName,
+              session.cardName,
+              err.partialOrder.pins
+            );
+            await bot.sendMessage(chatId, detailedMessage);
+
+            // Clear pins from memory after sending
+            orderService.clearOrderPins(err.partialOrder.order.id);
+
+            // Send final message
+            await bot.sendMessage(chatId,
+              `ℹ️ Remaining ${err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases} cards were not purchased.\n\n` +
+              `Use /start to create a new order.`,
+              { parse_mode: 'Markdown' }
+            );
+          } else {
+            // No purchases completed
+            await bot.sendMessage(chatId,
+              `❌ *ORDER CANCELLED*   \n` +
+              `No cards were purchased.\n\n` +
+              `Use /start to create a new order.`,
+              { parse_mode: 'Markdown' }
+            );
+          }
         } catch (sendErr) {
           console.error('Error sending cancellation message:', sendErr);
         }

@@ -137,7 +137,55 @@ class OrderService {
     } catch (err) {
       console.error('❌ Order processing failed:', err.message);
 
-      // Mark order as failed if it was created
+      // Handle cancellation - save what we have and return partial results
+      if (err.message && err.message.includes('cancelled by user')) {
+        console.log('🛑 Processing cancellation - saving partial order...');
+
+        if (order) {
+          // If we have any purchases, save them to database
+          if (err.purchases && err.purchases.length > 0) {
+            for (const purchase of err.purchases) {
+              // Save transaction to database
+              await databaseService.createPurchaseTransaction({
+                orderId: order.id,
+                transactionId: purchase.transactionId
+              });
+
+              // Save pin details to memory (NOT in database)
+              this.orderPins.get(order.id).push({
+                pinCode: purchase.pinCode,
+                serial: purchase.serial,
+                transactionId: purchase.transactionId
+              });
+
+              // Update order progress
+              await databaseService.incrementOrderPurchases(order.id);
+            }
+
+            // Mark as cancelled (partial completion)
+            await databaseService.updateOrderStatus(order.id, 'cancelled');
+
+            // Get final order state
+            order = await databaseService.getOrderById(order.id);
+
+            console.log(`🛑 Order #${order.id} cancelled with ${order.completed_purchases}/${order.cards_count} purchases saved`);
+
+            // Return partial results
+            err.partialOrder = {
+              order,
+              pins: this.orderPins.get(order.id) || []
+            };
+          } else {
+            // No purchases completed, just mark as cancelled
+            await databaseService.updateOrderStatus(order.id, 'cancelled');
+            console.log(`🛑 Order #${order.id} cancelled with no completed purchases`);
+          }
+        }
+
+        throw err;
+      }
+
+      // Mark order as failed if it was created (for non-cancellation errors)
       if (order) {
         await databaseService.updateOrderStatus(order.id, 'failed');
       }
