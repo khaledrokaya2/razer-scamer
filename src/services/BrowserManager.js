@@ -70,7 +70,7 @@ class BrowserManager {
     const isDevelopment = process.env.NODE_ENV === 'development';
 
     const browser = await puppeteer.launch({
-      headless: false,
+      headless: true,
       slowMo: 0,
       args: [
         '--no-sandbox',
