@@ -237,8 +237,8 @@ class OrderService {
       } else {
         message +=
           `📋 PIN: \`${pin.pinCode}\`\n` +
-          `🔑 Serial: \`${pin.serial}\`\n\n` +
-          `  transaction-id: ${pin.transactionId}\n\n`;
+          `🔑 Serial: \`${pin.serial}\`\n` +
+          `transaction-id: \`${pin.transactionId}\`\n\n`;
       }
     });
 

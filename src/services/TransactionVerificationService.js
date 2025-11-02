@@ -111,7 +111,8 @@ class TransactionVerificationService {
         const pin = pinMatch[1].trim();
         const serial = serialMatch[1].trim();
 
-        console.log(`Transaction ${transactionId}: SUCCESS - PIN=${pin}, Serial=${serial}`);
+        console.log(`Transaction ${transactionId}: SUCCESS - Data extracted`);
+        // 🔒 SECURITY: PIN and Serial not logged to console
         return {
           success: true,
           status: 'success',

@@ -1035,7 +1035,7 @@ class PurchaseService {
         // Transaction ID is already saved, so no retry will happen
         if (!purchaseData.pinCode || !purchaseData.serial) {
           console.error('⚠️ Could not extract PIN or Serial - marking as FAILED');
-          console.log('📋 Extracted data:', purchaseData);
+          // 🔒 SECURITY: purchaseData not logged (contains sensitive data)
 
           currentStage = this.STAGES.FAILED;
           console.log(`📍 Stage: ${currentStage}`);
@@ -1070,8 +1070,7 @@ class PurchaseService {
         console.log('✅ Transaction completed successfully!');
         console.log(`📦 Product: ${purchaseData.productName}`);
         console.log(`🆔 Transaction ID: ${purchaseData.transactionId || transactionId}`);
-        console.log(`🔑 PIN: ${purchaseData.pinCode}`);
-        console.log(`📋 Serial: ${purchaseData.serial}`);
+        // � SECURITY: PIN and Serial not logged to console
 
         // Save to database with 'success' status
         try {
@@ -1197,8 +1196,7 @@ class PurchaseService {
             successCount++;
             console.log(`✅ Card ${i}/${quantity} completed successfully!`);
             console.log(`   Transaction ID: ${result.transactionId}`);
-            console.log(`   Pin Code: ${result.pinCode}`);
-            console.log(`   Serial: ${result.serial}`);
+            // 🔒 SECURITY: PIN and Serial not logged to console
           } else {
             failedCount++;
             console.log(`⚠️ Card ${i}/${quantity} reached transaction page but extraction FAILED`);
