@@ -7,6 +7,7 @@
 
 const databaseService = require('./DatabaseService');
 const purchaseService = require('./PurchaseService');
+const authService = require('./AuthorizationService');
 
 class OrderService {
   constructor() {
@@ -85,42 +86,43 @@ class OrderService {
         quantity,
         backupCode,
         onProgress,  // Pass through progress callback
-        checkCancellation  // Pass through cancellation check
+        checkCancellation,  // Pass through cancellation check
+        orderId: order.id,  // Pass order ID for immediate transaction saving
+        onFirstPurchaseComplete: async () => {
+          // CRITICAL: Reduce attempts after FIRST purchase (success or fail)
+          try {
+            const updatedUser = await databaseService.reduceUserAttempts(userId);
+            console.log(`✅ User attempts reduced by 1 after first purchase (${updatedUser.AllowedAttempts} remaining)`);
+
+            // Invalidate cache to reflect updated attempts immediately
+            if (updatedUser && updatedUser.telegram_user_id) {
+              authService.invalidateCache(updatedUser.telegram_user_id);
+            }
+          } catch (attemptErr) {
+            console.error('⚠️ Could not reduce user attempts:', attemptErr.message);
+          }
+        }
       });
 
       // Step 3: Save purchases to database and memory
+      // Note: Transactions are already saved immediately when transaction page is reached
+      // Here we just update memory storage and progress counter
       for (const purchase of purchases) {
-        // Save transaction to database
-        await databaseService.createPurchaseTransaction({
-          orderId: order.id,
-          transactionId: purchase.transactionId
-        });
-
-        // Save pin details to memory (NOT in database)
+        // Transaction already saved in completePurchase, just store pins in memory
         this.orderPins.get(order.id).push({
           pinCode: purchase.pinCode,
           serial: purchase.serial,
-          transactionId: purchase.transactionId
+          transactionId: purchase.transactionId,
+          success: purchase.success !== false,  // Track if it succeeded or failed
+          requiresManualCheck: purchase.requiresManualCheck || false
         });
 
-        // Update order progress
+        // Update order progress count (count both successful and failed)
         await databaseService.incrementOrderPurchases(order.id);
       }
 
       // Step 4: Mark order as completed
       await databaseService.updateOrderStatus(order.id, 'completed');
-
-      // Step 5: Decrement user's allowed attempts (if not free plan)
-      try {
-        const user = await databaseService.getUserById(userId);
-        if (user && user.SubscriptionType !== 'free' && user.AllowedAttempts > 0) {
-          await databaseService.decrementUserAttempts(userId);
-          console.log(`✅ User attempts decremented: ${user.AllowedAttempts} -> ${user.AllowedAttempts - 1}`);
-        }
-      } catch (attemptErr) {
-        console.error('⚠️ Could not decrement user attempts:', attemptErr.message);
-        // Don't fail the order if this fails
-      }
 
       // Get final order state
       order = await databaseService.getOrderById(order.id);
@@ -141,45 +143,38 @@ class OrderService {
       if (err.message && err.message.includes('cancelled by user')) {
         console.log('🛑 Processing cancellation - saving partial order...');
 
-        if (order) {
-          // If we have any purchases, save them to database
-          if (err.purchases && err.purchases.length > 0) {
-            for (const purchase of err.purchases) {
-              // Save transaction to database
-              await databaseService.createPurchaseTransaction({
-                orderId: order.id,
-                transactionId: purchase.transactionId
-              });
+        if (order && err.purchases && err.purchases.length > 0) {
+          // Save all completed purchases (including failed ones)
+          for (const purchase of err.purchases) {
+            // Transactions already saved in completePurchase during processing
+            // Just store pins in memory
+            this.orderPins.get(order.id).push({
+              pinCode: purchase.pinCode,
+              serial: purchase.serial,
+              transactionId: purchase.transactionId,
+              success: purchase.success !== false,
+              requiresManualCheck: purchase.requiresManualCheck || false
+            });
 
-              // Save pin details to memory (NOT in database)
-              this.orderPins.get(order.id).push({
-                pinCode: purchase.pinCode,
-                serial: purchase.serial,
-                transactionId: purchase.transactionId
-              });
-
-              // Update order progress
-              await databaseService.incrementOrderPurchases(order.id);
-            }
-
-            // Mark as cancelled (partial completion)
-            await databaseService.updateOrderStatus(order.id, 'cancelled');
-
-            // Get final order state
-            order = await databaseService.getOrderById(order.id);
-
-            console.log(`🛑 Order #${order.id} cancelled with ${order.completed_purchases}/${order.cards_count} purchases saved`);
-
-            // Return partial results
-            err.partialOrder = {
-              order,
-              pins: this.orderPins.get(order.id) || []
-            };
-          } else {
-            // No purchases completed, just mark as cancelled
-            await databaseService.updateOrderStatus(order.id, 'cancelled');
-            console.log(`🛑 Order #${order.id} cancelled with no completed purchases`);
+            // Update order progress count
+            await databaseService.incrementOrderPurchases(order.id);
           }
+
+          // Mark as failed (cancelled status not in DB constraint, using 'failed')
+          await databaseService.updateOrderStatus(order.id, 'failed');
+
+          // Get final order state
+          order = await databaseService.getOrderById(order.id);
+
+          console.log(`🛑 Order #${order.id} cancelled with ${order.completed_purchases}/${order.cards_count} cards processed`);          // Return partial results
+          err.partialOrder = {
+            order,
+            pins: this.orderPins.get(order.id) || []
+          };
+        } else if (order) {
+          // No purchases completed, just mark as failed (cancelled status not in DB)
+          await databaseService.updateOrderStatus(order.id, 'failed');
+          console.log(`🛑 Order #${order.id} cancelled with no completed purchases`);
         }
 
         throw err;
@@ -196,37 +191,55 @@ class OrderService {
 
   /**
    * Format pins message (plain format)
+   * Shows "FAILED" for cards that couldn't be extracted
    * @param {string} gameName - Game name
    * @param {string} cardValue - Card value
    * @param {Array} pins - Array of pin objects
    * @returns {string} Formatted message
    */
-  formatPinsPlain(gameName, cardValue, pins) {
-    let message = `🎮 ${gameName}\n - ${cardValue}\n\n`;
+  formatPinsPlain(pins) {
+    let message = `🎁 **Your PIN Codes:**\n\n`;
 
-    pins.forEach((pin) => {
-      message += `${pin.pinCode}\n`;
+    pins.forEach((pin, index) => {
+      if (pin.pinCode === 'FAILED') {
+        message += `[Card ${index + 1}: ⚠️FAILED]\n`;
+      } else {
+        message += `\`${pin.pinCode}\`\n`;
+      }
     });
+
+    // Add note if any cards failed
+    const failedCount = pins.filter(p => p.pinCode === 'FAILED').length;
+    if (failedCount > 0) {
+      message += `\n⚠️ ${failedCount} card(s) marked as FAILED\n`;
+    }
 
     return message;
   }
 
   /**
    * Format pins message (detailed format)
+   * Shows "FAILED" for cards that couldn't be extracted
    * @param {string} gameName - Game name
    * @param {string} cardValue - Card value
    * @param {Array} pins - Array of pin objects
    * @returns {string} Formatted message
    */
-  formatPinsDetailed(gameName, cardValue, pins) {
-    let message = `🎮 ${gameName}\n - ${cardValue}\n\n`;
+  formatPinsDetailed(pins) {
+    let message = `🎁 **Your Cards Details:**\n\n`;
 
     pins.forEach((pin, index) => {
-      message += `📌 Pin ${index + 1}:\n`;
-      message += `{\n`;
-      message += `  pin-code: ${pin.pinCode}\n`;
-      message += `  serial-number: ${pin.serial}\n`;
-      message += `}\n\n`;
+      message += `**Card ${index + 1}:**\n`;
+
+      if (pin.pinCode === 'FAILED') {
+        message += `  ⚠️ FAILED\n`;
+        message += `  transaction-id: ${pin.transactionId}\n\n`;
+      } else {
+        message +=
+          `📋 PIN: \`${pin.pinCode}\`\n` +
+          `🔑 Serial: \`${pin.serial}\`\n\n` +
+          `  transaction-id: ${pin.transactionId}\n\n`;
+      }
     });
 
     return message;

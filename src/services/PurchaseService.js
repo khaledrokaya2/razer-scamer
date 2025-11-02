@@ -38,6 +38,20 @@ class PurchaseService {
     this.DEFAULT_TIMEOUT = 30000; // 30 seconds
     this.RELOAD_CHECK_INTERVAL = 2000; // 2 seconds between stock checks
     this.MAX_RELOAD_ATTEMPTS = 300; // 10 minutes of retrying (300 * 2s)
+
+    // Purchase stages for tracking
+    this.STAGES = {
+      IDLE: 'idle',
+      NAVIGATING: 'navigating_to_game',
+      SELECTING_CARD: 'selecting_card',
+      SELECTING_PAYMENT: 'selecting_payment',
+      CLICKING_CHECKOUT: 'clicking_checkout',
+      PROCESSING_2FA: 'processing_2fa',
+      REACHED_TRANSACTION: 'reached_transaction_page',
+      EXTRACTING_DATA: 'extracting_pin_data',
+      COMPLETED: 'completed',
+      FAILED: 'failed'
+    };
   }
 
   /**
@@ -358,14 +372,25 @@ class PurchaseService {
 
   /**
    * Complete single purchase
-   * @param {Object} params - Purchase parameters
+   * @param {Object} params - Purchase parameters {userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber}
    * @returns {Promise<Object>} Purchase data
    */
-  async completePurchase({ userId, page, gameUrl, cardIndex, backupCode, checkCancellation }) {
+  async completePurchase({ userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber = 1 }) {
+    let currentStage = this.STAGES.IDLE;
+    let transactionId = null;
+    const databaseService = require('./DatabaseService');
+
     try {
       console.log('🛒 Starting purchase process...');
 
-      // Navigate to game page (reusing existing browser)
+      // Check cancellation before starting
+      if (checkCancellation && checkCancellation()) {
+        throw new Error('Order cancelled by user');
+      }
+
+      // STAGE 1: Navigate to game page
+      currentStage = this.STAGES.NAVIGATING;
+      console.log(`📍 Stage: ${currentStage}`);
       await page.goto(gameUrl, { waitUntil: 'networkidle2' });
 
       // Wait for cards
@@ -373,6 +398,15 @@ class PurchaseService {
         visible: true,
         timeout: 20000
       });
+
+      // Check cancellation
+      if (checkCancellation && checkCancellation()) {
+        throw new Error('Order cancelled by user');
+      }
+
+      // STAGE 2: Select card
+      currentStage = this.STAGES.SELECTING_CARD;
+      console.log(`📍 Stage: ${currentStage}`);
 
       // Check if card is in stock, wait if not
       const isInStock = await page.evaluate((index) => {
@@ -476,6 +510,15 @@ class PurchaseService {
 
       console.log(`✅ Card ${cardIndex} selected successfully`);
 
+      // Check cancellation
+      if (checkCancellation && checkCancellation()) {
+        throw new Error('Order cancelled by user');
+      }
+
+      // STAGE 3: Select payment method
+      currentStage = this.STAGES.SELECTING_PAYMENT;
+      console.log(`📍 Stage: ${currentStage}`);
+
       // Wait for payment methods section to load
       await page.waitForSelector("#webshop_step_payment_channels", {
         visible: true,
@@ -568,6 +611,16 @@ class PurchaseService {
       }
 
       console.log('✅ Razer Gold payment method selected successfully');
+
+      // Check cancellation
+      if (checkCancellation && checkCancellation()) {
+        throw new Error('Order cancelled by user');
+      }
+
+      // STAGE 4: Click checkout
+      currentStage = this.STAGES.CLICKING_CHECKOUT;
+      console.log(`📍 Stage: ${currentStage}`);
+
       // Click checkout
       console.log('🛒 Clicking checkout...');
 
@@ -645,6 +698,15 @@ class PurchaseService {
       }
 
       console.log('✅ Checkout successful, checking next step...');
+
+      // Check cancellation
+      if (checkCancellation && checkCancellation()) {
+        throw new Error('Order cancelled by user');
+      }
+
+      // STAGE 5: Process 2FA or direct transaction
+      currentStage = this.STAGES.PROCESSING_2FA;
+      console.log(`📍 Stage: ${currentStage}`);
 
       // Wait for either 2FA modal OR direct transaction page (two scenarios)
       console.log('� Checking if 2FA is required or direct processing...');
@@ -735,49 +797,66 @@ class PurchaseService {
         // We need to wait for navigation without trying to access the detached frame
         console.log('⏳ Backup code entered, waiting for validation...');
 
-        // Wait for navigation to start (URL change from game page)
+        // CRITICAL FIX: Check for error popup on main page (not inside iframe)
+        // The error appears as: <div id="main-alert" class="show error notification">
         try {
-          await page.waitForFunction(
-            (gameUrl) => {
-              const currentUrl = window.location.href;
-              return currentUrl !== gameUrl && !currentUrl.includes(gameUrl);
-            },
-            { timeout: 10000 },
-            gameUrl
-          );
-          console.log('✅ Navigation detected after backup code submission');
-        } catch (navErr) {
-          // If navigation didn't happen, check for error in iframe
-          console.log('⚠️ No navigation detected, checking for errors...');
-
-          try {
-            const hasError = await otpFrame.evaluate(() => {
-              const errorDialog = document.querySelector('div.dialog');
-              if (errorDialog && errorDialog.textContent.includes('Invalid code')) {
+          // Quick check for error alert popup (3 seconds max)
+          console.log('🔍 Checking for error alert popup...');
+          await page.waitForFunction(() => {
+            const errorAlert = document.querySelector('#main-alert.show.error');
+            if (errorAlert) {
+              const dialogText = errorAlert.textContent || '';
+              if (dialogText.includes('Invalid code') || dialogText.includes('invalid') || dialogText.includes('incorrect')) {
                 return true;
               }
-              return false;
-            }).catch(() => false);
-
-            if (hasError) {
-              console.error('❌ Invalid backup code detected');
-              throw new InvalidBackupCodeError('The backup code you entered is incorrect. Please enter another valid backup code.');
             }
-          } catch (frameErr) {
-            // Frame is detached, which likely means navigation happened
-            console.log('⚠️ Could not check error (frame detached) - assuming navigation started');
-          }
+            return false;
+          }, { timeout: 3000, polling: 300 });
 
-          // Try waiting for navigation again with longer timeout
-          console.log('⏳ Waiting for transaction to complete...');
-          await page.waitForFunction(
-            (gameUrl) => window.location.href !== gameUrl,
-            { timeout: 60000 },
-            gameUrl
-          ).catch(() => {
-            console.log('⚠️ Navigation timeout, checking current URL...');
-          });
+          // If we reach here, error alert was found
+          console.error('❌ Invalid backup code - error alert detected');
+          throw new InvalidBackupCodeError('The backup code you entered is incorrect or expired. Please enter another valid backup code.');
+        } catch (errorCheckErr) {
+          // No error alert found within 3 seconds - this is GOOD
+          if (errorCheckErr.name === 'TimeoutError') {
+            console.log('✅ No error alert detected - waiting for navigation...');
+
+            // Now wait for navigation (give it up to 20 seconds)
+            try {
+              await page.waitForFunction(
+                (gameUrl) => {
+                  const currentUrl = window.location.href;
+                  // Success: Navigated away from game page
+                  return !currentUrl.includes(gameUrl);
+                },
+                { timeout: 20000, polling: 500 },
+                gameUrl
+              );
+
+              console.log('✅ Navigation detected - backup code accepted');
+            } catch (navErr) {
+              // Navigation timeout - check where we are
+              console.log('⏳ Navigation timeout - checking current URL...');
+              const currentUrl = page.url();
+
+              if (currentUrl.includes('/transaction/')) {
+                console.log('✅ Already on transaction page - backup code accepted');
+              } else if (currentUrl.includes(gameUrl)) {
+                console.error('❌ Still on game page after 20 seconds - backup code likely invalid');
+                throw new InvalidBackupCodeError('The backup code validation timed out. The code may be incorrect or expired. Please enter another valid backup code.');
+              } else {
+                console.log('✅ Navigated to unknown page - continuing...');
+              }
+            }
+          } else {
+            // This was the InvalidBackupCodeError we threw above
+            throw errorCheckErr;
+          }
         }
+      }
+      else if (checkoutResult.type === 'direct') {
+        // No 2FA required - already on transaction page
+        console.log('✅ Skipping 2FA - already redirected to transaction page');
       }
       else {
         // Unknown state - check current URL
@@ -801,30 +880,48 @@ class PurchaseService {
         throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
       }
 
+      // STAGE 6: Reached transaction page - SAVE TRANSACTION ID IMMEDIATELY!
       // Check if successful transaction page (URL contains /transaction/)
       if (currentUrl.includes('/transaction/')) {
+        currentStage = this.STAGES.REACHED_TRANSACTION;
+        console.log(`📍 Stage: ${currentStage}`);
         console.log('✅ Reached transaction page!');
 
         // Extract transaction ID from URL
-        const transactionId = currentUrl.split('/transaction/')[1];
+        transactionId = currentUrl.split('/transaction/')[1];
         console.log('🆔 Transaction ID:', transactionId);
 
-        // Wait for the "Order processing..." page to finish and show "Congratulations!"
+        // Check cancellation before proceeding to extraction
+        if (checkCancellation && checkCancellation()) {
+          console.log('🛑 Order cancelled after reaching transaction page');
+          const error = new Error('Order cancelled by user');
+          error.transactionId = transactionId;
+          throw error;
+        }
+
+        // STAGE 7: Extract PIN data
+        currentStage = this.STAGES.EXTRACTING_DATA;
+        console.log(`📍 Stage: ${currentStage}`);
+
+        // Wait for the "Order processing..." page to finish
         console.log('⏳ Waiting for order to complete processing...');
 
         try {
-          // Wait for the success message to appear (indicates processing is done)
-          await page.waitForFunction(() => {
-            const h2 = document.querySelector('h2[data-v-621e38f9]');
-            return h2 && h2.textContent.includes('Congratulations');
-          }, { timeout: 60000 }); // Give it up to 60 seconds for processing
+          // SOLUTION #1: Add 30-second timeout instead of 60 seconds
+          await Promise.race([
+            page.waitForFunction(() => {
+              const h2 = document.querySelector('h2[data-v-621e38f9]');
+              return h2 && h2.textContent.includes('Congratulations');
+            }, { timeout: 30000 }),  // 30 seconds max
+            new Promise((resolve) => setTimeout(resolve, 30000))  // Fallback timeout
+          ]);
 
           console.log('✅ Order processing completed - "Congratulations!" page loaded');
         } catch (waitErr) {
-          console.log('⚠️ Timeout waiting for congratulations message, checking current page state...');
+          console.log('⚠️ Timeout (30s) waiting for congratulations message, will try extraction anyway...');
         }
 
-        // Additional wait for PIN block to be visible
+        // Additional wait for PIN block to be visible with shorter timeout
         try {
           await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 10000 });
           console.log('✅ PIN block is visible');
@@ -835,106 +932,140 @@ class PurchaseService {
         // Give a moment for all content to settle
         await new Promise(resolve => setTimeout(resolve, 2000));
 
-        // Check transaction status from the page
+        // Check transaction status from the page with 10-second timeout
         console.log('🔍 Checking transaction status...');
-        const statusCheck = await page.evaluate(() => {
-          // Look for status in the order summary section
-          const statusElement = document.querySelector('.status-success');
-          if (statusElement) {
-            return { status: 'success', message: statusElement.textContent.trim() };
-          }
 
-          // Fallback: check for "Congratulations!" heading
-          const h2 = document.querySelector('h2[data-v-621e38f9]');
-          if (h2 && h2.textContent.includes('Congratulations')) {
-            return { status: 'success', message: 'Successful' };
-          }
+        let statusCheck;
+        try {
+          // SOLUTION #1: Wrap in Promise.race with 10-second timeout
+          statusCheck = await Promise.race([
+            page.evaluate(() => {
+              // Look for status in the order summary section
+              const statusElement = document.querySelector('.status-success');
+              if (statusElement) {
+                return { status: 'success', message: statusElement.textContent.trim() };
+              }
 
-          return { status: 'unknown', message: 'Unknown status' };
-        });
+              // Fallback: check for "Congratulations!" heading
+              const h2 = document.querySelector('h2[data-v-621e38f9]');
+              if (h2 && h2.textContent.includes('Congratulations')) {
+                return { status: 'success', message: 'Successful' };
+              }
+
+              return { status: 'unknown', message: 'Unknown status' };
+            }),
+            new Promise((resolve) =>
+              setTimeout(() => resolve({ status: 'timeout', message: 'Status check timed out' }), 10000)
+            )
+          ]);
+        } catch (evalErr) {
+          console.log('⚠️ Error checking status:', evalErr.message);
+          statusCheck = { status: 'unknown', message: 'Error during status check' };
+        }
 
         console.log(`📊 Transaction Status: ${statusCheck.status} - ${statusCheck.message}`);
 
         // If status is still unknown, assume success since we're on the transaction page
-        if (statusCheck.status === 'unknown') {
-          console.log('⚠️ Could not extract status, but we are on transaction page - assuming SUCCESS');
-          statusCheck.status = 'success';
-          statusCheck.message = 'SUCCESS';
-        }
-
-        // If out of stock, wait for restock and retry
-        if (statusCheck.status === 'failed' && statusCheck.message.toLowerCase().includes('out of stock')) {
-          console.log('⚠️ Purchase failed due to OUT OF STOCK during checkout');
-          console.log('🔄 Waiting for card to be back in stock...');
-
-          // Navigate back to game page
-          await page.goto(gameUrl, { waitUntil: 'networkidle2' });
-
-          // Wait for cards to load
-          await page.waitForSelector("div[class*='selection-tile__text']", {
-            visible: true,
-            timeout: 20000
-          });
-
-          // Wait for card to be in stock
-          await this.waitForCardInStock(page, cardIndex);
-
-          // Throw error to trigger retry
-          throw new Error('Card went out of stock during purchase - retrying now that it\'s back in stock');
-        }
-
-        // If status is not successful, throw error
-        if (statusCheck.status !== 'success') {
-          throw new Error(`Transaction failed with status: ${statusCheck.message}`);
+        if (statusCheck.status === 'unknown' || statusCheck.status === 'timeout') {
+          console.log('⚠️ Could not extract status clearly, but we are on transaction page');
+          // Don't retry - just mark for manual verification
         }
 
         // Extract pin and serial from the success page
         console.log('📄 Extracting purchase data from success page...');
 
-        const purchaseData = await page.evaluate(() => {
-          // Extract PIN and Serial from the pin-block
-          const pinCodeElement = document.querySelector('div.pin-code');
-          const serialElement = document.querySelector('div.pin-serial-number');
+        let purchaseData;
+        try {
+          // SOLUTION #1: Add 10-second timeout to extraction
+          purchaseData = await Promise.race([
+            page.evaluate(() => {
+              // Extract PIN and Serial from the pin-block
+              const pinCodeElement = document.querySelector('div.pin-code');
+              const serialElement = document.querySelector('div.pin-serial-number');
 
-          const pinCode = pinCodeElement ? pinCodeElement.textContent.trim() : '';
-          const serialRaw = serialElement ? serialElement.textContent.trim() : '';
-          const serial = serialRaw.replace('S/N:', '').trim();
+              const pinCode = pinCodeElement ? pinCodeElement.textContent.trim() : '';
+              const serialRaw = serialElement ? serialElement.textContent.trim() : '';
+              const serial = serialRaw.replace('S/N:', '').trim();
 
-          // Extract product name
-          const productElement = document.querySelector('strong[data-v-621e38f9].text--white');
-          const productName = productElement ? productElement.textContent.trim() : '';
+              // Extract product name
+              const productElement = document.querySelector('strong[data-v-621e38f9].text--white');
+              const productName = productElement ? productElement.textContent.trim() : '';
 
-          // Extract transaction ID from the order summary
-          const transactionElements = document.querySelectorAll('span[data-v-175ddd8f]');
-          let transactionNumber = '';
+              // Extract transaction ID from the order summary
+              const transactionElements = document.querySelectorAll('span[data-v-175ddd8f]');
+              let transactionNumber = '';
 
-          for (let i = 0; i < transactionElements.length; i++) {
-            const text = transactionElements[i].textContent.trim();
-            // Look for transaction number pattern (alphanumeric, usually 20+ chars)
-            // Skip dates, amounts, and short texts
-            if (text.length > 15 && /^[A-Z0-9]+$/i.test(text) && !text.includes('/') && !text.includes('.')) {
-              transactionNumber = text;
-              break;
-            }
-          }
+              for (let i = 0; i < transactionElements.length; i++) {
+                const text = transactionElements[i].textContent.trim();
+                // Look for transaction number pattern (alphanumeric, usually 20+ chars)
+                // Skip dates, amounts, and short texts
+                if (text.length > 15 && /^[A-Z0-9]+$/i.test(text) && !text.includes('/') && !text.includes('.')) {
+                  transactionNumber = text;
+                  break;
+                }
+              }
 
-          return {
-            pinCode,
-            serial,
-            transactionId: transactionNumber,
-            productName
+              return {
+                pinCode,
+                serial,
+                transactionId: transactionNumber,
+                productName
+              };
+            }),
+            new Promise((resolve) =>
+              setTimeout(() => resolve({
+                pinCode: '',
+                serial: '',
+                transactionId: '',
+                productName: ''
+              }), 10000)  // 10-second timeout
+            )
+          ]);
+        } catch (extractErr) {
+          console.error('⚠️ Error during extraction:', extractErr.message);
+          purchaseData = {
+            pinCode: '',
+            serial: '',
+            transactionId: '',
+            productName: ''
           };
-        });        // Validate that we got the essential data
+        }
+
+        // SOLUTION #2: Don't throw error if extraction fails - mark as FAILED
+        // Transaction ID is already saved, so no retry will happen
         if (!purchaseData.pinCode || !purchaseData.serial) {
-          console.error('⚠️ Missing PIN or Serial in extracted data!');
+          console.error('⚠️ Could not extract PIN or Serial - marking as FAILED');
           console.log('📋 Extracted data:', purchaseData);
 
-          // Try to get page content for debugging
-          const pageContent = await page.evaluate(() => document.body.innerText).catch(() => 'Could not get page content');
-          console.log('📄 Page content preview:', pageContent.substring(0, 500));
+          currentStage = this.STAGES.FAILED;
+          console.log(`📍 Stage: ${currentStage}`);
 
-          throw new Error(`Failed to extract purchase details. PIN: ${purchaseData.pinCode ? 'Found' : 'Missing'}, Serial: ${purchaseData.serial ? 'Found' : 'Missing'}`);
+          // Save to database with 'failed' status
+          try {
+            await databaseService.createPurchaseTransaction({
+              orderId: orderId,
+              transactionId: purchaseData.transactionId || transactionId,
+              cardNumber: cardNumber,
+              status: 'failed'
+            });
+            console.log(`📝 Failed purchase saved to database (card #${cardNumber}, status: failed)`);
+          } catch (dbErr) {
+            console.error('⚠️ Failed to save purchase to database:', dbErr.message);
+          }
+
+          // Return result with FAILED markers - user will check manually
+          return {
+            success: false,
+            transactionId: purchaseData.transactionId || transactionId,
+            pinCode: 'FAILED',  // Mark as failed for user to check manually
+            serial: 'FAILED',
+            requiresManualCheck: true,
+            stage: currentStage
+          };
         }
+
+        currentStage = this.STAGES.COMPLETED;
+        console.log(`📍 Stage: ${currentStage}`);
 
         console.log('✅ Transaction completed successfully!');
         console.log(`📦 Product: ${purchaseData.productName}`);
@@ -942,20 +1073,55 @@ class PurchaseService {
         console.log(`🔑 PIN: ${purchaseData.pinCode}`);
         console.log(`📋 Serial: ${purchaseData.serial}`);
 
+        // Save to database with 'success' status
+        try {
+          await databaseService.createPurchaseTransaction({
+            orderId: orderId,
+            transactionId: purchaseData.transactionId || transactionId,
+            cardNumber: cardNumber,
+            status: 'success'
+          });
+          console.log(`📝 Successful purchase saved to database (card #${cardNumber}, status: success)`);
+        } catch (dbErr) {
+          console.error('⚠️ Failed to save purchase to database:', dbErr.message);
+        }
+
         return {
           success: true,
           transactionId: purchaseData.transactionId || transactionId,
           pinCode: purchaseData.pinCode,
-          serial: purchaseData.serial
+          serial: purchaseData.serial,
+          stage: currentStage
         };
 
       } else {
-        // Not on transaction page - something went wrong
-        throw new Error(`Unexpected page after OTP. Current URL: ${currentUrl}`);
+        // Not on transaction page - something went wrong BEFORE reaching transaction
+        currentStage = this.STAGES.FAILED;
+        console.log(`📍 Stage: ${currentStage} - Did not reach transaction page`);
+        throw new Error(`Did not reach transaction page. Current URL: ${currentUrl}`);
       }
 
     } catch (err) {
-      console.error('❌ Purchase failed:', err.message);
+      console.error(`❌ Purchase failed at stage: ${currentStage}`);
+      console.error(`❌ Error: ${err.message}`);
+
+      // Save failed purchase to database (regardless of stage)
+      try {
+        await databaseService.createPurchaseTransaction({
+          orderId: orderId,
+          transactionId: transactionId || null,  // NULL if failed before transaction page
+          cardNumber: cardNumber,
+          status: 'failed'
+        });
+        console.log(`📝 Failed purchase saved to database (card #${cardNumber}, stage: ${currentStage}, status: failed)`);
+      } catch (dbErr) {
+        console.error('⚠️ Failed to save failed purchase to database:', dbErr.message);
+      }
+
+      // Add stage information to error
+      err.stage = currentStage;
+      err.transactionId = transactionId;
+
       throw err;
     } finally {
       // Update activity timestamp
@@ -964,11 +1130,13 @@ class PurchaseService {
   }
 
   /**
-   * Process multiple purchases with retry logic
+   * Process multiple purchases with NO RETRY logic
+   * If transaction page reached, skip to next card (no retry)
+   * If error before transaction page, also skip to next card (no retry)
    * @param {Object} params - Purchase parameters
-   * @returns {Promise<Array>} Array of purchase results
+   * @returns {Promise<Array>} Array of purchase results (including failed ones)
    */
-  async processBulkPurchases({ userId, gameUrl, cardIndex, cardName, quantity, backupCode, onProgress, checkCancellation }) {
+  async processBulkPurchases({ userId, gameUrl, cardIndex, cardName, quantity, backupCode, onProgress, checkCancellation, orderId, onFirstPurchaseComplete }) {
     // Get user's existing browser session
     const page = browserManager.getPage(userId);
 
@@ -976,24 +1144,30 @@ class PurchaseService {
       throw new Error('No active browser session. Please login first.');
     }
 
+    // Mark browser as in-use to prevent cleanup during purchase
+    browserManager.markInUse(userId);
+
     const purchases = [];
     let successCount = 0;
-    let attemptCount = 0;
+    let failedCount = 0;
+    let firstPurchaseCompleted = false;
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`🎮 Starting bulk purchase: ${quantity} x ${cardName}`);
     console.log(`${'='.repeat(60)}\n`);
 
     try {
-      while (successCount < quantity) {
+      // SOLUTION #2: No retry - process each card once
+      for (let i = 1; i <= quantity; i++) {
         // Check if order was cancelled
         if (checkCancellation && checkCancellation()) {
           console.log('🛑 Order cancelled by user');
-          throw new Error('Order cancelled by user');
+          const error = new Error('Order cancelled by user');
+          error.purchases = purchases;  // Include what we have so far
+          throw error;
         }
 
-        attemptCount++;
-        console.log(`\n--- Purchase ${successCount + 1}/${quantity} (Attempt ${attemptCount}) ---`);
+        console.log(`\n--- Processing Card ${i}/${quantity} ---`);
 
         try {
           const result = await this.completePurchase({
@@ -1002,69 +1176,130 @@ class PurchaseService {
             gameUrl,
             cardIndex,
             backupCode,
-            checkCancellation  // Pass cancellation check to completePurchase
+            checkCancellation,
+            orderId,
+            cardNumber: i  // Pass card number (1, 2, 3...)
           });
 
           purchases.push(result);
-          successCount++;
 
-          console.log(`✅ Purchase ${successCount}/${quantity} completed successfully!`);
-          console.log(`   Transaction ID: ${result.transactionId}`);
-          console.log(`   Pin Code: ${result.pinCode}`);
-          console.log(`   Serial: ${result.serial}`);
+          // CRITICAL: Reduce attempts after FIRST purchase (success or fail)
+          if (!firstPurchaseCompleted && onFirstPurchaseComplete) {
+            try {
+              await onFirstPurchaseComplete();
+              firstPurchaseCompleted = true;
+            } catch (attemptErr) {
+              console.error('⚠️ Error in onFirstPurchaseComplete callback:', attemptErr.message);
+            }
+          }
 
-          // UX FIX #16: Call progress callback after EVERY successful purchase
+          if (result.success) {
+            successCount++;
+            console.log(`✅ Card ${i}/${quantity} completed successfully!`);
+            console.log(`   Transaction ID: ${result.transactionId}`);
+            console.log(`   Pin Code: ${result.pinCode}`);
+            console.log(`   Serial: ${result.serial}`);
+          } else {
+            failedCount++;
+            console.log(`⚠️ Card ${i}/${quantity} reached transaction page but extraction FAILED`);
+            console.log(`   Transaction ID: ${result.transactionId}`);
+            console.log(`   Status: Requires manual check on website`);
+          }
+
+          // Update progress after EVERY card (success or failed)
           if (onProgress) {
             try {
-              await onProgress(successCount, quantity);
+              await onProgress(i, quantity);
             } catch (progressErr) {
               console.log('⚠️ Progress callback error:', progressErr.message);
             }
           }
 
         } catch (err) {
-          console.error(`❌ Purchase attempt failed: ${err.message}`);
+          failedCount++;
+          console.error(`❌ Card ${i}/${quantity} failed at stage: ${err.stage || 'unknown'}`);
+          console.error(`   Error: ${err.message}`);
 
-          // Don't retry if it's an insufficient balance error
+          // CRITICAL: Reduce attempts after FIRST purchase attempt (even if failed)
+          if (!firstPurchaseCompleted && onFirstPurchaseComplete) {
+            try {
+              await onFirstPurchaseComplete();
+              firstPurchaseCompleted = true;
+            } catch (attemptErr) {
+              console.error('⚠️ Error in onFirstPurchaseComplete callback:', attemptErr.message);
+            }
+          }
+
+          // Check if this is a cancellation error
+          if (err.message && err.message.includes('cancelled by user')) {
+            console.log('🛑 Cancelling remaining cards...');
+            err.purchases = purchases;  // Include what we have so far
+            throw err;
+          }
+
+          // Don't retry if it's insufficient balance
           if (err instanceof InsufficientBalanceError) {
-            console.error('💰 Insufficient balance detected - stopping purchase process');
-            throw err;
+            console.error('💰 Insufficient balance - stopping all remaining purchases');
+            const balanceError = new Error('Insufficient Razer Gold balance');
+            balanceError.purchases = purchases;
+            throw balanceError;
           }
 
-          // Don't retry if it's an invalid backup code error
+          // Don't retry if it's invalid backup code
           if (err instanceof InvalidBackupCodeError) {
-            console.error('🔑 Invalid backup code detected - stopping purchase process');
-            throw err;
+            console.error('🔑 Invalid backup code - stopping all remaining purchases');
+            const codeError = new Error('Invalid backup code');
+            codeError.purchases = purchases;
+            throw codeError;
           }
 
-          console.log('🔄 Retrying in 3 seconds...');
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          // SOLUTION #2: NO RETRY - just mark as failed and continue
+          // Add failed card to purchases array
+          const failedPurchase = {
+            success: false,
+            transactionId: err.transactionId || null,
+            pinCode: 'FAILED',
+            serial: 'FAILED',
+            error: err.message,
+            stage: err.stage,
+            requiresManualCheck: true
+          };
 
-          // If too many failures, throw error
-          if (attemptCount - successCount > 10) {
-            throw new Error('Too many consecutive failures - aborting');
+          purchases.push(failedPurchase);
+
+          console.log(`⏭️ Skipping to next card (no retry)`);
+
+          // Update progress even for failed cards
+          if (onProgress) {
+            try {
+              await onProgress(i, quantity);
+            } catch (progressErr) {
+              console.log('⚠️ Progress callback error:', progressErr.message);
+            }
           }
         }
       }
 
       console.log(`\n${'='.repeat(60)}`);
-      console.log(`✅ All purchases completed! ${successCount}/${quantity} successful`);
+      console.log(`✅ All cards processed! Success: ${successCount}, Failed: ${failedCount}, Total: ${quantity}`);
       console.log(`${'='.repeat(60)}\n`);
 
       return purchases;
 
     } catch (err) {
-      console.error('💥 Bulk purchase process failed:', err.message);
+      console.error('💥 Bulk purchase process stopped:', err.message);
 
-      // If order was cancelled, return what we have so far
-      if (err.message && err.message.includes('cancelled by user')) {
-        console.log(`🛑 Order cancelled - returning ${purchases.length} completed purchases`);
-        // Attach the purchases to the error so they can be retrieved
+      // Always return what we have so far (even on error)
+      if (err.purchases) {
+        err.purchases = err.purchases;
+      } else {
         err.purchases = purchases;
-        err.completedCount = successCount;
       }
 
       throw err;
+    } finally {
+      // Mark browser as not in-use after purchase completes or fails
+      browserManager.markNotInUse(userId);
     }
   }
 }

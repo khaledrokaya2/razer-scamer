@@ -82,7 +82,7 @@ GO
 -- ============================================================================
 -- PURCHASES TABLE
 -- ============================================================================
--- ⭐ IMPORTANT: Only stores transaction_id and order_id
+-- ⭐ IMPORTANT: Stores transaction_id, card_number, and status
 -- ⭐ NO PIN DATA stored in database (security)
 -- Pin codes and serials stored in memory only, sent to user, then cleared
 CREATE TABLE dbo.purchases
@@ -92,9 +92,14 @@ CREATE TABLE dbo.purchases
   order_id INT NULL,
   -- Allow NULL, order can be deleted
   razer_transaction_id NVARCHAR(100) NULL,
-  -- ⭐ Razer's transaction reference (e.g., 122GZ...)
+  -- ⭐ Razer's transaction reference (e.g., 122GZ...) - NULL if failed before transaction page
+  card_number INT NOT NULL,
+  -- ⭐ Card number within the order (1, 2, 3, etc.)
+  status NVARCHAR(20) DEFAULT 'pending'
+    CHECK (status IN ('pending', 'success', 'failed')),
+  -- ⭐ Purchase status
   created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
-  -- ⭐ NO card_serial, card_code, reference_id, payment_id fields
+  -- ⭐ NO card_serial, card_code fields
   -- All pin data is stored in memory only for security
   CONSTRAINT FK_purchases_order 
         FOREIGN KEY (order_id) REFERENCES dbo.orders(id)

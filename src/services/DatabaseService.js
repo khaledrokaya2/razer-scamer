@@ -118,12 +118,12 @@ class DatabaseService {
   }
 
   /**
-   * Update user subscription plan
+   * Update user subscription plan (admin function)
    * @param {number} userId - User ID
    * @param {string} subscriptionType - Subscription type (free, pro, gold, vip)
    * @returns {Promise<UserAccount>} Updated user account
    */
-  async updateUserSubscription(userId, subscriptionType) {
+  async changeUserSubscriptionPlan(userId, subscriptionType) {
     try {
       await this.connect();
       const plan = SubscriptionPlans[subscriptionType];
@@ -397,20 +397,22 @@ class DatabaseService {
 
   /**
    * Create purchase record with Razer transaction ID (no pin data in database)
-   * @param {Object} purchaseData - Purchase data {orderId, transactionId}
+   * @param {Object} purchaseData - Purchase data {orderId, transactionId, cardNumber, status}
    * @returns {Promise<Purchase>} Created purchase
    */
-  async createPurchaseTransaction({ orderId, transactionId }) {
+  async createPurchaseTransaction({ orderId, transactionId, cardNumber, status = 'pending' }) {
     try {
       await this.connect();
 
       const result = await this.pool.request()
         .input('order_id', sql.Int, orderId)
         .input('razer_transaction_id', sql.NVarChar(100), transactionId)
+        .input('card_number', sql.Int, cardNumber)
+        .input('status', sql.NVarChar(20), status)
         .query(`
-          INSERT INTO purchases (order_id, razer_transaction_id)
+          INSERT INTO purchases (order_id, razer_transaction_id, card_number, status)
           OUTPUT INSERTED.*
-          VALUES (@order_id, @razer_transaction_id)
+          VALUES (@order_id, @razer_transaction_id, @card_number, @status)
         `);
 
       return new Purchase(result.recordset[0]);
@@ -421,7 +423,137 @@ class DatabaseService {
   }
 
   /**
-   * Close database connection
+   * Update purchase status
+   * @param {number} purchaseId - Purchase ID
+   * @param {string} status - New status (pending, success, failed)
+   * @returns {Promise<Purchase>} Updated purchase
+   */
+  async updatePurchaseStatus(purchaseId, status) {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .input('id', sql.Int, purchaseId)
+        .input('status', sql.NVarChar(20), status)
+        .query(`
+          UPDATE purchases 
+          SET status = @status
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
+
+      return new Purchase(result.recordset[0]);
+    } catch (err) {
+      console.error('Error updating purchase status:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Get last order for a user
+   * @param {number} userId - User ID
+   * @returns {Promise<Order|null>} Last order or null
+   */
+  async getLastUserOrder(userId) {
+    try {
+      await this.connect();
+      const result = await this.pool.request()
+        .input('user_id', sql.Int, userId)
+        .query('SELECT TOP 1 * FROM orders WHERE user_id = @user_id ORDER BY created_at DESC');
+
+      return result.recordset.length > 0 ? new Order(result.recordset[0]) : null;
+    } catch (err) {
+      console.error('Error getting last user order:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Update user subscription (for daily renewal)
+   * @param {number} userId - User ID
+   * @param {Object} data - {subscriptionType, allowedAttempts}
+   * @returns {Promise<UserAccount>} Updated user account
+   */
+  async updateUserSubscription(userId, data) {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .input('id', sql.Int, userId)
+        .input('subscription_type', sql.NVarChar(50), data.subscriptionType)
+        .input('allowed_attempts', sql.Int, data.allowedAttempts)
+        .query(`
+          UPDATE user_accounts 
+          SET SubscriptionType = @subscription_type,
+              AllowedAttempts = @allowed_attempts
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
+
+      return new UserAccount(result.recordset[0]);
+    } catch (err) {
+      console.error('Error updating user subscription:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Update user attempts only (for daily renewal)
+   * @param {number} userId - User ID
+   * @param {number} attempts - New attempts count
+   * @returns {Promise<UserAccount>} Updated user account
+   */
+  async updateUserAttempts(userId, attempts) {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .input('id', sql.Int, userId)
+        .input('attempts', sql.Int, attempts)
+        .query(`
+          UPDATE user_accounts 
+          SET AllowedAttempts = @attempts
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
+
+      return new UserAccount(result.recordset[0]);
+    } catch (err) {
+      console.error('Error updating user attempts:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Reduce user attempts by 1 (after purchase attempt)
+   * @param {number} userId - User ID
+   * @returns {Promise<UserAccount>} Updated user account
+   */
+  async reduceUserAttempts(userId) {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .input('id', sql.Int, userId)
+        .query(`
+          UPDATE user_accounts 
+          SET AllowedAttempts = CASE 
+            WHEN AllowedAttempts > 0 THEN AllowedAttempts - 1 
+            ELSE 0 
+          END
+          OUTPUT INSERTED.*
+          WHERE id = @id
+        `);
+
+      return new UserAccount(result.recordset[0]);
+    } catch (err) {
+      console.error('Error reducing user attempts:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Close database connection pool
    */
   async close() {
     if (this.pool) {

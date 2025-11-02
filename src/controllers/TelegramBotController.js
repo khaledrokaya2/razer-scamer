@@ -66,6 +66,32 @@ class TelegramBotController {
   }
 
   /**
+   * Ensure user has active browser session, prompt login if not
+   * @param {Object} user - User object
+   * @param {string} chatId - Chat ID
+   * @returns {Promise<boolean>} True if browser session exists, false otherwise
+   */
+  async ensureBrowserSession(user, chatId) {
+    const browserManager = require('../services/BrowserManager');
+    const page = browserManager.getPage(user.id);
+
+    if (!page) {
+      const keyboard = {
+        inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
+      };
+
+      await this.safeSendMessage(
+        chatId,
+        '⚠️ You must login first.',
+        { reply_markup: keyboard }
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
    * Safe bot message sender with error handling (LOGIC BUG FIX #13)
    * @param {string} chatId - Chat ID
    * @param {string} text - Message text
@@ -188,8 +214,8 @@ class TelegramBotController {
           callback_data: 'user_create_order'
         }]);
         keyboard.inline_keyboard.push([{
-          text: '📋 My Orders',
-          callback_data: 'user_my_orders'
+          text: '📋 Get Last Order',
+          callback_data: 'user_get_last_order'
         }]);
         keyboard.inline_keyboard.push([{
           text: '⚡ Remaining Attempts',
@@ -239,7 +265,7 @@ class TelegramBotController {
           text: 'Please wait a moment before trying again.',
           show_alert: false
         });
-        return;
+        return; // Keep lock until finally block
       }
 
       // Check authorization from database
@@ -249,7 +275,7 @@ class TelegramBotController {
         await this.bot.answerCallbackQuery(query.id, {
           text: 'Access denied.'
         });
-        return;
+        return; // Keep lock until finally block
       }
 
       const user = authResult.user;
@@ -260,7 +286,7 @@ class TelegramBotController {
           await this.bot.answerCallbackQuery(query.id, {
             text: 'Admin access required.'
           });
-          return;
+          return; // Keep lock until finally block
         }
         await this.handleAdminCallback(chatId, callbackData, query.id, user);
       } else if (callbackData.startsWith('user_') || callbackData.startsWith('order_') || callbackData === 'card_disabled') {
@@ -280,7 +306,7 @@ class TelegramBotController {
         console.log('Could not answer callback query');
       }
     } finally {
-      // Release lock
+      // RACE CONDITION FIX: Release lock only after all async operations complete
       this.processingCallbacks.delete(lockKey);
     }
   }
@@ -366,20 +392,8 @@ class TelegramBotController {
             return;
           }
 
-          // Check if user is logged in (using BrowserManager)
-          const browserManager = require('../services/BrowserManager');
-          const page = browserManager.getPage(user.id);
-
-          if (!page) {
-            const keyboard = {
-              inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
-            };
-
-            await this.safeSendMessage(
-              chatId,
-              '⚠️ You must login first.',
-              { reply_markup: keyboard }
-            );
+          // Check if user has active browser session
+          if (!await this.ensureBrowserSession(user, chatId)) {
             return;
           }
 
@@ -388,8 +402,20 @@ class TelegramBotController {
           await orderFlowHandler.showGameSelection(this.bot, chatId);
           break;
 
-        case 'user_my_orders':
-          await this.safeSendMessage(chatId, '📋 My Orders feature coming soon!');
+        case 'user_get_last_order':
+          // SECURITY FIX #10: Validate user ownership
+          if (user.telegram_user_id !== chatId) {
+            console.error(`⚠️ Security: User ID mismatch - ${user.telegram_user_id} vs ${chatId}`);
+            await this.safeSendMessage(chatId, '❌ Security error: Session mismatch. Please restart with /start');
+            return;
+          }
+
+          // Check if user has active browser session
+          if (!await this.ensureBrowserSession(user, chatId)) {
+            return;
+          }
+
+          await this.handleGetLastOrder(chatId, user);
           break;
 
         case 'user_attempts':
@@ -406,22 +432,10 @@ class TelegramBotController {
               return;
             }
 
-            // LOGIC BUG FIX #12: Check if browser session still exists
-            const browserManager = require('../services/BrowserManager');
-            const page = browserManager.getPage(user.id);
-
-            if (!page) {
-              // LOGIC BUG FIX #12: Clear order session when browser session expired
+            // Check if user has active browser session
+            if (!await this.ensureBrowserSession(user, chatId)) {
+              // Clear order session when browser session expired
               orderFlowHandler.clearSession(chatId);
-
-              const keyboard = {
-                inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
-              };
-              await this.safeSendMessage(
-                chatId,
-                '⚠️ Your session expired. Please login again.',
-                { reply_markup: keyboard }
-              );
               return;
             }
 
@@ -437,22 +451,10 @@ class TelegramBotController {
               return;
             }
 
-            // LOGIC BUG FIX #12: Check if browser session still exists
-            const browserManager = require('../services/BrowserManager');
-            const page = browserManager.getPage(user.id);
-
-            if (!page) {
-              // LOGIC BUG FIX #12: Clear order session when browser session expired
+            // Check if user has active browser session
+            if (!await this.ensureBrowserSession(user, chatId)) {
+              // Clear order session when browser session expired
               orderFlowHandler.clearSession(chatId);
-
-              const keyboard = {
-                inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
-              };
-              await this.safeSendMessage(
-                chatId,
-                '⚠️ Your session expired. Please login again.',
-                { reply_markup: keyboard }
-              );
               return;
             }
 
@@ -547,6 +549,148 @@ class TelegramBotController {
   }
 
   /**
+   * Gets and verifies user's last order with transaction details
+   */
+  async handleGetLastOrder(chatId, user) {
+    const databaseService = require('../services/DatabaseService');
+    const browserManager = require('../services/BrowserManager');
+    const transactionVerifier = require('../services/TransactionVerificationService');
+
+    try {
+      // Send initial status message
+      const statusMsg = await this.safeSendMessage(
+        chatId,
+        '🔍 Fetching your last order...'
+      );
+
+      // Get last order for user
+      const lastOrder = await databaseService.getLastUserOrder(user.id);
+
+      if (!lastOrder) {
+        await this.bot.editMessageText(
+          '📋 You have no orders yet.',
+          {
+            chat_id: chatId,
+            message_id: statusMsg.message_id
+          }
+        );
+        return;
+      }
+
+      // Get purchases for this order
+      const purchases = await databaseService.getOrderPurchases(lastOrder.id);
+
+      if (!purchases || purchases.length === 0) {
+        await this.bot.editMessageText(
+          '📋 Your last order has no purchases.',
+          {
+            chat_id: chatId,
+            message_id: statusMsg.message_id
+          }
+        );
+        return;
+      }
+
+      // Update status to show verification in progress
+      await this.bot.editMessageText(
+        `🔍 Verifying ${purchases.length} transaction(s)...\n\nThis may take a moment.`,
+        {
+          chat_id: chatId,
+          message_id: statusMsg.message_id
+        }
+      );
+
+      // Get browser page (already validated by ensureBrowserSession)
+      const page = browserManager.getPage(user.id);
+
+      // Verify all transactions
+      const verificationResults = await transactionVerifier.verifyMultipleTransactions(purchases, page);
+
+      // Update purchase statuses in database
+      for (const result of verificationResults) {
+        if (result.success) {
+          await databaseService.updatePurchaseStatus(result.purchaseId, 'success');
+        } else {
+          await databaseService.updatePurchaseStatus(result.purchaseId, 'failed');
+        }
+      }
+
+      // Delete status message
+      try {
+        await this.bot.deleteMessage(chatId, statusMsg.message_id);
+      } catch (err) {
+        console.log('⚠️ Could not delete status message');
+      }
+
+      // Format results exactly like normal order flow
+      // Message 1: Order Summary
+      const successCount = verificationResults.filter(r => r.success).length;
+      const failedCount = verificationResults.filter(r => !r.success).length;
+
+      const summaryMessage =
+        `📦 **Order Details:**\n` +
+        `Game: ${lastOrder.game_name}\n` +
+        `Card: ${lastOrder.card_value}\n` +
+        `Quantity: ${purchases.length}\n\n` +
+        `✅ Successful: ${successCount}\n` +
+        `❌ Failed: ${failedCount}\n`;
+
+      await this.safeSendMessage(chatId, summaryMessage, { parse_mode: 'Markdown' });
+
+      // Message 2: PINS Only
+      const successfulPurchases = verificationResults.filter(r => r.success);
+      const failedPurchases = verificationResults.filter(r => !r.success);
+
+      if (successfulPurchases.length > 0) {
+        let pinMessage = `🎁 **Your PIN Codes:**\n\n`;
+
+        for (const result of successfulPurchases) {
+          pinMessage += `\`${result.pin}\`\n`;
+        }
+        await this.safeSendMessage(chatId, pinMessage, { parse_mode: 'Markdown' });
+
+        // Message 2: Cards Details
+        pinMessage = `🎁 **Your Cards Details:**\n\n`;
+        for (const result of successfulPurchases) {
+          pinMessage +=
+            `**Card ${result.cardNumber}:**\n` +
+            `📋 PIN: \`${result.pin}\`\n` +
+            `🔑 Serial: \`${result.serial}\`\n\n`;
+        }
+        await this.safeSendMessage(chatId, pinMessage, { parse_mode: 'Markdown' });
+      }
+
+      // Message 3: Failed transactions (if any)
+      if (failedPurchases.length > 0) {
+        let failedMessage = `⚠️ **Failed Transactions:**\n\n`;
+
+        for (const result of failedPurchases) {
+          failedMessage +=
+            `**Card ${result.cardNumber}:**\n`;
+
+          if (result.transactionId && result.transactionId !== 'N/A') {
+            failedMessage +=
+              `🆔 Transaction: \`${result.transactionId}\`\n` +
+              `❌ Error: ${result.error}\n\n`;
+          } else {
+            failedMessage += `❌ Failed before reaching transaction page\n\n`;
+          }
+        }
+
+        failedMessage += `_Please check your Razer transaction history manually_`;
+        await this.safeSendMessage(chatId, failedMessage, { parse_mode: 'Markdown' });
+      }
+
+    } catch (err) {
+      console.error('Error in handleGetLastOrder:', err);
+      await this.safeSendMessage(
+        chatId,
+        '❌ Error retrieving last order. Please try again later.'
+      );
+    }
+  }
+
+  /**
    * Handles the Login button click
    * Initiates the login flow by asking for email
    * 
@@ -577,8 +721,6 @@ class TelegramBotController {
    * @param {string} queryId - Callback query ID for acknowledgment
    */
   async handleCheckBalanceButton(chatId, queryId) {
-    const session = sessionManager.getSession(chatId);
-
     // Answer callback query IMMEDIATELY to stop loading spinner
     try {
       await this.bot.answerCallbackQuery(queryId);
@@ -587,8 +729,16 @@ class TelegramBotController {
       console.log('⚠️ Could not answer callback query (may be too old)');
     }
 
-    // Verify user has an active browser session
-    if (!session || !session.page) {
+    // Get user from database for browser session management
+    const authResult = await authService.checkAuthorization(chatId);
+    if (!authResult.authorized) {
+      return this.bot.sendMessage(chatId, '❌ Unauthorized');
+    }
+    const user = authResult.user;
+
+    // Verify user has an active browser session using BrowserManager
+    const browserManager = require('../services/BrowserManager');
+    if (!browserManager.hasActiveBrowser(user.id)) {
       const keyboard = {
         inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
       };
@@ -604,15 +754,11 @@ class TelegramBotController {
     const checkBalanceMessage = this.bot.sendMessage(chatId, '⏳ Checking your balance...');
 
     try {
-      // Get user from database for browser session management
-      const authResult = await authService.checkAuthorization(chatId);
-      if (!authResult.authorized) {
-        throw new Error('User not authorized');
-      }
-      const user = authResult.user;
+      // Get page from BrowserManager
+      const page = browserManager.getPage(user.id);
 
       // Call scraper service to get balance (pass user.id for browser management)
-      const balance = await scraperService.getBalance(user.id, session.page);
+      const balance = await scraperService.getBalance(user.id, page);
 
       // Delete the loading message
       checkBalanceMessage.then(msg => {
@@ -642,8 +788,8 @@ class TelegramBotController {
         }
       );
 
-      // Clear browser session on error
-      await sessionManager.clearBrowserSession(chatId);
+      // Close browser session on error
+      await browserManager.closeBrowser(user.id);
     }
   }
 
@@ -879,7 +1025,8 @@ class TelegramBotController {
       const user = authResult.user;
 
       // Attempt login using scraper service (pass user.id for browser management)
-      const { browser, page } = await scraperService.login(
+      // Browser and page are now managed by BrowserManager, no need to store them
+      await scraperService.login(
         user.id,  // User ID for browser session
         session.email,
         session.password
@@ -888,8 +1035,7 @@ class TelegramBotController {
       // SECURITY FIX #8: Clear credentials from memory immediately after successful login
       sessionManager.clearCredentials(chatId);
 
-      // Store browser session
-      sessionManager.setBrowserSession(chatId, browser, page);
+      // Update session state to logged_in
       sessionManager.updateState(chatId, 'logged_in');
 
       // Inform user of success
@@ -919,8 +1065,10 @@ class TelegramBotController {
         }
       );
 
-      // Reset session state
-      await sessionManager.clearBrowserSession(chatId);
+      // Reset session state and close browser
+      sessionManager.updateState(chatId, 'idle');
+      const browserManager = require('../services/BrowserManager');
+      await browserManager.closeBrowser(user.id);
     }
   }
 

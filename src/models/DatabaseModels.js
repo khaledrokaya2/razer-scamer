@@ -112,16 +112,39 @@ class Order {
 /**
  * Purchase Model
  * Represents a single card purchase within an order
- * NOTE: Only stores id, razer_transaction_id and order_id - NO PIN DATA
+ * NOTE: Only stores id, razer_transaction_id, card_number, status, and order_id - NO PIN DATA
  */
 class Purchase {
   constructor(data) {
     this.id = data.id;  // Auto-increment ID
     this.order_id = data.order_id;
-    this.razer_transaction_id = data.razer_transaction_id;  // Razer's transaction reference
+    this.razer_transaction_id = data.razer_transaction_id;  // Razer's transaction reference (can be NULL)
+    this.card_number = data.card_number;  // Card number in order (1, 2, 3, etc.)
+    this.status = data.status || 'pending';  // pending, success, failed
     this.created_at = data.created_at;
     // NO card_serial, card_code, pin_code
     // Pin data stored in memory only for security
+  }
+
+  /**
+   * Check if purchase has transaction ID
+   */
+  hasTransactionId() {
+    return this.razer_transaction_id && this.razer_transaction_id !== null;
+  }
+
+  /**
+   * Check if purchase is successful
+   */
+  isSuccess() {
+    return this.status === 'success';
+  }
+
+  /**
+   * Check if purchase is failed
+   */
+  isFailed() {
+    return this.status === 'failed';
   }
 }
 

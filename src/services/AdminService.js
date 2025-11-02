@@ -10,6 +10,7 @@
  */
 
 const databaseService = require('./DatabaseService');
+const authService = require('./AuthorizationService');
 const { SubscriptionPlans } = require('../models/DatabaseModels');
 
 class AdminService {
@@ -77,7 +78,14 @@ class AdminService {
         throw new Error(`Invalid plan: ${plan}`);
       }
 
-      return await databaseService.updateUserSubscription(userId, plan);
+      const user = await databaseService.changeUserSubscriptionPlan(userId, plan);
+
+      // Invalidate cache for this user (force fresh data on next request)
+      if (user && user.telegram_user_id) {
+        authService.invalidateCache(user.telegram_user_id);
+      }
+
+      return user;
     } catch (err) {
       console.error('Error changing user plan:', err);
       throw err;
@@ -92,7 +100,14 @@ class AdminService {
    */
   async extendSubscription(userId) {
     try {
-      return await databaseService.extendUserSubscription(userId);
+      const user = await databaseService.extendUserSubscription(userId);
+
+      // Invalidate cache for this user (force fresh data on next request)
+      if (user && user.telegram_user_id) {
+        authService.invalidateCache(user.telegram_user_id);
+      }
+
+      return user;
     } catch (err) {
       console.error('Error extending subscription:', err);
       throw err;
@@ -106,7 +121,17 @@ class AdminService {
    */
   async removeUser(userId) {
     try {
-      return await databaseService.deleteUser(userId);
+      // Get user before deleting to invalidate cache
+      const user = await databaseService.getUserById(userId);
+
+      const result = await databaseService.deleteUser(userId);
+
+      // Invalidate cache for this user
+      if (user && user.telegram_user_id) {
+        authService.invalidateCache(user.telegram_user_id);
+      }
+
+      return result;
     } catch (err) {
       console.error('Error removing user:', err);
       throw err;

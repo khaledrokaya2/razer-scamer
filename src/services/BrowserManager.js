@@ -11,7 +11,7 @@ const puppeteer = require('puppeteer');
 
 class BrowserManager {
   constructor() {
-    // Map of userId -> { browser, page, lastActivity }
+    // Map of userId -> { browser, page, lastActivity, inUse }
     this.userBrowsers = new Map();
 
     // Auto-close inactive browsers after 30 minutes (extended for login sessions)
@@ -55,7 +55,8 @@ class BrowserManager {
     this.userBrowsers.set(userId, {
       browser,
       page,
-      lastActivity: Date.now()
+      lastActivity: Date.now(),
+      inUse: false  // Track if browser is currently being used
     });
 
     return { browser, page };
@@ -69,7 +70,7 @@ class BrowserManager {
     const isDevelopment = process.env.NODE_ENV === 'development';
 
     const browser = await puppeteer.launch({
-      headless: true,
+      headless: false,
       slowMo: 0,
       args: [
         '--no-sandbox',
@@ -158,6 +159,30 @@ class BrowserManager {
   }
 
   /**
+   * Mark browser as in-use to prevent cleanup
+   * @param {number} userId - User ID
+   */
+  markInUse(userId) {
+    const existing = this.userBrowsers.get(userId);
+    if (existing) {
+      existing.inUse = true;
+      existing.lastActivity = Date.now();
+    }
+  }
+
+  /**
+   * Mark browser as not in-use (available for cleanup)
+   * @param {number} userId - User ID
+   */
+  markNotInUse(userId) {
+    const existing = this.userBrowsers.get(userId);
+    if (existing) {
+      existing.inUse = false;
+      existing.lastActivity = Date.now();
+    }
+  }
+
+  /**
    * Update last activity timestamp for user
    * @param {number} userId - User ID
    */
@@ -177,6 +202,13 @@ class BrowserManager {
       console.log('🧹 Running cleanup for inactive browsers...');
       for (const [userId, session] of this.userBrowsers.entries()) {
         const inactiveTime = now - session.lastActivity;
+
+        // Skip if browser is currently in use
+        if (session.inUse) {
+          console.log(`⏭️ Skipping browser for user ${userId} (in use)`);
+          continue;
+        }
+
         if (inactiveTime > this.INACTIVITY_TIMEOUT) {
           console.log(`⏰ Browser for user ${userId} inactive for ${Math.round(inactiveTime / 1000 / 60)} minutes - closing...`);
           this.closeBrowser(userId);

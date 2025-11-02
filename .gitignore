@@ -1,6 +1,9 @@
 # Environment variables (contains sensitive data)
 .env
 
+# Test file with sensitive data
+lol.txt
+
 # SQLite Database (contains user data)
 data/
 *.db

@@ -15,6 +15,7 @@ require('dotenv').config();
 
 // Import services and controllers
 const authService = require('./src/services/AuthorizationService');
+const dailyRenewalService = require('./src/services/DailyRenewalService');
 const botController = require('./src/controllers/TelegramBotController');
 
 /**
@@ -41,8 +42,11 @@ async function initializeServices() {
   // Initialize authorization service (connects to database)
   await authService.initialize();
 
+  // Start daily renewal service (runs at 12:00 AM every day)
+  dailyRenewalService.start();
+
   // Initialize Telegram bot controller with bot token
-  botController.initialize(process.env.TELEGRAM_BOT_TOKEN);
+  botController.initialize(process.env.TELEGRAM_TEST_BOT_TOKEN);
 
   console.log('✅ All services initialized');
 }
@@ -81,6 +85,9 @@ async function handleShutdown() {
   console.log('🛑 Shutting down gracefully...');
 
   try {
+    // Stop the daily renewal service
+    dailyRenewalService.stop();
+
     // Stop the bot
     await botController.stop();
 

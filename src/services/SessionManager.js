@@ -49,8 +49,6 @@ class SessionManager {
   createSession(chatId) {
     this.sessions[chatId] = {
       state: 'idle',           // Current state: idle, awaiting_email, awaiting_password, logged_in
-      browser: null,           // Puppeteer browser instance (deprecated - use BrowserManager)
-      page: null,              // Puppeteer page instance (deprecated - use BrowserManager)
       lastActivity: Date.now() // Track last activity for cleanup
     };
     console.log(`📝 Session created for user ${chatId}`);
@@ -121,61 +119,11 @@ class SessionManager {
   }
 
   /**
-   * Stores browser and page instances in the session
-   * NOTE: Browser is now managed by BrowserManager using userId
-   * This is kept for backward compatibility but marks session as logged in
-   * 
-   * @param {string} chatId - Telegram chat ID
-   * @param {Browser} browser - Puppeteer browser instance (deprecated)
-   * @param {Page} page - Puppeteer page instance (deprecated)
-   */
-  setBrowserSession(chatId, browser, page) {
-    if (this.sessions[chatId]) {
-      this.sessions[chatId].browser = browser;
-      this.sessions[chatId].page = page;
-      this.sessions[chatId].lastActivity = Date.now();
-      console.log(`🌐 Browser session stored for ${chatId}`);
-    }
-  }
-
-  /**
-   * Clears browser session and closes browser
-   * 
-   * @param {string} chatId - Telegram chat ID
-   */
-  async clearBrowserSession(chatId) {
-    const session = this.sessions[chatId];
-    if (session) {
-      // Close browser if it exists
-      if (session.browser) {
-        await session.browser.close();
-        console.log(`🔒 Browser closed for ${chatId}`);
-      }
-      // Clear browser references
-      session.browser = null;
-      session.page = null;
-      session.state = 'idle';
-    }
-  }
-
-  /**
-   * Checks if a user has an active browser session
-   * 
-   * @param {string} chatId - Telegram chat ID
-   * @returns {boolean} True if browser session exists
-   */
-  hasBrowserSession(chatId) {
-    const session = this.sessions[chatId];
-    return session && session.browser && session.page;
-  }
-
-  /**
    * Deletes a user's entire session
    * 
    * @param {string} chatId - Telegram chat ID
    */
   async deleteSession(chatId) {
-    await this.clearBrowserSession(chatId);
     delete this.sessions[chatId];
     console.log(`🗑️ Session deleted for ${chatId}`);
   }

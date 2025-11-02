@@ -12,15 +12,47 @@
 const { getAllGames, getGameById } = require('../config/games-catalog');
 const purchaseService = require('../services/PurchaseService');
 const orderService = require('../services/OrderService');
+const { parse } = require('dotenv');
 
 class OrderFlowHandler {
   constructor() {
     // Session data for order creation flow
-    this.orderSessions = new Map(); // chatId -> {step, gameId, cardIndex, cardName, quantity}
+    this.orderSessions = new Map(); // chatId -> {step, gameId, cardIndex, cardName, quantity, lastActivity}
     // Track cancellation requests
     this.cancellationRequests = new Set();
     // Track progress message IDs for editing
     this.progressMessages = new Map(); // chatId -> messageId
+    // Track cancelling message IDs for deletion
+    this.cancellingMessages = new Map(); // chatId -> messageId
+
+    // Session timeout configuration
+    this.SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+
+    // Start cleanup interval for expired sessions
+    this.startCleanupInterval();
+  }
+
+  /**
+   * Start cleanup interval to remove expired sessions
+   */
+  startCleanupInterval() {
+    setInterval(() => {
+      const now = Date.now();
+      console.log('🧹 Running order session cleanup...');
+
+      for (const [chatId, session] of this.orderSessions.entries()) {
+        if (session.lastActivity) {
+          const inactiveTime = now - session.lastActivity;
+          if (inactiveTime > this.SESSION_TIMEOUT) {
+            console.log(`⏰ Order session for chat ${chatId} expired - cleaning up...`);
+            this.orderSessions.delete(chatId);
+            this.cancellationRequests.delete(chatId);
+            this.progressMessages.delete(chatId);
+            this.cancellingMessages.delete(chatId);
+          }
+        }
+      }
+    }, 5 * 60 * 1000); // Check every 5 minutes
   }
 
   /**
@@ -71,6 +103,14 @@ class OrderFlowHandler {
    */
   getUserFriendlyError(error) {
     const errorMessage = error.message || '';
+
+    // Log full error details for debugging
+    console.error('🔍 Full error details for debugging:');
+    console.error('Error name:', error.name);
+    console.error('Error message:', errorMessage);
+    console.error('Error stack:', error.stack);
+    if (error.code) console.error('Error code:', error.code);
+    if (error.number) console.error('SQL Error number:', error.number);
 
     if (errorMessage.includes('Invalid backup code') || errorMessage.includes('incorrect')) {
       return `❌ *ERROR*     \n` +
@@ -133,12 +173,41 @@ class OrderFlowHandler {
         `Use /start to try again.`;
     }
 
-    // Default error message
+    // Database errors (CHECK constraint, connection errors, etc.)
+    if (errorMessage.includes('CHECK constraint') ||
+      errorMessage.includes('FOREIGN KEY') ||
+      errorMessage.includes('database') ||
+      errorMessage.includes('RequestError') ||
+      errorMessage.includes('SQL')) {
+      return `❌ *SYSTEM ERROR*   \n` +
+        `A technical issue occurred\n` +
+        `while processing your order.\n\n` +
+        `🔧 Our team has been notified.\n\n` +
+        `Please try again in a few moments.\n` +
+        `If the issue persists, contact support.\n\n` +
+        `Use /start to try again.`;
+    }
+
+    // Network/timeout errors
+    if (errorMessage.includes('timeout') ||
+      errorMessage.includes('ETIMEDOUT') ||
+      errorMessage.includes('ECONNREFUSED') ||
+      errorMessage.includes('network')) {
+      return `❌ *CONNECTION ERROR* \n` +
+        `Network connection issue\n` +
+        `occurred during processing.\n\n` +
+        `🌐 Please check your internet\n` +
+        `   connection and try again.\n\n` +
+        `Use /start to try again.`;
+    }
+
+    // Generic user-friendly error (hide all technical details)
     return `❌ *ERROR*     \n` +
-      `*Order Failed*\n\n` +
-      `${errorMessage}\n\n` +
+      `*Something went wrong*\n\n` +
+      `We encountered an issue while\n` +
+      `processing your order.\n\n` +
       `Please try again or contact\n` +
-      `support if the problem persists.\n\n` +
+      `support if the issue continues.\n\n` +
       `Use /start to try again.`;
   }
 
@@ -155,7 +224,8 @@ class OrderFlowHandler {
       cardIndex: null,
       cardName: null,
       quantity: null,
-      backupCode: null
+      backupCode: null,
+      lastActivity: Date.now()
     });
   }
 
@@ -165,7 +235,12 @@ class OrderFlowHandler {
    * @returns {Object} Session data
    */
   getSession(chatId) {
-    return this.orderSessions.get(chatId);
+    const session = this.orderSessions.get(chatId);
+    if (session) {
+      // Update last activity on access
+      session.lastActivity = Date.now();
+    }
+    return session;
   }
 
   /**
@@ -177,6 +252,7 @@ class OrderFlowHandler {
     const session = this.getSession(chatId);
     if (session) {
       Object.assign(session, data);
+      session.lastActivity = Date.now();
     }
   }
 
@@ -254,6 +330,7 @@ class OrderFlowHandler {
 
   /**
    * Handle cancel during processing
+   * SOLUTION #3: Stop immediately and return completed cards
    * @param {Object} bot - Telegram bot instance
    * @param {number} chatId - Chat ID
    */
@@ -262,13 +339,17 @@ class OrderFlowHandler {
     this.markAsCancelled(chatId);
 
     try {
-      await bot.sendMessage(chatId,
+      const cancelMsg = await bot.sendMessage(chatId,
         `🛑 *CANCELLING ORDER*  \n` +
-        `⏳ Stopping the purchase process...\n\n` +
-        `_Please wait for current operation_\n` +
-        `_to complete safely._`,
+        `⏳ Stopping immediately...\n\n` +
+        `_Cards completed so far will be sent_\n` +
+        `_Current card being processed will_\n` +
+        `_finish first for safety_`,
         { parse_mode: 'Markdown' }
       );
+
+      // Store message ID for later deletion
+      this.cancellingMessages.set(chatId, cancelMsg.message_id);
     } catch (err) {
       console.error('Error sending cancelling message:', err);
     }
@@ -505,8 +586,32 @@ class OrderFlowHandler {
       return; // Not in backup code input step
     }
 
+    // CRITICAL: Check if user has attempts remaining
+    if (!user.hasAttemptsRemaining()) {
+      try {
+        await bot.sendMessage(chatId,
+          `⚠️ *NO ATTEMPTS REMAINING* \n\n` +
+          `You have used all your attempts\n` +
+          `for today.\n\n` +
+          `💡 Your attempts will renew at\n` +
+          `    12:00 AM (midnight).\n\n` +
+          `📊 Current Plan: ${user.getSubscriptionDisplay()}\n` +
+          `🔄 Remaining: ${user.AllowedAttempts} attempts\n\n` +
+          `_Use /start to return to menu_`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        console.error('Error sending no attempts message:', err);
+      }
+
+      // Clear session
+      this.clearSession(chatId);
+      return;
+    }
+
     const backupCode = text.trim();
 
+    // Validate format: exactly 8 digits
     if (!/^\d{8}$/.test(backupCode)) {
       try {
         await bot.sendMessage(chatId,
@@ -518,6 +623,23 @@ class OrderFlowHandler {
         );
       } catch (err) {
         console.error('Error sending invalid code message:', err);
+      }
+      return;
+    }
+
+    // Additional validation: reject obvious invalid patterns
+    if (/^(.)\1{7}$/.test(backupCode)) { // All same digit
+      try {
+        await bot.sendMessage(chatId,
+          `⚠️ *INVALID CODE*     \n` +
+          `This backup code pattern\n` +
+          `appears invalid.\n\n` +
+          `Please enter a valid code\n` +
+          `from your Razer account:`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        console.error('Error sending invalid pattern message:', err);
       }
       return;
     }
@@ -627,34 +749,47 @@ class OrderFlowHandler {
         checkCancellation: () => this.isCancelled(chatId)  // Check if user cancelled
       });
 
-      // Send success message
+      // Send success message with details about failed cards
+      const successfulCards = result.order.completed_purchases;
+      const failedCards = result.pins.filter(p => p.pinCode === 'FAILED').length;
+
+      // Delete the progress message before sending results
+      const progressMsgId = this.progressMessages.get(chatId);
+      if (progressMsgId) {
+        try {
+          await bot.deleteMessage(chatId, progressMsgId);
+          this.progressMessages.delete(chatId);
+        } catch (delErr) {
+          console.log('⚠️ Could not delete progress message');
+        }
+      }
+
       try {
-        await bot.sendMessage(chatId,
-          `✅ *ORDER COMPLETED*   \n` +
+        let statusMessage = `✅ *ORDER COMPLETED*   \n` +
           `🆔 *Order ID:* #${result.order.id}\n\n` +
-          `📦 *Purchases*\n` +
-          `     ${result.order.completed_purchases} / ${result.order.cards_count} cards\n\n` +
-          `📊 *Status:* ${result.order.status}\n\n` +
-          `📨 *Sending your cards now...*`,
-          { parse_mode: 'Markdown' }
-        );
+          `📦 *Cards Processed*\n` +
+          `     ${successfulCards} / ${result.order.cards_count} cards\n\n`;
+
+        if (failedCards > 0) {
+          statusMessage += `⚠️ *${failedCards} card(s) marked FAILED*\n\n`;
+        }
+
+        statusMessage += `📊 *Status:* ${result.order.status}\n\n`;
+
+        await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 
         // Send pins in two formats
         // Format 1: Plain (all pin codes)
         const plainMessage = orderService.formatPinsPlain(
-          session.gameName,
-          session.cardName,
           result.pins
         );
-        await bot.sendMessage(chatId, plainMessage);
+        await bot.sendMessage(chatId, plainMessage, { parse_mode: 'Markdown' });
 
-        // Format 2: Detailed (with serials)
+        // Format 2: Detailed (with serials and transaction IDs)
         const detailedMessage = orderService.formatPinsDetailed(
-          session.gameName,
-          session.cardName,
           result.pins
         );
-        await bot.sendMessage(chatId, detailedMessage);
+        await bot.sendMessage(chatId, detailedMessage, { parse_mode: 'Markdown' });
 
         // Clear pins from memory after sending
         orderService.clearOrderPins(result.order.id);
@@ -670,16 +805,45 @@ class OrderFlowHandler {
     } catch (err) {
       console.error('Order processing error:', err);
 
+      // Always clear progress message and cancelling message on error
+      this.progressMessages.delete(chatId);
+      this.cancellingMessages.delete(chatId);
+
       // Check if it was a user cancellation
       if (err.message && err.message.includes('cancelled by user')) {
         try {
           // Check if there were any completed purchases
           if (err.partialOrder && err.partialOrder.pins && err.partialOrder.pins.length > 0) {
+            const failedCards = err.partialOrder.pins.filter(p => p.pinCode === 'FAILED').length;
+
+            // Delete the "CANCELLING ORDER" message before sending results
+            const cancellingMsgId = this.cancellingMessages.get(chatId);
+            if (cancellingMsgId) {
+              try {
+                await bot.deleteMessage(chatId, cancellingMsgId);
+                this.cancellingMessages.delete(chatId);
+              } catch (delErr) {
+                console.log('⚠️ Could not delete cancelling message');
+              }
+            }
+
+            // Delete the progress message before sending results
+            const progressMsgId = this.progressMessages.get(chatId);
+            if (progressMsgId) {
+              try {
+                await bot.deleteMessage(chatId, progressMsgId);
+                this.progressMessages.delete(chatId);
+              } catch (delErr) {
+                console.log('⚠️ Could not delete progress message');
+              }
+            }
+
             // Send cancellation message with partial results
             await bot.sendMessage(chatId,
               `🛑 *ORDER CANCELLED*   \n` +
               `🆔 *Order ID:* #${err.partialOrder.order.id}\n\n` +
-              `✅ *Completed:* ${err.partialOrder.order.completed_purchases} / ${err.partialOrder.order.cards_count} cards\n\n` +
+              `✅ *Completed:* ${err.partialOrder.order.completed_purchases} / ${err.partialOrder.order.cards_count} cards\n` +
+              (failedCards > 0 ? `⚠️ *Failed:* ${failedCards} card(s)\n\n` : '\n') +
               `📨 *Sending completed cards...*`,
               { parse_mode: 'Markdown' }
             );
@@ -687,34 +851,56 @@ class OrderFlowHandler {
             // Send the pins that were successfully purchased
             // Format 1: Plain (all pin codes)
             const plainMessage = orderService.formatPinsPlain(
-              session.gameName,
-              session.cardName,
               err.partialOrder.pins
             );
-            await bot.sendMessage(chatId, plainMessage);
+            await bot.sendMessage(chatId, plainMessage, { parse_mode: 'Markdown' });
 
-            // Format 2: Detailed (with serials)
+            // Format 2: Detailed (with serials and transaction IDs)
             const detailedMessage = orderService.formatPinsDetailed(
-              session.gameName,
-              session.cardName,
               err.partialOrder.pins
             );
-            await bot.sendMessage(chatId, detailedMessage);
+            await bot.sendMessage(chatId, detailedMessage, { parse_mode: 'Markdown' });
 
             // Clear pins from memory after sending
             orderService.clearOrderPins(err.partialOrder.order.id);
 
             // Send final message
-            await bot.sendMessage(chatId,
-              `ℹ️ Remaining ${err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases} cards were not purchased.\n\n` +
-              `Use /start to create a new order.`,
-              { parse_mode: 'Markdown' }
-            );
+            const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
+            if (remaining > 0) {
+              await bot.sendMessage(chatId,
+                `ℹ️ ${remaining} card(s) were not processed.\n\n` +
+                `Use /start to create a new order.`,
+                { parse_mode: 'Markdown' }
+              );
+            }
           } else {
             // No purchases completed
+
+            // Delete the "CANCELLING ORDER" message before sending results
+            const cancellingMsgId = this.cancellingMessages.get(chatId);
+            if (cancellingMsgId) {
+              try {
+                await bot.deleteMessage(chatId, cancellingMsgId);
+                this.cancellingMessages.delete(chatId);
+              } catch (delErr) {
+                console.log('⚠️ Could not delete cancelling message');
+              }
+            }
+
+            // Delete the progress message before sending results
+            const progressMsgId = this.progressMessages.get(chatId);
+            if (progressMsgId) {
+              try {
+                await bot.deleteMessage(chatId, progressMsgId);
+                this.progressMessages.delete(chatId);
+              } catch (delErr) {
+                console.log('⚠️ Could not delete progress message');
+              }
+            }
+
             await bot.sendMessage(chatId,
-              `❌ *ORDER CANCELLED*   \n` +
-              `No cards were purchased.\n\n` +
+              `🛑 *ORDER CANCELLED*   \n` +
+              `No cards were processed.\n\n` +
               `Use /start to create a new order.`,
               { parse_mode: 'Markdown' }
             );
@@ -723,10 +909,11 @@ class OrderFlowHandler {
           console.error('Error sending cancellation message:', sendErr);
         }
 
-        // Clear session, cancellation flag, and progress message
+        // Clear session, cancellation flag, progress message, and cancelling message
         this.clearSession(chatId);
         this.clearCancellation(chatId);
         this.progressMessages.delete(chatId);
+        this.cancellingMessages.delete(chatId);
         return;
       }
 
