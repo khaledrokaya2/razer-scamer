@@ -779,17 +779,21 @@ class OrderFlowHandler {
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 
         // Send pins in two formats
-        // Format 1: Plain (all pin codes)
-        const plainMessage = orderService.formatPinsPlain(
+        // Format 1: Plain (all pin codes) - may be split into multiple messages
+        const plainMessages = orderService.formatPinsPlain(
           result.pins
         );
-        await bot.sendMessage(chatId, plainMessage, { parse_mode: 'Markdown' });
+        for (const message of plainMessages) {
+          await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+        }
 
-        // Format 2: Detailed (with serials and transaction IDs)
-        const detailedMessage = orderService.formatPinsDetailed(
+        // Format 2: Detailed (with serials and transaction IDs) - may be split into multiple messages
+        const detailedMessages = orderService.formatPinsDetailed(
           result.pins
         );
-        await bot.sendMessage(chatId, detailedMessage, { parse_mode: 'Markdown' });
+        for (const message of detailedMessages) {
+          await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+        }
 
         // Clear pins from memory after sending
         orderService.clearOrderPins(result.order.id);
@@ -849,17 +853,21 @@ class OrderFlowHandler {
             );
 
             // Send the pins that were successfully purchased
-            // Format 1: Plain (all pin codes)
-            const plainMessage = orderService.formatPinsPlain(
+            // Format 1: Plain (all pin codes) - may be split into multiple messages
+            const plainMessages = orderService.formatPinsPlain(
               err.partialOrder.pins
             );
-            await bot.sendMessage(chatId, plainMessage, { parse_mode: 'Markdown' });
+            for (const message of plainMessages) {
+              await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+            }
 
-            // Format 2: Detailed (with serials and transaction IDs)
-            const detailedMessage = orderService.formatPinsDetailed(
+            // Format 2: Detailed (with serials and transaction IDs) - may be split into multiple messages
+            const detailedMessages = orderService.formatPinsDetailed(
               err.partialOrder.pins
             );
-            await bot.sendMessage(chatId, detailedMessage, { parse_mode: 'Markdown' });
+            for (const message of detailedMessages) {
+              await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+            }
 
             // Clear pins from memory after sending
             orderService.clearOrderPins(err.partialOrder.order.id);

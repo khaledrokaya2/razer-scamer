@@ -191,58 +191,77 @@ class OrderService {
 
   /**
    * Format pins message (plain format)
-   * Shows "FAILED" for cards that couldn't be extracted
-   * @param {string} gameName - Game name
-   * @param {string} cardValue - Card value
+   * Shows only PIN codes, one per line
    * @param {Array} pins - Array of pin objects
-   * @returns {string} Formatted message
+   * @returns {Array<string>} Array with single message (100 PINs won't exceed limit)
    */
   formatPinsPlain(pins) {
-    let message = `🎁 **Your PIN Codes:**\n\n`;
+    let message = '';
 
-    pins.forEach((pin, index) => {
+    pins.forEach((pin) => {
       if (pin.pinCode === 'FAILED') {
-        message += `[Card ${index + 1}: ⚠️FAILED]\n`;
+        message += `FAILED\n`;
       } else {
-        message += `\`${pin.pinCode}\`\n`;
+        message += `${pin.pinCode}\n`;
       }
     });
 
-    // Add note if any cards failed
-    const failedCount = pins.filter(p => p.pinCode === 'FAILED').length;
-    if (failedCount > 0) {
-      message += `\n⚠️ ${failedCount} card(s) marked as FAILED\n`;
-    }
-
-    return message;
+    return [message];
   }
 
   /**
    * Format pins message (detailed format)
-   * Shows "FAILED" for cards that couldn't be extracted
-   * @param {string} gameName - Game name
-   * @param {string} cardValue - Card value
+   * Shows PIN and Serial pairs, separated by newline
+   * Splits into 2 messages if more than 50 cards
    * @param {Array} pins - Array of pin objects
-   * @returns {string} Formatted message
+   * @returns {Array<string>} Array of formatted messages (1 or 2 messages)
    */
   formatPinsDetailed(pins) {
-    let message = `🎁 **Your Cards Details:**\n\n`;
+    const messages = [];
 
-    pins.forEach((pin, index) => {
-      message += `**Card ${index + 1}:**\n`;
+    if (pins.length <= 50) {
+      // Single message for 50 or fewer cards
+      let message = '';
 
-      if (pin.pinCode === 'FAILED') {
-        message += `  ⚠️ FAILED\n`;
-        message += `  transaction-id: ${pin.transactionId}\n\n`;
-      } else {
-        message +=
-          `📋 PIN: \`${pin.pinCode}\`\n` +
-          `🔑 Serial: \`${pin.serial}\`\n` +
-          `transaction-id: \`${pin.transactionId}\`\n\n`;
+      pins.forEach((pin) => {
+        if (pin.pinCode === 'FAILED') {
+          message += `FAILED\nFAILED\n\n`;
+        } else {
+          message += `${pin.pinCode}\n${pin.serial}\n\n`;
+        }
+      });
+
+      messages.push(message);
+    } else {
+      // Split into 2 messages for more than 50 cards
+      const half = Math.ceil(pins.length / 2);
+
+      // First half
+      let message1 = '';
+      for (let i = 0; i < half; i++) {
+        const pin = pins[i];
+        if (pin.pinCode === 'FAILED') {
+          message1 += `FAILED\nFAILED\n\n`;
+        } else {
+          message1 += `${pin.pinCode}\n${pin.serial}\n\n`;
+        }
       }
-    });
+      messages.push(message1);
 
-    return message;
+      // Second half
+      let message2 = '';
+      for (let i = half; i < pins.length; i++) {
+        const pin = pins[i];
+        if (pin.pinCode === 'FAILED') {
+          message2 += `FAILED\nFAILED\n\n`;
+        } else {
+          message2 += `${pin.pinCode}\n${pin.serial}\n\n`;
+        }
+      }
+      messages.push(message2);
+    }
+
+    return messages;
   }
 
   /**
