@@ -632,13 +632,24 @@ class TelegramBotController {
       // Verify all transactions with progress updates
       const verificationResults = await transactionVerifier.verifyMultipleTransactions(purchases, page, onProgress);
 
-      // Batch update purchase statuses in database (faster than individual updates)
-      const updatePromises = verificationResults.map(result => {
-        const status = result.success ? 'success' : 'failed';
-        return databaseService.updatePurchaseStatus(result.purchaseId, status);
-      });
+      // SMART OPTIMIZATION: Only update purchases where status changed (saves DB queries!)
+      const updatePromises = verificationResults
+        .filter(result => {
+          const purchase = purchases.find(p => p.id === result.purchaseId);
+          const newStatus = result.success ? 'success' : 'failed';
+          return purchase.status !== newStatus; // Only update if different
+        })
+        .map(result => {
+          const status = result.success ? 'success' : 'failed';
+          return databaseService.updatePurchaseStatus(result.purchaseId, status);
+        });
 
-      await Promise.all(updatePromises);
+      if (updatePromises.length > 0) {
+        await Promise.all(updatePromises);
+        console.log(`✅ Updated ${updatePromises.length} purchase statuses (${verificationResults.length - updatePromises.length} already correct)`);
+      } else {
+        console.log(`✅ All ${verificationResults.length} purchase statuses already up-to-date`);
+      }
 
       // Delete status message
       try {
