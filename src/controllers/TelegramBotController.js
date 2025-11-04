@@ -629,24 +629,42 @@ class TelegramBotController {
         }
       };
 
-      // Verify all transactions with progress updates
+      // Verify all transactions with progress updates (Sequential - reliable)
       const verificationResults = await transactionVerifier.verifyMultipleTransactions(purchases, page, onProgress);
 
-      // SMART OPTIMIZATION: Only update purchases where status changed (saves DB queries!)
-      const updatePromises = verificationResults
-        .filter(result => {
-          const purchase = purchases.find(p => p.id === result.purchaseId);
-          const newStatus = result.success ? 'success' : 'failed';
-          return purchase.status !== newStatus; // Only update if different
-        })
-        .map(result => {
-          const status = result.success ? 'success' : 'failed';
-          return databaseService.updatePurchaseStatus(result.purchaseId, status);
-        });
+      // OPTIMIZATION 1: Create Map for O(1) purchase lookup (faster than .find())
+      const purchaseMap = new Map(purchases.map(p => [p.id, p]));
 
-      if (updatePromises.length > 0) {
-        await Promise.all(updatePromises);
-        console.log(`✅ Updated ${updatePromises.length} purchase statuses (${verificationResults.length - updatePromises.length} already correct)`);
+      // OPTIMIZATION 2: Single-pass categorization (instead of 3 separate filters)
+      const successfulPurchases = [];
+      const failedPurchases = [];
+      const purchasesToUpdate = [];
+
+      for (const result of verificationResults) {
+        // Categorize results
+        if (result.success) {
+          successfulPurchases.push(result);
+        } else {
+          failedPurchases.push(result);
+        }
+
+        // Check if status needs updating (O(1) Map lookup instead of O(n) array.find)
+        const purchase = purchaseMap.get(result.purchaseId);
+        const newStatus = result.success ? 'success' : 'failed';
+        if (purchase && purchase.status !== newStatus) {
+          purchasesToUpdate.push({
+            id: result.purchaseId,
+            status: newStatus
+          });
+        }
+      }
+
+      // Update only changed statuses
+      if (purchasesToUpdate.length > 0) {
+        await Promise.all(purchasesToUpdate.map(p =>
+          databaseService.updatePurchaseStatus(p.id, p.status)
+        ));
+        console.log(`✅ Updated ${purchasesToUpdate.length} purchase statuses (${verificationResults.length - purchasesToUpdate.length} already correct)`);
       } else {
         console.log(`✅ All ${verificationResults.length} purchase statuses already up-to-date`);
       }
@@ -660,8 +678,8 @@ class TelegramBotController {
 
       // Format results exactly like normal order flow
       // Message 1: Order Summary
-      const successCount = verificationResults.filter(r => r.success).length;
-      const failedCount = verificationResults.filter(r => !r.success).length;
+      const successCount = successfulPurchases.length;
+      const failedCount = failedPurchases.length;
 
       const summaryMessage =
         `📦 **Order Details:**\n` +
@@ -672,10 +690,6 @@ class TelegramBotController {
         `❌ Failed: ${failedCount}\n`;
 
       await this.safeSendMessage(chatId, summaryMessage, { parse_mode: 'Markdown' });
-
-      // Message 2: PINS Only (using new format)
-      const successfulPurchases = verificationResults.filter(r => r.success);
-      const failedPurchases = verificationResults.filter(r => !r.success);
 
       if (successfulPurchases.length > 0) {
 

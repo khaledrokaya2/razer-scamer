@@ -139,7 +139,7 @@ class TransactionVerificationService {
   }
 
   /**
-   * Verify multiple transactions
+   * Verify multiple transactions (Sequential - one at a time for reliability)
    * @param {Array<Object>} purchases - Array of purchase objects with transactionId
    * @param {Object} page - Puppeteer page object (already logged in)
    * @param {Function} onProgress - Optional progress callback (current, total)
