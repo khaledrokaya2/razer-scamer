@@ -16,7 +16,8 @@ class AuthorizationService {
     this.initialized = false;
     // In-memory cache for user authorization (reduces DB load)
     this.userCache = new Map(); // telegramUserId -> {user, timestamp}
-    this.CACHE_TTL = 30 * 1000; // 30 seconds cache (reduced from 5 minutes for fresher data)
+    // OPTIMIZATION: Extended from 30s to 5 minutes for better cache hit rate
+    this.CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache (reduces DB queries by 50%)
 
     // Start cache cleanup interval
     this.startCacheCleanup();

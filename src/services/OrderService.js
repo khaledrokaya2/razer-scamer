@@ -12,7 +12,47 @@ const authService = require('./AuthorizationService');
 class OrderService {
   constructor() {
     // In-memory storage for pins (not saved to database)
-    this.orderPins = new Map(); // orderId -> [{pinCode, serial, transactionId}, ...]
+    this.orderPins = new Map(); // orderId -> {pins: [...], timestamp: Date.now()}
+    this.ORDER_PIN_TTL = 2 * 60 * 60 * 1000; // 2 hours
+
+    // CONCURRENCY FIX: Track active orders to prevent cleanup during processing
+    this.activeOrders = new Set(); // Set of order IDs currently being processed
+
+    // Start automatic cleanup
+    this.startPinCleanup();
+  }
+
+  /**
+   * Start automatic cleanup of old pins
+   * Runs every 30 minutes to remove pins older than 2 hours
+   * CONCURRENCY FIX: Skips active orders to prevent data loss
+   */
+  startPinCleanup() {
+    setInterval(() => {
+      const now = Date.now();
+      let cleaned = 0;
+      let skipped = 0;
+
+      for (const [orderId, data] of this.orderPins.entries()) {
+        // CRITICAL FIX: Don't delete pins for active orders
+        if (this.activeOrders.has(orderId)) {
+          skipped++;
+          continue;
+        }
+
+        // Check if order is older than 2 hours
+        const age = now - (data.timestamp || now);
+        if (age > this.ORDER_PIN_TTL) {
+          this.orderPins.delete(orderId);
+          cleaned++;
+        }
+      }
+
+      if (cleaned > 0 || skipped > 0) {
+        console.log(`🧹 Cleanup: ${cleaned} old orders removed, ${skipped} active orders skipped`);
+        console.log(`📊 Memory: ${this.orderPins.size} orders, ${this.activeOrders.size} active`);
+      }
+    }, 30 * 60 * 1000); // Every 30 minutes
   }
 
   /**
@@ -31,8 +71,11 @@ class OrderService {
         gameName
       );
 
-      // Initialize empty pins array for this order
-      this.orderPins.set(order.id, []);
+      // Initialize empty pins array for this order WITH TIMESTAMP
+      this.orderPins.set(order.id, {
+        pins: [],
+        timestamp: Date.now()
+      });
 
       console.log(`✅ Order created: ID ${order.id}`);
       return order;
@@ -70,6 +113,10 @@ class OrderService {
         cardsCount: quantity
       });
 
+      // CONCURRENCY FIX: Mark order as active to prevent cleanup
+      this.activeOrders.add(order.id);
+      console.log(`🔒 Order ${order.id} marked as active (total active: ${this.activeOrders.size})`);
+
       console.log(`\n${'='.repeat(60)}`);
       console.log(`📦 Processing Order #${order.id}`);
       console.log(`   Game: ${gameName}`);
@@ -104,25 +151,31 @@ class OrderService {
         }
       });
 
-      // Step 3: Save purchases to database and memory
-      // Note: Transactions are already saved immediately when transaction page is reached
-      // Here we just update memory storage and progress counter
+      // Step 3: Save purchases to memory (transactions already saved in DB during purchase)
+      // Count successful purchases for final update
+      let successfulPurchasesCount = 0;
+
       for (const purchase of purchases) {
         // Transaction already saved in completePurchase, just store pins in memory
-        this.orderPins.get(order.id).push({
-          pinCode: purchase.pinCode,
-          serial: purchase.serial,
-          transactionId: purchase.transactionId,
-          success: purchase.success !== false,  // Track if it succeeded or failed
-          requiresManualCheck: purchase.requiresManualCheck || false
-        });
+        const orderData = this.orderPins.get(order.id);
+        if (orderData && orderData.pins) {
+          orderData.pins.push({
+            pinCode: purchase.pinCode,
+            serial: purchase.serial,
+            transactionId: purchase.transactionId,
+            success: purchase.success !== false,  // Track if it succeeded or failed
+            requiresManualCheck: purchase.requiresManualCheck || false
+          });
+        }
 
-        // Update order progress count (count both successful and failed)
-        await databaseService.incrementOrderPurchases(order.id);
+        // Count successful purchases
+        if (purchase.success !== false) {
+          successfulPurchasesCount++;
+        }
       }
 
-      // Step 4: Mark order as completed
-      await databaseService.updateOrderStatus(order.id, 'completed');
+      // Step 4: Mark order as completed and update purchase count ONCE
+      await databaseService.updateOrderStatusWithCount(order.id, 'completed', successfulPurchasesCount);
 
       // Get final order state
       order = await databaseService.getOrderById(order.id);
@@ -131,13 +184,23 @@ class OrderService {
       console.log(`   Total purchases: ${order.completed_purchases}/${order.cards_count}`);
       console.log(`   Status: ${order.status}`);
 
+      // CONCURRENCY FIX: Remove from active orders after completion
+      this.activeOrders.delete(order.id);
+      console.log(`🔓 Order ${order.id} marked as inactive (total active: ${this.activeOrders.size})`);
+
       return {
         order,
-        pins: this.orderPins.get(order.id) || []
+        pins: (this.orderPins.get(order.id) && this.orderPins.get(order.id).pins) || []
       };
 
     } catch (err) {
       console.error('❌ Order processing failed:', err.message);
+
+      // CONCURRENCY FIX: Remove from active orders on ANY error
+      if (order) {
+        this.activeOrders.delete(order.id);
+        console.log(`🔓 Order ${order.id} marked as inactive after error (total active: ${this.activeOrders.size})`);
+      }
 
       // Handle cancellation - save what we have and return partial results
       if (err.message && err.message.includes('cancelled by user')) {
@@ -145,23 +208,30 @@ class OrderService {
 
         if (order && err.purchases && err.purchases.length > 0) {
           // Save all completed purchases (including failed ones)
+          let successfulPurchasesCount = 0;
+
           for (const purchase of err.purchases) {
             // Transactions already saved in completePurchase during processing
             // Just store pins in memory
-            this.orderPins.get(order.id).push({
-              pinCode: purchase.pinCode,
-              serial: purchase.serial,
-              transactionId: purchase.transactionId,
-              success: purchase.success !== false,
-              requiresManualCheck: purchase.requiresManualCheck || false
-            });
+            const orderData = this.orderPins.get(order.id);
+            if (orderData && orderData.pins) {
+              orderData.pins.push({
+                pinCode: purchase.pinCode,
+                serial: purchase.serial,
+                transactionId: purchase.transactionId,
+                success: purchase.success !== false,
+                requiresManualCheck: purchase.requiresManualCheck || false
+              });
+            }
 
-            // Update order progress count
-            await databaseService.incrementOrderPurchases(order.id);
+            // Count successful purchases
+            if (purchase.success !== false) {
+              successfulPurchasesCount++;
+            }
           }
 
-          // Mark as failed (cancelled status not in DB constraint, using 'failed')
-          await databaseService.updateOrderStatus(order.id, 'failed');
+          // Mark as failed and update count ONCE (cancelled status not in DB constraint, using 'failed')
+          await databaseService.updateOrderStatusWithCount(order.id, 'failed', successfulPurchasesCount);
 
           // Get final order state
           order = await databaseService.getOrderById(order.id);
@@ -169,7 +239,7 @@ class OrderService {
           console.log(`🛑 Order #${order.id} cancelled with ${order.completed_purchases}/${order.cards_count} cards processed`);          // Return partial results
           err.partialOrder = {
             order,
-            pins: this.orderPins.get(order.id) || []
+            pins: (this.orderPins.get(order.id) && this.orderPins.get(order.id).pins) || []
           };
         } else if (order) {
           // No purchases completed, just mark as failed (cancelled status not in DB)
@@ -266,11 +336,15 @@ class OrderService {
 
   /**
    * Clear pins from memory (after sending to user)
+   * OPTIMIZATION: Immediately free memory after delivery
    * @param {number} orderId - Order ID
    */
   clearOrderPins(orderId) {
-    this.orderPins.delete(orderId);
-    console.log(`🗑️ Cleared pins from memory for order ${orderId}`);
+    const deleted = this.orderPins.delete(orderId);
+    if (deleted) {
+      console.log(`🗑️ Cleared pins from memory for order ${orderId}`);
+      console.log(`📊 Memory: ${this.orderPins.size} orders remaining`);
+    }
   }
 }
 

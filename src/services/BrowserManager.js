@@ -14,8 +14,9 @@ class BrowserManager {
     // Map of userId -> { browser, page, lastActivity, inUse }
     this.userBrowsers = new Map();
 
-    // Auto-close inactive browsers after 30 minutes (extended for login sessions)
-    this.INACTIVITY_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+    // OPTIMIZATION: Reduced timeout from 30 to 5 minutes to save memory
+    // Browser stays open while in use, closes after 5 minutes of inactivity
+    this.INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
     // Start cleanup interval (check every 5 minutes)
     this.startCleanupInterval();

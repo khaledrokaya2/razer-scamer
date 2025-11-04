@@ -108,97 +108,67 @@ class PurchaseService {
       console.log(`📄 Page loaded: ${pageStatus.title}`);
       console.log(`🎯 Quick scan: ${pageStatus.cardCount} cards, ${pageStatus.paymentCount} payment methods`);
 
-      // If we already found cards in the quick scan, use fast path
-      if (pageStatus.hasCards && pageStatus.cardCount > 0) {
-        console.log('⚡ Fast path: Cards detected, extracting directly...');
+      // OPTIMIZED: Wait for cards to load, then try all detection methods in one pass
+      console.log('⏳ Waiting for cards to load (max 5 seconds)...');
 
-        const cardsData = await page.evaluate(() => {
-          const containers = document.querySelectorAll('#webshop_step_sku .selection-tile, .sku-list__item .selection-tile, [class*="sku"] .selection-tile');
-
-          return Array.from(containers).map((container, index) => {
-            const radioInput = container.querySelector('input[type="radio"][name="paymentAmountItem"]');
-            if (!radioInput) return null; // Skip non-card containers
-
-            // Get card name
-            const textElement = container.querySelector('.selection-tile__text') ||
-              container.querySelector('[class*="title"]') ||
-              container.querySelector('label');
-
-            let name = textElement ? textElement.textContent.trim() : '';
-
-            // Check if disabled
-            let disabled = radioInput.disabled ||
-              container.classList.contains('disabled') ||
-              container.querySelector('.disabled') !== null ||
-              (container.textContent && container.textContent.toLowerCase().includes('out of stock'));
-
-            return {
-              name: name,
-              index: index,
-              disabled: disabled,
-              radioId: radioInput.id,
-              radioValue: radioInput.value
-            };
-          }).filter(card => card && card.name && card.name.length > 0);
-        });
-
-        console.log(`✅ Fast extraction: Found ${cardsData.length} cards`);
-
-        if (cardsData.length > 0) {
-          // Log card details
-          cardsData.forEach((card, idx) => {
-            const status = card.disabled ? '(OUT OF STOCK)' : '(AVAILABLE)';
-            console.log(`   ${idx}: ${card.name} ${status}`);
-          });
-
-          browserManager.updateActivity(userId);
-          return cardsData;
-        }
+      // Wait for any card-related selector to appear (5 second timeout)
+      try {
+        await Promise.race([
+          // Try to wait for known card containers
+          page.waitForSelector('#webshop_step_sku .selection-tile, div[class*="selection-tile"], input[name="paymentAmountItem"]',
+            { timeout: 5000 }
+          ),
+          // Or wait 5 seconds maximum
+          new Promise((resolve) => setTimeout(resolve, 5000))
+        ]);
+        console.log('✅ Card elements detected on page');
+      } catch (waitErr) {
+        console.log('⚠️ Card elements not found within 5 seconds, will try extraction anyway...');
       }
 
-      // Fallback: If fast path didn't work, try slower detection methods
-      console.log('🔍 Fast path failed, trying detailed scanning...');
+      // Additional small wait for dynamic content to settle
+      await new Promise(resolve => setTimeout(resolve, 300));
 
-      let cardsData = [];
-      let detectionMethod = '';
+      // OPTIMIZED: Try ALL 3 detection methods in ONE evaluation
+      console.log('🔍 Extracting cards using unified detection...');
 
-      // Method 1: Try the specific structure first (2 second timeout)
-      try {
-        await page.waitForSelector('div[class*="selection-tile"]', { timeout: 2000 });
-        cardsData = await page.evaluate(() => {
-          // Look for card containers in multiple possible locations
-          const containers = [
-            ...document.querySelectorAll('#webshop_step_sku .selection-tile'),
-            ...document.querySelectorAll('div[class*="selection-tile"]'),
-            ...document.querySelectorAll('.sku-list__item .selection-tile'),
-            ...document.querySelectorAll('[class*="catalog"] .selection-tile')
-          ];
+      const cardsData = await page.evaluate(() => {
+        let detectedCards = [];
+        let method = '';
 
-          const uniqueContainers = [...new Set(containers)]; // Remove duplicates
+        // METHOD 1: Specific structure with selection-tile class
+        const method1Containers = [
+          ...document.querySelectorAll('#webshop_step_sku .selection-tile'),
+          ...document.querySelectorAll('.sku-list__item .selection-tile'),
+          ...document.querySelectorAll('[class*="catalog"] .selection-tile'),
+          ...document.querySelectorAll('div[class*="selection-tile"]')
+        ];
 
-          return uniqueContainers.map((container, index) => {
-            // Get radio input
-            const radioInput = container.querySelector('input[type="radio"]');
+        // Remove duplicates by checking if same element
+        const uniqueMethod1 = [];
+        const seenElements = new Set();
 
-            // Get card name from multiple possible locations
-            let name = '';
+        for (const container of method1Containers) {
+          if (!seenElements.has(container)) {
+            seenElements.add(container);
+            uniqueMethod1.push(container);
+          }
+        }
+
+        if (uniqueMethod1.length > 0) {
+          method = 'Specific structure (selection-tile)';
+          detectedCards = uniqueMethod1.map((container, index) => {
+            const radioInput = container.querySelector('input[type="radio"][name="paymentAmountItem"]');
+            if (!radioInput) return null;
+
             const textElement = container.querySelector('.selection-tile__text') ||
               container.querySelector('[class*="title"]') ||
               container.querySelector('[class*="name"]') ||
               container.querySelector('label');
 
-            if (textElement) {
-              name = textElement.textContent.trim();
-            }
+            const name = textElement ? textElement.textContent.trim() : '';
 
-            // Check if disabled
-            let disabled = false;
-            if (radioInput) {
-              disabled = radioInput.disabled;
-            }
-
-            // Check for disabled styling
-            disabled = disabled ||
+            const disabled = radioInput.disabled ||
               container.classList.contains('disabled') ||
               container.querySelector('.disabled') !== null ||
               container.querySelector('[class*="out-of-stock"]') !== null ||
@@ -208,37 +178,71 @@ class PurchaseService {
               name: name,
               index: index,
               disabled: disabled,
-              radioId: radioInput ? radioInput.id : null,
-              radioValue: radioInput ? radioInput.value : null
+              radioId: radioInput.id,
+              radioValue: radioInput.value,
+              method: method
             };
-          }).filter(card => card.name && card.name.length > 0);
-        });
-
-        if (cardsData.length > 0) {
-          detectionMethod = 'Specific structure';
+          }).filter(card => card && card.name && card.name.length > 0);
         }
-      } catch (err) {
-        console.log('⚠️ Specific structure detection failed, trying fallback...');
-      }
 
-      // Method 2: Generic fallback detection
-      if (cardsData.length === 0) {
-        cardsData = await page.evaluate(() => {
-          // Look for any radio inputs that might be cards
-          const radioInputs = document.querySelectorAll('input[type="radio"]');
-          const cardCandidates = [];
+        // METHOD 2: If Method 1 found nothing, try direct radio button search
+        if (detectedCards.length === 0) {
+          method = 'Direct radio search (paymentAmountItem)';
+          const radioInputs = document.querySelectorAll('input[type="radio"][name="paymentAmountItem"]');
 
-          radioInputs.forEach((radio, index) => {
-            // Skip payment method radios
-            const name = radio.getAttribute('name') || '';
-            if (name.includes('payment') && !name.includes('amount')) {
-              return;
+          detectedCards = Array.from(radioInputs).map((radio, index) => {
+            // Find parent container
+            const parent = radio.closest('div, label, li');
+            let name = '';
+
+            // Try to find label
+            if (radio.id) {
+              const label = document.querySelector(`label[for="${radio.id}"]`);
+              if (label) {
+                name = label.textContent.trim();
+              }
             }
 
-            // Find the label or text associated with this radio
+            // If no label, use parent text
+            if (!name && parent) {
+              name = parent.textContent.trim().replace(/\s+/g, ' ');
+            }
+
+            const disabled = radio.disabled ||
+              (parent && (
+                parent.classList.contains('disabled') ||
+                parent.querySelector('.disabled') !== null ||
+                parent.textContent.toLowerCase().includes('out of stock')
+              ));
+
+            return {
+              name: name,
+              index: index,
+              disabled: disabled,
+              radioId: radio.id,
+              radioValue: radio.value,
+              method: method
+            };
+          }).filter(card => card.name && card.name.length > 3);
+        }
+
+        // METHOD 3: Generic fallback - find ANY radio that looks like a product
+        if (detectedCards.length === 0) {
+          method = 'Generic fallback (all radios)';
+          const allRadios = document.querySelectorAll('input[type="radio"]');
+          const candidates = [];
+
+          for (const radio of allRadios) {
+            const radioName = radio.getAttribute('name') || '';
+
+            // Skip payment method radios
+            if (radioName.includes('payment') && !radioName.includes('amount')) {
+              continue;
+            }
+
             let labelText = '';
 
-            // Try to find label by 'for' attribute
+            // Try label
             if (radio.id) {
               const label = document.querySelector(`label[for="${radio.id}"]`);
               if (label) {
@@ -246,58 +250,62 @@ class PurchaseService {
               }
             }
 
-            // If no label found, look in parent container
+            // Try parent
             if (!labelText) {
-              const parent = radio.closest('div');
+              const parent = radio.closest('div, li, label');
               if (parent) {
-                labelText = parent.textContent.trim();
-                // Clean up text (remove extra whitespace, etc.)
-                labelText = labelText.replace(/\s+/g, ' ').substring(0, 100);
+                labelText = parent.textContent.trim().replace(/\s+/g, ' ').substring(0, 100);
               }
             }
 
-            if (labelText && labelText.length > 0) {
-              cardCandidates.push({
-                name: labelText,
-                index: index,
-                disabled: radio.disabled,
-                radioId: radio.id,
-                radioValue: radio.value
-              });
+            if (labelText && labelText.length > 3) {
+              const lowerText = labelText.toLowerCase();
+
+              // Filter out obvious non-product items
+              if (!lowerText.includes('razer gold') &&
+                !lowerText.includes('paypal') &&
+                !lowerText.includes('credit card') &&
+                !lowerText.includes('payment method')) {
+                candidates.push({
+                  name: labelText,
+                  disabled: radio.disabled,
+                  radioId: radio.id,
+                  radioValue: radio.value,
+                  method: method
+                });
+              }
             }
-          });
+          }
 
-          // Filter to likely product cards (exclude very short names, payment methods, etc.)
-          return cardCandidates.filter(card => {
-            const name = card.name.toLowerCase();
-            return name.length > 3 &&
-              !name.includes('razer gold') &&
-              !name.includes('paypal') &&
-              !name.includes('credit card') &&
-              !name.includes('payment');
-          });
-        });
-
-        if (cardsData.length > 0) {
-          detectionMethod = 'Generic fallback';
+          // Add index after filtering
+          detectedCards = candidates.map((card, index) => ({
+            ...card,
+            index: index
+          }));
         }
-      }
 
-      console.log(`✅ Cards detected using: ${detectionMethod}`);
-      console.log(`📦 Found ${cardsData.length} card options`);
+        return {
+          cards: detectedCards,
+          method: method,
+          totalFound: detectedCards.length
+        };
+      });
+
+      console.log(`✅ Cards detected using: ${cardsData.method}`);
+      console.log(`📦 Found ${cardsData.totalFound} card options`);
 
       // Log card details for debugging
-      cardsData.forEach((card, idx) => {
+      cardsData.cards.forEach((card, idx) => {
         const status = card.disabled ? '(OUT OF STOCK)' : '(AVAILABLE)';
         console.log(`   ${idx}: ${card.name} ${status}`);
       });
 
-      if (cardsData.length === 0) {
+      if (cardsData.cards.length === 0) {
         throw new Error('No cards found. The page might not have loaded properly or the game might not be available.');
       }
 
       browserManager.updateActivity(userId);
-      return cardsData;
+      return cardsData.cards;
 
     } catch (err) {
       console.error('❌ Error getting available cards:', err.message);
@@ -907,37 +915,35 @@ class PurchaseService {
         console.log('⏳ Waiting for order to complete processing...');
 
         try {
-          // SOLUTION #1: Add 30-second timeout instead of 60 seconds
+          // OPTIMIZATION: Reduced to 10s (safe because transaction ID already captured)
           await Promise.race([
             page.waitForFunction(() => {
               const h2 = document.querySelector('h2[data-v-621e38f9]');
               return h2 && h2.textContent.includes('Congratulations');
-            }, { timeout: 30000 }),  // 30 seconds max
-            new Promise((resolve) => setTimeout(resolve, 30000))  // Fallback timeout
+            }, { timeout: 10000 }),  // 10 seconds max
+            new Promise((resolve) => setTimeout(resolve, 10000))  // Fallback timeout
           ]);
 
           console.log('✅ Order processing completed - "Congratulations!" page loaded');
         } catch (waitErr) {
-          console.log('⚠️ Timeout (30s) waiting for congratulations message, will try extraction anyway...');
+          console.log('⚠️ Timeout (10s) waiting for congratulations message, will try extraction anyway...');
         }
 
         // Additional wait for PIN block to be visible with shorter timeout
         try {
-          await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 10000 });
+          await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 5000 });
           console.log('✅ PIN block is visible');
         } catch (pinWaitErr) {
           console.log('⚠️ PIN block not found with selector, will try extraction anyway...');
         }
 
-        // Give a moment for all content to settle
-        await new Promise(resolve => setTimeout(resolve, 2000));
 
         // Check transaction status from the page with 10-second timeout
         console.log('🔍 Checking transaction status...');
 
         let statusCheck;
         try {
-          // SOLUTION #1: Wrap in Promise.race with 10-second timeout
+          // OPTIMIZATION: Reduced to 5s (safe because transaction ID already captured)
           statusCheck = await Promise.race([
             page.evaluate(() => {
               // Look for status in the order summary section
@@ -955,7 +961,7 @@ class PurchaseService {
               return { status: 'unknown', message: 'Unknown status' };
             }),
             new Promise((resolve) =>
-              setTimeout(() => resolve({ status: 'timeout', message: 'Status check timed out' }), 10000)
+              setTimeout(() => resolve({ status: 'timeout', message: 'Status check timed out' }), 5000)
             )
           ]);
         } catch (evalErr) {
@@ -976,7 +982,7 @@ class PurchaseService {
 
         let purchaseData;
         try {
-          // SOLUTION #1: Add 10-second timeout to extraction
+          // OPTIMIZATION: Reduced to 5s (safe because transaction ID already captured)
           purchaseData = await Promise.race([
             page.evaluate(() => {
               // Extract PIN and Serial from the pin-block
@@ -1018,7 +1024,7 @@ class PurchaseService {
                 serial: '',
                 transactionId: '',
                 productName: ''
-              }), 10000)  // 10-second timeout
+              }), 5000)  // OPTIMIZATION: 5s timeout
             )
           ]);
         } catch (extractErr) {
@@ -1031,24 +1037,36 @@ class PurchaseService {
           };
         }
 
+        // OPTIMIZATION #2: Determine final status and save ONCE
+        let finalStatus, purchaseSuccess, finalTransactionId;
+
+        if (purchaseData.pinCode && purchaseData.serial) {
+          finalStatus = 'success';
+          purchaseSuccess = true;
+          currentStage = this.STAGES.COMPLETED;
+        } else {
+          finalStatus = 'failed';
+          purchaseSuccess = false;
+          currentStage = this.STAGES.FAILED;
+        }
+
+        finalTransactionId = purchaseData.transactionId || transactionId || '';
+
         // SOLUTION #2: Don't throw error if extraction fails - mark as FAILED
         // Transaction ID is already saved, so no retry will happen
-        if (!purchaseData.pinCode || !purchaseData.serial) {
+        if (!purchaseSuccess) {
           console.error('⚠️ Could not extract PIN or Serial - marking as FAILED');
-          // 🔒 SECURITY: purchaseData not logged (contains sensitive data)
-
-          currentStage = this.STAGES.FAILED;
           console.log(`📍 Stage: ${currentStage}`);
 
-          // Save to database with 'failed' status
+          // Save to database with final status
           try {
             await databaseService.createPurchaseTransaction({
               orderId: orderId,
-              transactionId: purchaseData.transactionId || transactionId,
+              transactionId: finalTransactionId,
               cardNumber: cardNumber,
-              status: 'failed'
+              status: finalStatus
             });
-            console.log(`📝 Failed purchase saved to database (card #${cardNumber}, status: failed)`);
+            console.log(`📝 Purchase saved to database (card #${cardNumber}, status: ${finalStatus})`);
           } catch (dbErr) {
             console.error('⚠️ Failed to save purchase to database:', dbErr.message);
           }
@@ -1056,38 +1074,36 @@ class PurchaseService {
           // Return result with FAILED markers - user will check manually
           return {
             success: false,
-            transactionId: purchaseData.transactionId || transactionId,
-            pinCode: 'FAILED',  // Mark as failed for user to check manually
+            transactionId: finalTransactionId,
+            pinCode: 'FAILED',
             serial: 'FAILED',
             requiresManualCheck: true,
             stage: currentStage
           };
         }
 
-        currentStage = this.STAGES.COMPLETED;
-        console.log(`📍 Stage: ${currentStage}`);
-
         console.log('✅ Transaction completed successfully!');
         console.log(`📦 Product: ${purchaseData.productName}`);
-        console.log(`🆔 Transaction ID: ${purchaseData.transactionId || transactionId}`);
+        console.log(`🆔 Transaction ID: ${finalTransactionId}`);
+        console.log(`📍 Stage: ${currentStage}`);
         // � SECURITY: PIN and Serial not logged to console
 
-        // Save to database with 'success' status
+        // Save to database with final status
         try {
           await databaseService.createPurchaseTransaction({
             orderId: orderId,
-            transactionId: purchaseData.transactionId || transactionId,
+            transactionId: finalTransactionId,
             cardNumber: cardNumber,
-            status: 'success'
+            status: finalStatus
           });
-          console.log(`📝 Successful purchase saved to database (card #${cardNumber}, status: success)`);
+          console.log(`📝 Purchase saved to database (card #${cardNumber}, status: ${finalStatus})`);
         } catch (dbErr) {
           console.error('⚠️ Failed to save purchase to database:', dbErr.message);
         }
 
         return {
           success: true,
-          transactionId: purchaseData.transactionId || transactionId,
+          transactionId: finalTransactionId,
           pinCode: purchaseData.pinCode,
           serial: purchaseData.serial,
           stage: currentStage

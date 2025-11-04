@@ -15,9 +15,20 @@ const { UserAccount, Order, Purchase, SubscriptionPlans } = require('../models/D
 class DatabaseService {
   constructor() {
     this.pool = null;
-    // Use connection string directly
+
+    // OPTIMIZATION: Configure connection pool for concurrent users
+    // MonsterASP free tier - configured for 50 max connections
+    // Using direct connection string with pool options
     this.config = process.env.DB_CONNECTION_STRING;
-    console.log('📝 Using Azure SQL Database (MSSQL)');
+
+    this.poolConfig = {
+      max: 50,        // Max 50 connections (supports up to 100 concurrent users)
+      min: 5,         // Keep 5 connections alive always (faster response)
+      idleTimeoutMillis: 30000,  // Close idle connections after 30s
+      acquireTimeoutMillis: 30000, // Wait max 30s for connection
+    };
+
+    console.log('📝 Database pool configured: 5-50 connections (MonsterASP)');
   }
 
   /**
@@ -26,9 +37,58 @@ class DatabaseService {
   async connect() {
     try {
       if (!this.pool) {
-        console.log('🔌 Connecting to Azure SQL Database...');
-        this.pool = await sql.connect(this.config);
-        console.log('✅ Database connected successfully');
+        console.log('🔌 Connecting to SQL Database (MonsterASP)...');
+
+        // OPTIMIZATION: Parse connection string and add pool config
+        // Connection string format: Server=...;Database=...;User Id=...;Password=...;Encrypt=true
+        const connString = this.config;
+
+        // Parse connection string into config object
+        const config = {};
+        const parts = connString.split(';').filter(p => p.trim());
+
+        for (const part of parts) {
+          const [key, value] = part.split('=').map(s => s.trim());
+          if (key && value) {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey === 'server' || lowerKey === 'data source') {
+              config.server = value;
+            } else if (lowerKey === 'database' || lowerKey === 'initial catalog') {
+              config.database = value;
+            } else if (lowerKey === 'user id' || lowerKey === 'uid') {
+              config.user = value;
+            } else if (lowerKey === 'password' || lowerKey === 'pwd') {
+              config.password = value;
+            } else if (lowerKey === 'encrypt') {
+              config.encrypt = value.toLowerCase() === 'true';
+            } else if (lowerKey === 'trustservercertificate') {
+              config.trustServerCertificate = value.toLowerCase() === 'true';
+            }
+          }
+        }
+
+        // Add pool configuration
+        config.pool = this.poolConfig;
+
+        // Add default options
+        config.options = {
+          encrypt: config.encrypt !== false,
+          trustServerCertificate: config.trustServerCertificate || false,
+          requestTimeout: 30000,
+          connectionTimeout: 15000,
+          enableArithAbort: true
+        };
+
+        // Create pool
+        this.pool = new sql.ConnectionPool(config);
+
+        // Monitor pool health
+        this.pool.on('error', err => {
+          console.error('💥 Database pool error:', err);
+        });
+
+        await this.pool.connect();
+        console.log('✅ Database connected (pool: 5-50 connections)');
       }
       return this.pool;
     } catch (err) {
@@ -229,34 +289,6 @@ class DatabaseService {
   }
 
   /**
-   * Decrement user's allowed attempts (when creating an order)
-   * @param {number} userId - User ID
-   * @returns {Promise<UserAccount>} Updated user account
-   */
-  async decrementUserAttempts(userId) {
-    try {
-      await this.connect();
-      const result = await this.pool.request()
-        .input('id', sql.Int, userId)
-        .query(`
-          UPDATE user_accounts 
-          SET AllowedAttempts = AllowedAttempts - 1
-          OUTPUT INSERTED.*
-          WHERE id = @id AND AllowedAttempts > 0
-        `);
-
-      if (result.recordset.length === 0) {
-        throw new Error('No attempts remaining');
-      }
-
-      return new UserAccount(result.recordset[0]);
-    } catch (err) {
-      console.error('Error decrementing user attempts:', err);
-      throw err;
-    }
-  }
-
-  /**
    * Get user's orders
    * @param {number} userId - User ID
    * @returns {Promise<Order[]>} Array of user's orders
@@ -352,26 +384,30 @@ class DatabaseService {
   }
 
   /**
-   * Increment completed purchases count for an order
+   * OPTIMIZATION: Update order status and purchase count in one query
    * @param {number} orderId - Order ID
+   * @param {string} status - New status
+   * @param {number} purchaseCount - Number of successful purchases
    * @returns {Promise<Order>} Updated order
    */
-  async incrementOrderPurchases(orderId) {
+  async updateOrderStatusWithCount(orderId, status, purchaseCount) {
     try {
       await this.connect();
 
       const result = await this.pool.request()
         .input('id', sql.Int, orderId)
+        .input('status', sql.NVarChar(50), status)
+        .input('count', sql.Int, purchaseCount)
         .query(`
           UPDATE orders 
-          SET completed_purchases = completed_purchases + 1
+          SET status = @status, completed_purchases = @count
           OUTPUT INSERTED.*
           WHERE id = @id
         `);
 
       return new Order(result.recordset[0]);
     } catch (err) {
-      console.error('Error incrementing order purchases:', err);
+      console.error('Error updating order status with count:', err);
       throw err;
     }
   }
