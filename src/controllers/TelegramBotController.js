@@ -688,13 +688,13 @@ class TelegramBotController {
         // Format and send PIN messages (plain format)
         const plainMessages = orderService.formatPinsPlain(pinObjects);
         for (const message of plainMessages) {
-          await this.safeSendMessage(chatId, message);
+          await this.safeSendMessage(chatId, message, { parse_mode: 'Markdown' });
         }
 
         // Format and send detailed messages (PIN + Serial)
         const detailedMessages = orderService.formatPinsDetailed(pinObjects);
         for (const message of detailedMessages) {
-          await this.safeSendMessage(chatId, message);
+          await this.safeSendMessage(chatId, message, { parse_mode: 'Markdown' });
         }
       }
 
