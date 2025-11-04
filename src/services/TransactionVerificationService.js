@@ -21,7 +21,7 @@ class TransactionVerificationService {
       console.log(`Verifying transaction: ${transactionId}`);
 
       // Navigate to transaction page
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
       // Wait for the status element to appear (this ensures dynamic content is loaded)
       try {
@@ -34,12 +34,12 @@ class TransactionVerificationService {
             }
           }
           return false;
-        }, { timeout: 5000, polling: 200 });
+        }, { timeout: 15000, polling: 100 });
 
         console.log(`Transaction ${transactionId}: Status element loaded`);
 
         // Additional small wait for content to fully render
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, 100));
       } catch (waitErr) {
         console.log(`Transaction ${transactionId}: Timeout waiting for status element`);
         // Continue anyway and try to extract
@@ -142,12 +142,26 @@ class TransactionVerificationService {
    * Verify multiple transactions
    * @param {Array<Object>} purchases - Array of purchase objects with transactionId
    * @param {Object} page - Puppeteer page object (already logged in)
+   * @param {Function} onProgress - Optional progress callback (current, total)
    * @returns {Promise<Array<Object>>} Array of verification results with purchaseId
    */
-  async verifyMultipleTransactions(purchases, page) {
+  async verifyMultipleTransactions(purchases, page, onProgress = null) {
     const results = [];
+    const total = purchases.length;
 
-    for (const purchase of purchases) {
+    for (let i = 0; i < purchases.length; i++) {
+      const purchase = purchases[i];
+      const current = i + 1;
+
+      // Call progress callback if provided
+      if (onProgress) {
+        try {
+          await onProgress(current, total);
+        } catch (err) {
+          console.log('⚠️ Progress callback error:', err.message);
+        }
+      }
+
       if (!purchase.hasTransactionId()) {
         // Transaction ID not saved - purchase failed before transaction page
         results.push({
@@ -168,8 +182,10 @@ class TransactionVerificationService {
         });
       }
 
-      // Minimal delay between requests (reduced from 1s to 500ms)
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // Minimal delay between requests (reduced for speed)
+      if (i < purchases.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
     }
 
     return results;

@@ -227,7 +227,7 @@ class OrderService {
         if (pin.pinCode === 'FAILED') {
           message += `FAILED\nFAILED\n\n`;
         } else {
-          message += `${pin.pinCode}\n${pin.serial}\n\n`;
+          message += `\`${pin.pinCode}\`\n\`${pin.serial}\`\n\n`;
         }
       });
 
@@ -243,7 +243,7 @@ class OrderService {
         if (pin.pinCode === 'FAILED') {
           message1 += `FAILED\nFAILED\n\n`;
         } else {
-          message1 += `${pin.pinCode}\n${pin.serial}\n\n`;
+          message1 += `\`${pin.pinCode}\`\n\`${pin.serial}\`\n\n`;
         }
       }
       messages.push(message1);

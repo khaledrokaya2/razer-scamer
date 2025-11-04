@@ -17,6 +17,7 @@ const scraperService = require('../services/RazerScraperService');
 const adminService = require('../services/AdminService');
 const userService = require('../services/UserService');
 const orderFlowHandler = require('./OrderFlowHandler');
+const orderService = require('../services/OrderService');
 
 class TelegramBotController {
   constructor() {
@@ -555,6 +556,7 @@ class TelegramBotController {
     const databaseService = require('../services/DatabaseService');
     const browserManager = require('../services/BrowserManager');
     const transactionVerifier = require('../services/TransactionVerificationService');
+    const orderService = require('../services/OrderService');
 
     try {
       // Send initial status message
@@ -593,7 +595,7 @@ class TelegramBotController {
 
       // Update status to show verification in progress
       await this.bot.editMessageText(
-        `🔍 Verifying ${purchases.length} transaction(s)...\n\nThis may take a moment.`,
+        `🔍 Verifying ${purchases.length} transaction(s)...\n\n⏳ Progress: 0/${purchases.length}`,
         {
           chat_id: chatId,
           message_id: statusMsg.message_id
@@ -603,17 +605,40 @@ class TelegramBotController {
       // Get browser page (already validated by ensureBrowserSession)
       const page = browserManager.getPage(user.id);
 
-      // Verify all transactions
-      const verificationResults = await transactionVerifier.verifyMultipleTransactions(purchases, page);
+      // Progress callback to update message (throttled to avoid rate limits)
+      let lastProgressUpdate = 0;
+      const PROGRESS_THROTTLE_MS = 1000; // Update every 1 second max
 
-      // Update purchase statuses in database
-      for (const result of verificationResults) {
-        if (result.success) {
-          await databaseService.updatePurchaseStatus(result.purchaseId, 'success');
-        } else {
-          await databaseService.updatePurchaseStatus(result.purchaseId, 'failed');
+      const onProgress = async (current, total) => {
+        const now = Date.now();
+
+        // Only update if enough time has passed or if it's the last one
+        if (now - lastProgressUpdate >= PROGRESS_THROTTLE_MS || current === total) {
+          lastProgressUpdate = now;
+          try {
+            await this.bot.editMessageText(
+              `🔍 Verifying ${total} transaction(s)...\n\n⏳ Progress: ${current}/${total}`,
+              {
+                chat_id: chatId,
+                message_id: statusMsg.message_id
+              }
+            );
+          } catch (err) {
+            // Ignore errors (might be too many edits)
+          }
         }
-      }
+      };
+
+      // Verify all transactions with progress updates
+      const verificationResults = await transactionVerifier.verifyMultipleTransactions(purchases, page, onProgress);
+
+      // Batch update purchase statuses in database (faster than individual updates)
+      const updatePromises = verificationResults.map(result => {
+        const status = result.success ? 'success' : 'failed';
+        return databaseService.updatePurchaseStatus(result.purchaseId, status);
+      });
+
+      await Promise.all(updatePromises);
 
       // Delete status message
       try {
@@ -637,48 +662,80 @@ class TelegramBotController {
 
       await this.safeSendMessage(chatId, summaryMessage, { parse_mode: 'Markdown' });
 
-      // Message 2: PINS Only
+      // Message 2: PINS Only (using new format)
       const successfulPurchases = verificationResults.filter(r => r.success);
       const failedPurchases = verificationResults.filter(r => !r.success);
 
       if (successfulPurchases.length > 0) {
-        let pinMessage = `🎁 **Your PIN Codes:**\n\n`;
 
-        for (const result of successfulPurchases) {
-          pinMessage += `\`${result.pin}\`\n`;
-        }
-        await this.safeSendMessage(chatId, pinMessage, { parse_mode: 'Markdown' });
+        // Convert verification results to pin objects format
+        const pinObjects = successfulPurchases.map(result => ({
+          pinCode: result.pin,
+          serial: result.serial
+        }));
 
-        // Message 2: Cards Details
-        pinMessage = `🎁 **Your Cards Details:**\n\n`;
-        for (const result of successfulPurchases) {
-          pinMessage +=
-            `**Card ${result.cardNumber}:**\n` +
-            `📋 PIN: \`${result.pin}\`\n` +
-            `🔑 Serial: \`${result.serial}\`\n\n`;
+        // Format and send PIN messages (plain format)
+        const plainMessages = orderService.formatPinsPlain(pinObjects);
+        for (const message of plainMessages) {
+          await this.safeSendMessage(chatId, message);
         }
-        await this.safeSendMessage(chatId, pinMessage, { parse_mode: 'Markdown' });
+
+        // Format and send detailed messages (PIN + Serial)
+        const detailedMessages = orderService.formatPinsDetailed(pinObjects);
+        for (const message of detailedMessages) {
+          await this.safeSendMessage(chatId, message);
+        }
       }
 
       // Message 3: Failed transactions (if any)
       if (failedPurchases.length > 0) {
-        let failedMessage = `⚠️ **Failed Transactions:**\n\n`;
+        if (failedPurchases.length >= 50) {
+          let failedMessage = `⚠️ **Failed:**\n\n`;
 
-        for (const result of failedPurchases) {
-          failedMessage +=
-            `**Card ${result.cardNumber}:**\n`;
-
-          if (result.transactionId && result.transactionId !== 'N/A') {
+          for (let i = 0; i <= 50; i++) {
+            const result = failedPurchases[i];
             failedMessage +=
-              `🆔 Transaction: \`${result.transactionId}\`\n` +
-              `❌ Error: ${result.error}\n\n`;
-          } else {
-            failedMessage += `❌ Failed before reaching transaction page\n\n`;
-          }
-        }
+              `**Card ${result.cardNumber}:**\n`;
 
-        failedMessage += `_Please check your Razer transaction history manually_`;
-        await this.safeSendMessage(chatId, failedMessage, { parse_mode: 'Markdown' });
+            if (result.transactionId && result.transactionId !== 'N/A') {
+              failedMessage +=
+                `🆔 Transaction: \`${result.transactionId}\`\n` +
+                `❌ Error: ${result.error}\n\n`;
+            } else {
+              failedMessage += `❌ Failed\n\n`;
+            }
+          }
+          await this.safeSendMessage(chatId, failedMessage, { parse_mode: 'Markdown' });
+          failedMessage = '';
+          for (let i = 51; i < failedPurchases.length; i++) {
+            const result = failedPurchases[i];
+            failedMessage +=
+              `**Card ${result.cardNumber}:**\n`;
+            if (result.transactionId && result.transactionId !== 'N/A') {
+              failedMessage +=
+                `🆔 Transaction: \`${result.transactionId}\`\n` +
+                `❌ Error: ${result.error}\n\n`;
+            } else {
+              failedMessage += `❌ Failed\n\n`;
+            }
+          }
+          await this.safeSendMessage(chatId, failedMessage, { parse_mode: 'Markdown' });
+        } else {
+          let failedMessage = `⚠️ **Failed:**\n\n`;
+
+          for (const result of failedPurchases) {
+            failedMessage +=
+              `**Card ${result.cardNumber}:**\n`;
+            if (result.transactionId && result.transactionId !== 'N/A') {
+              failedMessage +=
+                `🆔 Transaction: \`${result.transactionId}\`\n` +
+                `❌ Error: ${result.error}\n\n`;
+            } else {
+              failedMessage += `❌ Failed\n\n`;
+            }
+          }
+          await this.safeSendMessage(chatId, failedMessage, { parse_mode: 'Markdown' });
+        }
       }
 
     } catch (err) {
