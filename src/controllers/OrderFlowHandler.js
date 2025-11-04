@@ -224,7 +224,8 @@ class OrderFlowHandler {
       cardIndex: null,
       cardName: null,
       quantity: null,
-      backupCode: null,
+      backupCodes: null, // Changed to array
+      backupCodeIndex: 0, // Track current code index
       lastActivity: Date.now()
     });
   }
@@ -561,11 +562,21 @@ class OrderFlowHandler {
 
     // Ask for backup code
     await bot.sendMessage(chatId,
-      `🔐 *BACKUP CODE NEEDED* \n` +
+      `🔐 *BACKUP CODES NEEDED* \n` +
       `✅ *Quantity:* ${quantity} cards\n\n` +
-      `Please enter an 8-digit 2FA Code:\n` +
-      `⚠️ *Note:* Backup codes are\n` +
-      `single-use and will be consumed.`,
+      `Please enter *5 to 10 backup codes*\n` +
+      `(one per line):\n\n` +
+      `Example:\n` +
+      `12345678\n` +
+      `87654321\n` +
+      `11223344\n` +
+      `44332211\n` +
+      `55667788\n` +
+      `...\n\n` +
+      `⚠️ *Note:* Each backup code is\n` +
+      `single-use. You can provide 5-10\n` +
+      `codes to handle 2FA prompts during\n` +
+      `the purchase process.`,
       {
         parse_mode: 'Markdown',
       }
@@ -609,16 +620,52 @@ class OrderFlowHandler {
       return;
     }
 
-    const backupCode = text.trim();
+    // Parse backup codes (one per line)
+    const inputText = text.trim();
+    const backupCodes = inputText.split('\n')
+      .map(code => code.trim())
+      .filter(code => code.length > 0); // Remove empty lines
 
-    // Validate format: exactly 8 digits
-    if (!/^\d{8}$/.test(backupCode)) {
+    // Validate: need 5-10 codes
+    if (backupCodes.length < 5 || backupCodes.length > 10) {
+      try {
+        await bot.sendMessage(chatId,
+          `⚠️ *INVALID INPUT*    \n` +
+          `You entered ${backupCodes.length} code(s).\n` +
+          `Please enter between *5 and 10 codes*.\n\n` +
+          `Example:\n` +
+          `12345678\n` +
+          `87654321\n` +
+          `11223344\n` +
+          `44332211\n` +
+          `55667788\n` +
+          `...(up to 10 codes)\n\n` +
+          `Please try again:`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        console.error('Error sending count validation message:', err);
+      }
+      return;
+    }
+
+    // Validate format: each code must be exactly 8 digits
+    const invalidCodes = [];
+    for (let i = 0; i < backupCodes.length; i++) {
+      if (!/^\d{8}$/.test(backupCodes[i])) {
+        invalidCodes.push(i + 1);
+      }
+    }
+
+    if (invalidCodes.length > 0) {
       try {
         await bot.sendMessage(chatId,
           `⚠️ *INVALID FORMAT*   \n` +
-          `Backup code must be exactly\n` +
-          `*8 digits*.\n\n` +
-          `Please try again:`,
+          `Code(s) at position ${invalidCodes.join(', ')}\n` +
+          `are not valid.\n\n` +
+          `Each backup code must be\n` +
+          `exactly *8 digits*.\n\n` +
+          `Please check and try again:`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -627,14 +674,21 @@ class OrderFlowHandler {
       return;
     }
 
-    // Additional validation: reject obvious invalid patterns
-    if (/^(.)\1{7}$/.test(backupCode)) { // All same digit
+    // Additional validation: reject codes with all same digit
+    const invalidPatterns = [];
+    for (let i = 0; i < backupCodes.length; i++) {
+      if (/^(.)\1{7}$/.test(backupCodes[i])) {
+        invalidPatterns.push(i + 1);
+      }
+    }
+
+    if (invalidPatterns.length > 0) {
       try {
         await bot.sendMessage(chatId,
-          `⚠️ *INVALID CODE*     \n` +
-          `This backup code pattern\n` +
-          `appears invalid.\n\n` +
-          `Please enter a valid code\n` +
+          `⚠️ *INVALID PATTERN*  \n` +
+          `Code(s) at position ${invalidPatterns.join(', ')}\n` +
+          `have suspicious patterns.\n\n` +
+          `Please enter valid codes\n` +
           `from your Razer account:`,
           { parse_mode: 'Markdown' }
         );
@@ -644,10 +698,28 @@ class OrderFlowHandler {
       return;
     }
 
-    // Update session
+    // Check for duplicate codes
+    const uniqueCodes = new Set(backupCodes);
+    if (uniqueCodes.size !== backupCodes.length) {
+      try {
+        await bot.sendMessage(chatId,
+          `⚠️ *DUPLICATE CODES*  \n` +
+          `You entered duplicate codes.\n\n` +
+          `Each code must be unique.\n\n` +
+          `Please enter 10 different codes:`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        console.error('Error sending duplicate message:', err);
+      }
+      return;
+    }
+
+    // Update session with array of backup codes
     this.updateSession(chatId, {
       step: 'processing',
-      backupCode: backupCode
+      backupCodes: backupCodes, // Changed from backupCode to backupCodes (array)
+      backupCodeIndex: 0 // Track which code to use next
     });
 
     // LOGIC BUG FIX #11: Warn user that backup codes are single-use
@@ -744,7 +816,7 @@ class OrderFlowHandler {
         cardName: session.cardName,
         cardIndex: session.cardIndex,
         quantity: session.quantity,
-        backupCode: session.backupCode,
+        backupCodes: session.backupCodes, // Pass array of codes
         onProgress: sendProgressUpdate,  // UX FIX #16
         checkCancellation: () => this.isCancelled(chatId)  // Check if user cancelled
       });

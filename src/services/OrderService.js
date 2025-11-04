@@ -98,7 +98,7 @@ class OrderService {
     cardName,
     cardIndex,
     quantity,
-    backupCode,
+    backupCodes, // Changed to array of backup codes
     onProgress,  // UX FIX #16: Progress callback
     checkCancellation  // Cancellation check callback
   }) {
@@ -122,6 +122,7 @@ class OrderService {
       console.log(`   Game: ${gameName}`);
       console.log(`   Card: ${cardName}`);
       console.log(`   Quantity: ${quantity}`);
+      console.log(`   Backup Codes: ${backupCodes.length} codes provided`);
       console.log(`${'='.repeat(60)}\n`);
 
       // Step 2: Process purchases with progress callback
@@ -131,7 +132,7 @@ class OrderService {
         cardIndex,
         cardName,
         quantity,
-        backupCode,
+        backupCodes, // Pass array of codes
         onProgress,  // Pass through progress callback
         checkCancellation,  // Pass through cancellation check
         orderId: order.id,  // Pass order ID for immediate transaction saving

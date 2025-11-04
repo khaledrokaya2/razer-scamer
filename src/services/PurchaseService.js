@@ -1151,7 +1151,7 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters
    * @returns {Promise<Array>} Array of purchase results (including failed ones)
    */
-  async processBulkPurchases({ userId, gameUrl, cardIndex, cardName, quantity, backupCode, onProgress, checkCancellation, orderId, onFirstPurchaseComplete }) {
+  async processBulkPurchases({ userId, gameUrl, cardIndex, cardName, quantity, backupCodes, onProgress, checkCancellation, orderId, onFirstPurchaseComplete }) {
     // Get user's existing browser session
     const page = browserManager.getPage(userId);
 
@@ -1166,9 +1166,11 @@ class PurchaseService {
     let successCount = 0;
     let failedCount = 0;
     let firstPurchaseCompleted = false;
+    let backupCodeIndex = 0; // Track which backup code to use next
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`🎮 Starting bulk purchase: ${quantity} x ${cardName}`);
+    console.log(`   Backup Codes Available: ${backupCodes.length} codes`);
     console.log(`${'='.repeat(60)}\n`);
 
     try {
@@ -1182,7 +1184,16 @@ class PurchaseService {
           throw error;
         }
 
+        // Check if we have backup codes available (in case more than 10 cards ordered)
+        if (backupCodeIndex >= backupCodes.length) {
+          console.error(`❌ No more backup codes available (used ${backupCodeIndex}/${backupCodes.length})`);
+          const codeError = new Error('All backup codes have been used. Cannot process remaining cards.');
+          codeError.purchases = purchases;
+          throw codeError;
+        }
+
         console.log(`\n--- Processing Card ${i}/${quantity} ---`);
+        console.log(`   Using backup code ${backupCodeIndex + 1}/${backupCodes.length}`);
 
         try {
           const result = await this.completePurchase({
@@ -1190,11 +1201,20 @@ class PurchaseService {
             page,
             gameUrl,
             cardIndex,
-            backupCode,
+            backupCode: backupCodes[backupCodeIndex], // Use current backup code from array
             checkCancellation,
             orderId,
             cardNumber: i  // Pass card number (1, 2, 3...)
           });
+
+          // Increment backup code index after successful use
+          backupCodeIndex++;
+          console.log(`   Backup code used successfully (${backupCodeIndex}/${backupCodes.length} used)`);
+
+
+          // Increment backup code index after successful use
+          backupCodeIndex++;
+          console.log(`   Backup code used successfully (${backupCodeIndex}/${backupCodes.length} used)`);
 
           purchases.push(result);
 
@@ -1233,6 +1253,10 @@ class PurchaseService {
           failedCount++;
           console.error(`❌ Card ${i}/${quantity} failed at stage: ${err.stage || 'unknown'}`);
           console.error(`   Error: ${err.message}`);
+
+          // Increment backup code index even if purchase failed (code was likely consumed)
+          backupCodeIndex++;
+          console.log(`   Backup code consumed (${backupCodeIndex}/${backupCodes.length} used)`);
 
           // CRITICAL: Reduce attempts after FIRST purchase attempt (even if failed)
           if (!firstPurchaseCompleted && onFirstPurchaseComplete) {
@@ -1296,6 +1320,7 @@ class PurchaseService {
 
       console.log(`\n${'='.repeat(60)}`);
       console.log(`✅ All cards processed! Success: ${successCount}, Failed: ${failedCount}, Total: ${quantity}`);
+      console.log(`   Backup codes used: ${backupCodeIndex}/${backupCodes.length}`);
       console.log(`${'='.repeat(60)}\n`);
 
       return purchases;
