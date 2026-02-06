@@ -1,5 +1,5 @@
 /**
- * Main Entry Point
+ * Main Entry Pointt
  * 
  * This file serves as the application entry point.
  * It initializes configuration, services, and starts the bot.
