@@ -143,15 +143,24 @@ class TransactionVerificationService {
    * @param {Array<Object>} purchases - Array of purchase objects with transactionId
    * @param {Object} page - Puppeteer page object (already logged in)
    * @param {Function} onProgress - Optional progress callback (current, total)
+   * @param {Function} checkCancellation - Optional cancellation check callback
    * @returns {Promise<Array<Object>>} Array of verification results with purchaseId
    */
-  async verifyMultipleTransactions(purchases, page, onProgress = null) {
+  async verifyMultipleTransactions(purchases, page, onProgress = null, checkCancellation = null) {
     const results = [];
     const total = purchases.length;
 
     for (let i = 0; i < purchases.length; i++) {
       const purchase = purchases[i];
       const current = i + 1;
+
+      // Check if verification was cancelled
+      if (checkCancellation && checkCancellation()) {
+        console.log('🛑 Verification cancelled by user');
+        const error = new Error('Verification cancelled by user');
+        error.partialResults = results;
+        throw error;
+      }
 
       // Call progress callback if provided
       if (onProgress) {

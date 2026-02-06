@@ -29,6 +29,10 @@ class TelegramBotController {
     this.RATE_LIMIT_MS = 1500; // 1.5 seconds between requests
     // State locking to prevent race conditions
     this.processingCallbacks = new Set();
+    // Track verification cancellation requests
+    this.verificationCancellationRequests = new Set();
+    // Track cancelling verification message IDs for deletion
+    this.cancellingVerificationMessages = new Map();
   }
 
   /**
@@ -423,6 +427,11 @@ class TelegramBotController {
           await this.handleShowAttempts(chatId, user);
           break;
 
+        case 'user_cancel_verification':
+          console.log(`📞 Cancel verification callback received`);
+          await this.handleCancelVerification(chatId);
+          break;
+
         default:
           // Handle order flow callbacks
           if (callbackData.startsWith('order_game_')) {
@@ -550,6 +559,30 @@ class TelegramBotController {
   }
 
   /**
+   * Handle verification cancellation
+   */
+  async handleCancelVerification(chatId) {
+    // Mark as cancelled
+    this.verificationCancellationRequests.add(chatId);
+
+    try {
+      const cancelMsg = await this.safeSendMessage(chatId,
+        `🛑 *CANCELLING VERIFICATION*  \n` +
+        `⏳ Stopping immediately...\n\n` +
+        `_Cards verified so far will be sent_`,
+        { parse_mode: 'Markdown' }
+      );
+
+      // Store message ID for later deletion
+      if (cancelMsg) {
+        this.cancellingVerificationMessages.set(chatId, cancelMsg.message_id);
+      }
+    } catch (err) {
+      console.error('Error sending cancelling message:', err);
+    }
+  }
+
+  /**
    * Gets and verifies user's last order with transaction details
    */
   async handleGetLastOrder(chatId, user) {
@@ -558,15 +591,19 @@ class TelegramBotController {
     const transactionVerifier = require('../services/TransactionVerificationService');
     const orderService = require('../services/OrderService');
 
+    let statusMsg = null;
+    let lastOrder = null;
+    let purchases = null;
+
     try {
       // Send initial status message
-      const statusMsg = await this.safeSendMessage(
+      statusMsg = await this.safeSendMessage(
         chatId,
         '🔍 Fetching your last order...'
       );
 
       // Get last order for user
-      const lastOrder = await databaseService.getLastUserOrder(user.id);
+      lastOrder = await databaseService.getLastUserOrder(user.id);
 
       if (!lastOrder) {
         await this.bot.editMessageText(
@@ -580,7 +617,7 @@ class TelegramBotController {
       }
 
       // Get purchases for this order
-      const purchases = await databaseService.getOrderPurchases(lastOrder.id);
+      purchases = await databaseService.getOrderPurchases(lastOrder.id);
 
       if (!purchases || purchases.length === 0) {
         await this.bot.editMessageText(
@@ -593,14 +630,22 @@ class TelegramBotController {
         return;
       }
 
-      // Update status to show verification in progress
+      // Update status to show verification in progress with cancel button
       await this.bot.editMessageText(
         `🔍 Verifying ${purchases.length} transaction(s)...\n\n⏳ Progress: 0/${purchases.length}`,
         {
           chat_id: chatId,
-          message_id: statusMsg.message_id
+          message_id: statusMsg.message_id,
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '🛑 Cancel Verification', callback_data: 'user_cancel_verification' }
+            ]]
+          }
         }
       );
+
+      // Clear any previous cancellation flag
+      this.verificationCancellationRequests.delete(chatId);
 
       // Get browser page (already validated by ensureBrowserSession)
       const page = browserManager.getPage(user.id);
@@ -620,7 +665,12 @@ class TelegramBotController {
               `🔍 Verifying ${total} transaction(s)...\n\n⏳ Progress: ${current}/${total}`,
               {
                 chat_id: chatId,
-                message_id: statusMsg.message_id
+                message_id: statusMsg.message_id,
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: '🛑 Cancel Verification', callback_data: 'user_cancel_verification' }
+                  ]]
+                }
               }
             );
           } catch (err) {
@@ -629,8 +679,13 @@ class TelegramBotController {
         }
       };
 
-      // Verify all transactions with progress updates (Sequential - reliable)
-      const verificationResults = await transactionVerifier.verifyMultipleTransactions(purchases, page, onProgress);
+      // Verify all transactions with progress updates and cancellation check (Sequential - reliable)
+      const verificationResults = await transactionVerifier.verifyMultipleTransactions(
+        purchases,
+        page,
+        onProgress,
+        () => this.verificationCancellationRequests.has(chatId) // Cancellation check
+      );
 
       // OPTIMIZATION 1: Create Map for O(1) purchase lookup (faster than .find())
       const purchaseMap = new Map(purchases.map(p => [p.id, p]));
@@ -765,10 +820,125 @@ class TelegramBotController {
 
     } catch (err) {
       console.error('Error in handleGetLastOrder:', err);
+
+      // Check if it was a user cancellation
+      if (err.message && err.message.includes('cancelled by user')) {
+        try {
+          // Delete the status message
+          try {
+            await this.bot.deleteMessage(chatId, statusMsg.message_id);
+          } catch (delErr) {
+            console.log('⚠️ Could not delete status message');
+          }
+
+          // Delete the "CANCELLING VERIFICATION" message
+          const cancellingMsgId = this.cancellingVerificationMessages.get(chatId);
+          if (cancellingMsgId) {
+            try {
+              await this.bot.deleteMessage(chatId, cancellingMsgId);
+              this.cancellingVerificationMessages.delete(chatId);
+            } catch (delErr) {
+              console.log('⚠️ Could not delete cancelling message');
+            }
+          }
+
+          // Check if there were any completed verifications
+          if (err.partialResults && err.partialResults.length > 0) {
+            const successfulPurchases = err.partialResults.filter(r => r.success);
+            const failedPurchases = err.partialResults.filter(r => !r.success);
+
+            // Send cancellation message with partial results
+            await this.safeSendMessage(chatId,
+              `🛑 *VERIFICATION CANCELLED*   \n\n` +
+              `✅ *Verified:* ${err.partialResults.length} / ${purchases.length} cards\n` +
+              `📨 *Sending verified cards...*`,
+              { parse_mode: 'Markdown' }
+            );
+
+            // Send order info
+            const successCount = successfulPurchases.length;
+            const failedCount = failedPurchases.length;
+
+            const summaryMessage =
+              `📦 **Order Details:**\n` +
+              `Game: ${lastOrder.game_name}\n` +
+              `Card: ${lastOrder.card_value}\n` +
+              `Total: ${purchases.length}\n\n` +
+              `✅ Successful: ${successCount}\n` +
+              `❌ Failed: ${failedCount}\n` +
+              `⏭️ Not Verified: ${purchases.length - err.partialResults.length}\n`;
+
+            await this.safeSendMessage(chatId, summaryMessage, { parse_mode: 'Markdown' });
+
+            // Send successful cards if any
+            if (successfulPurchases.length > 0) {
+              const pinObjects = successfulPurchases.map(result => ({
+                pinCode: result.pin,
+                serial: result.serial
+              }));
+
+              const plainMessages = orderService.formatPinsPlain(pinObjects);
+              for (const message of plainMessages) {
+                await this.safeSendMessage(chatId, message, { parse_mode: 'Markdown' });
+              }
+
+              const detailedMessages = orderService.formatPinsDetailed(pinObjects);
+              for (const message of detailedMessages) {
+                await this.safeSendMessage(chatId, message, { parse_mode: 'Markdown' });
+              }
+            }
+
+            // Send failed cards if any
+            if (failedPurchases.length > 0) {
+              let failedMessage = `⚠️ **Failed:**\n\n`;
+              for (const result of failedPurchases) {
+                failedMessage += `**Card ${result.cardNumber}:**\n`;
+                if (result.transactionId && result.transactionId !== 'N/A') {
+                  failedMessage += `🆔 Transaction: \`${result.transactionId}\`\n` +
+                    `❌ Error: ${result.error}\n\n`;
+                } else {
+                  failedMessage += `❌ Failed\n\n`;
+                }
+              }
+              await this.safeSendMessage(chatId, failedMessage, { parse_mode: 'Markdown' });
+            }
+
+            // Final message
+            const remaining = purchases.length - err.partialResults.length;
+            if (remaining > 0) {
+              await this.safeSendMessage(chatId,
+                `ℹ️ ${remaining} card(s) were not verified.\n\n` +
+                `Use /start to return to menu.`,
+                { parse_mode: 'Markdown' }
+              );
+            }
+          } else {
+            // No verifications completed
+            await this.safeSendMessage(chatId,
+              `🛑 *VERIFICATION CANCELLED*   \n` +
+              `No cards were verified.\n\n` +
+              `Use /start to return to menu.`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+        } catch (sendErr) {
+          console.error('Error sending cancellation message:', sendErr);
+        }
+
+        // Clear cancellation flag
+        this.verificationCancellationRequests.delete(chatId);
+        return;
+      }
+
+      // For other errors, show error message
       await this.safeSendMessage(
         chatId,
         '❌ Error retrieving last order. Please try again later.'
       );
+    } finally {
+      // Always clear cancellation flag and message tracking
+      this.verificationCancellationRequests.delete(chatId);
+      this.cancellingVerificationMessages.delete(chatId);
     }
   }
 
