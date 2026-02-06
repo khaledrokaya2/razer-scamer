@@ -12,47 +12,62 @@
 const { getAllGames, getGameById } = require('../config/games-catalog');
 const purchaseService = require('../services/PurchaseService');
 const orderService = require('../services/OrderService');
-const { parse } = require('dotenv');
 
 class OrderFlowHandler {
   constructor() {
     // Session data for order creation flow
-    this.orderSessions = new Map(); // chatId -> {step, gameId, cardIndex, cardName, quantity, lastActivity}
+    this.orderSessions = new Map(); // chatId -> {step, gameId, cardIndex, cardName, quantity}
     // Track cancellation requests
     this.cancellationRequests = new Set();
     // Track progress message IDs for editing
     this.progressMessages = new Map(); // chatId -> messageId
     // Track cancelling message IDs for deletion
     this.cancellingMessages = new Map(); // chatId -> messageId
+    // Track order summary message IDs for deletion
+    this.orderSummaryMessages = new Map(); // chatId -> messageId
 
-    // Session timeout configuration
+    // Session timeout and cleanup for memory optimization
     this.SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
-
-    // Start cleanup interval for expired sessions
-    this.startCleanupInterval();
+    this.startSessionCleanup();
   }
 
   /**
-   * Start cleanup interval to remove expired sessions
+   * Start automatic cleanup of old sessions
+   * Prevents memory leaks from abandoned order flows
+   * OPTIMIZATION: Active processing orders can take hours - never cleanup
    */
-  startCleanupInterval() {
+  startSessionCleanup() {
     setInterval(() => {
       const now = Date.now();
-      console.log('🧹 Running order session cleanup...');
+      let cleaned = 0;
 
       for (const [chatId, session] of this.orderSessions.entries()) {
-        if (session.lastActivity) {
-          const inactiveTime = now - session.lastActivity;
-          if (inactiveTime > this.SESSION_TIMEOUT) {
-            console.log(`⏰ Order session for chat ${chatId} expired - cleaning up...`);
-            this.orderSessions.delete(chatId);
-            this.cancellationRequests.delete(chatId);
-            this.progressMessages.delete(chatId);
-            this.cancellingMessages.delete(chatId);
-          }
+        // CRITICAL: Skip processing orders (can take 1+ hours for large quantities or stock waiting)
+        if (session.step === 'processing' || session.step === 'checking_balance') {
+          continue;
+        }
+
+        // Check if session has timestamp, add if missing
+        if (!session.timestamp) {
+          session.timestamp = now;
+          continue;
+        }
+
+        // Remove if older than timeout (only for non-processing sessions)
+        if (now - session.timestamp > this.SESSION_TIMEOUT) {
+          this.orderSessions.delete(chatId);
+          this.progressMessages.delete(chatId);
+          this.cancellingMessages.delete(chatId);
+          this.orderSummaryMessages.delete(chatId);
+          this.cancellationRequests.delete(chatId);
+          cleaned++;
         }
       }
-    }, 5 * 60 * 1000); // Check every 5 minutes
+
+      if (cleaned > 0) {
+        console.log(`🧹 OrderFlow cleanup: ${cleaned} old sessions removed`);
+      }
+    }, 10 * 60 * 1000); // Check every 10 minutes
   }
 
   /**
@@ -318,6 +333,8 @@ class OrderFlowHandler {
   async handleCancel(bot, chatId) {
     this.clearSession(chatId);
     this.clearCancellation(chatId);
+    this.progressMessages.delete(chatId);
+    this.orderSummaryMessages.delete(chatId);
     try {
       await bot.sendMessage(chatId,
         `❌ *ORDER CANCELLED*   \n` +
@@ -379,8 +396,9 @@ class OrderFlowHandler {
    * @param {Object} bot - Telegram bot instance
    * @param {number} chatId - Chat ID
    * @param {string} gameId - Game ID
+   * @param {string} telegramUserId - Telegram user ID
    */
-  async handleGameSelection(bot, chatId, gameId, user) {
+  async handleGameSelection(bot, chatId, gameId, telegramUserId) {
     console.log(`🎮 Game selected: ${gameId} for chat ${chatId}`);
 
     const game = getGameById(gameId);
@@ -415,8 +433,8 @@ class OrderFlowHandler {
     try {
       console.log(`🔍 Scraping cards from: ${game.link}`);
 
-      // Get available cards from Razer
-      const cards = await purchaseService.getAvailableCards(user.id, game.link);
+      // Get available cards from Razer (use telegramUserId)
+      const cards = await purchaseService.getAvailableCards(telegramUserId, game.link);
 
       console.log(`✅ Found ${cards.length} cards`);
 
@@ -590,34 +608,11 @@ class OrderFlowHandler {
    * @param {user} user - User Object
    * @param {string} text - User input
    */
-  async handleBackupCodeInput(bot, chatId, user, text) {
+  async handleBackupCodeInput(bot, chatId, telegramUserId, text) {
     const session = this.getSession(chatId);
 
     if (!session || session.step !== 'enter_backup_code') {
       return; // Not in backup code input step
-    }
-
-    // CRITICAL: Check if user has attempts remaining
-    if (!user.hasAttemptsRemaining()) {
-      try {
-        await bot.sendMessage(chatId,
-          `⚠️ *NO ATTEMPTS REMAINING* \n\n` +
-          `You have used all your attempts\n` +
-          `for today.\n\n` +
-          `💡 Your attempts will renew at\n` +
-          `    12:00 AM (midnight).\n\n` +
-          `📊 Current Plan: ${user.getSubscriptionDisplay()}\n` +
-          `🔄 Remaining: ${user.AllowedAttempts} attempts\n\n` +
-          `_Use /start to return to menu_`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (err) {
-        console.error('Error sending no attempts message:', err);
-      }
-
-      // Clear session
-      this.clearSession(chatId);
-      return;
     }
 
     // Parse backup codes (one per line)
@@ -717,14 +712,36 @@ class OrderFlowHandler {
 
     // Update session with array of backup codes
     this.updateSession(chatId, {
-      step: 'processing',
+      step: 'checking_balance',
       backupCodes: backupCodes, // Changed from backupCode to backupCodes (array)
       backupCodeIndex: 0 // Track which code to use next
     });
 
-    // LOGIC BUG FIX #11: Warn user that backup codes are single-use
+    // Check balance before processing (silently)
     try {
+      const scraperService = require('../services/RazerScraperService');
+      const browserManager = require('../services/BrowserManager');
+      const page = browserManager.getPage(telegramUserId);
+
+      const balance = await scraperService.getBalance(telegramUserId, page);
+
+      // Update to processing step
+      this.updateSession(chatId, {
+        step: 'processing'
+      });
+
+    } catch (err) {
+      console.error('Balance check error:', err);
       await bot.sendMessage(chatId,
+        `❌ Failed to check balance. Please try again later.`
+      );
+      this.clearSession(chatId);
+      return;
+    }
+
+    // Send ORDER SUMMARY and store message ID for later deletion
+    try {
+      const summaryMsg = await bot.sendMessage(chatId,
         `📋 *ORDER SUMMARY*    \n` +
         `🎮 *Game*\n` +
         `     ${session.gameName}\n\n` +
@@ -744,6 +761,8 @@ class OrderFlowHandler {
           }
         }
       );
+      // Store message ID for deletion later
+      this.orderSummaryMessages.set(chatId, summaryMsg.message_id);
     } catch (err) {
       console.error('Error sending order summary:', err);
     }
@@ -810,7 +829,7 @@ class OrderFlowHandler {
 
       // Process the order with progress updates and cancellation check
       const result = await orderService.processOrder({
-        userId: user.id,
+        telegramUserId: telegramUserId,  // Changed from userId to telegramUserId
         gameName: session.gameName,
         gameUrl: session.gameUrl,
         cardName: session.cardName,
@@ -825,7 +844,7 @@ class OrderFlowHandler {
       const successfulCards = result.order.completed_purchases;
       const failedCards = result.pins.filter(p => p.pinCode === 'FAILED').length;
 
-      // Delete the progress message before sending results
+      // Delete the progress message and order summary before sending results
       const progressMsgId = this.progressMessages.get(chatId);
       if (progressMsgId) {
         try {
@@ -833,6 +852,16 @@ class OrderFlowHandler {
           this.progressMessages.delete(chatId);
         } catch (delErr) {
           console.log('⚠️ Could not delete progress message');
+        }
+      }
+
+      const summaryMsgId = this.orderSummaryMessages.get(chatId);
+      if (summaryMsgId) {
+        try {
+          await bot.deleteMessage(chatId, summaryMsgId);
+          this.orderSummaryMessages.delete(chatId);
+        } catch (delErr) {
+          console.log('⚠️ Could not delete order summary message');
         }
       }
 
@@ -850,40 +879,69 @@ class OrderFlowHandler {
 
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 
-        // Send pins in two formats
-        // Format 1: Plain (all pin codes) - may be split into multiple messages
-        const plainMessages = orderService.formatPinsPlain(
-          result.pins
-        );
-        for (const message of plainMessages) {
-          await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-        }
+        // Always send PINs as TXT file (for all orders)
+        try {
+          const fs = require('fs');
+          const path = require('path');
 
-        // Format 2: Detailed (with serials and transaction IDs) - may be split into multiple messages
-        const detailedMessages = orderService.formatPinsDetailed(
-          result.pins
-        );
-        for (const message of detailedMessages) {
-          await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+          // Create pins directory if it doesn't exist
+          const pinsDir = path.join(process.cwd(), 'temp_pins');
+          if (!fs.existsSync(pinsDir)) {
+            fs.mkdirSync(pinsDir, { recursive: true });
+          }
+
+          // Generate file name
+          const fileName = `Order_${result.order.id}_Pins.txt`;
+          const filePath = path.join(pinsDir, fileName);
+
+          // Generate file content - PINs only, one per line
+          let fileContent = '';
+          result.pins.forEach((pin) => {
+            fileContent += `${pin.pinCode}\n`;
+          });
+
+          // Write file
+          fs.writeFileSync(filePath, fileContent, 'utf8');
+
+          // Send file
+          await bot.sendDocument(chatId, filePath, {
+            caption: `📄 *PIN Codes for Order #${result.order.id}*\n\n` +
+              `All ${result.pins.length} PIN codes are in the attached file.`,
+            parse_mode: 'Markdown'
+          });
+
+          // Delete file after sending
+          fs.unlinkSync(filePath);
+
+        } catch (err) {
+          console.error('Error sending TXT file:', err);
+          // Fallback to message format
+          const plainMessages = orderService.formatPinsPlain(result.pins);
+          for (const message of plainMessages) {
+            await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+          }
         }
 
         // Clear pins from memory after sending
         orderService.clearOrderPins(result.order.id);
+
       } catch (err) {
         console.error('Error sending order results:', err);
       }
 
-      // Clear session, cancellation flag, and progress message
+      // Clear session, cancellation flag, progress message, and order summary
       this.clearSession(chatId);
       this.clearCancellation(chatId);
       this.progressMessages.delete(chatId);
+      this.orderSummaryMessages.delete(chatId);
 
     } catch (err) {
       console.error('Order processing error:', err);
 
-      // Always clear progress message and cancelling message on error
+      // Always clear progress message, cancelling message, and order summary on error
       this.progressMessages.delete(chatId);
       this.cancellingMessages.delete(chatId);
+      this.orderSummaryMessages.delete(chatId);
 
       // Check if it was a user cancellation
       if (err.message && err.message.includes('cancelled by user')) {
@@ -914,6 +972,17 @@ class OrderFlowHandler {
               }
             }
 
+            // Delete the order summary message before sending results
+            const summaryMsgId = this.orderSummaryMessages.get(chatId);
+            if (summaryMsgId) {
+              try {
+                await bot.deleteMessage(chatId, summaryMsgId);
+                this.orderSummaryMessages.delete(chatId);
+              } catch (delErr) {
+                console.log('⚠️ Could not delete order summary message');
+              }
+            }
+
             // Send cancellation message with partial results
             await bot.sendMessage(chatId,
               `🛑 *ORDER CANCELLED*   \n` +
@@ -924,21 +993,47 @@ class OrderFlowHandler {
               { parse_mode: 'Markdown' }
             );
 
-            // Send the pins that were successfully purchased
-            // Format 1: Plain (all pin codes) - may be split into multiple messages
-            const plainMessages = orderService.formatPinsPlain(
-              err.partialOrder.pins
-            );
-            for (const message of plainMessages) {
-              await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-            }
+            // Send the pins as TXT file
+            try {
+              const fs = require('fs');
+              const path = require('path');
 
-            // Format 2: Detailed (with serials and transaction IDs) - may be split into multiple messages
-            const detailedMessages = orderService.formatPinsDetailed(
-              err.partialOrder.pins
-            );
-            for (const message of detailedMessages) {
-              await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+              // Create pins directory if it doesn't exist
+              const pinsDir = path.join(process.cwd(), 'temp_pins');
+              if (!fs.existsSync(pinsDir)) {
+                fs.mkdirSync(pinsDir, { recursive: true });
+              }
+
+              // Generate file name
+              const fileName = `Order_${err.partialOrder.order.id}_Pins.txt`;
+              const filePath = path.join(pinsDir, fileName);
+
+              // Generate file content - PINs only, one per line
+              let fileContent = '';
+              err.partialOrder.pins.forEach((pin) => {
+                fileContent += `${pin.pinCode}\n`;
+              });
+
+              // Write file
+              fs.writeFileSync(filePath, fileContent, 'utf8');
+
+              // Send file
+              await bot.sendDocument(chatId, filePath, {
+                caption: `📄 *PIN Codes for Order #${err.partialOrder.order.id}*\n\n` +
+                  `${err.partialOrder.pins.length} completed PIN codes are in the attached file.`,
+                parse_mode: 'Markdown'
+              });
+
+              // Delete file after sending
+              fs.unlinkSync(filePath);
+
+            } catch (fileErr) {
+              console.error('Error sending TXT file:', fileErr);
+              // Fallback to message format
+              const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
+              for (const message of plainMessages) {
+                await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+              }
             }
 
             // Clear pins from memory after sending
@@ -989,11 +1084,12 @@ class OrderFlowHandler {
           console.error('Error sending cancellation message:', sendErr);
         }
 
-        // Clear session, cancellation flag, progress message, and cancelling message
+        // Clear session, cancellation flag, progress message, cancelling message, and order summary
         this.clearSession(chatId);
         this.clearCancellation(chatId);
         this.progressMessages.delete(chatId);
         this.cancellingMessages.delete(chatId);
+        this.orderSummaryMessages.delete(chatId);
         return;
       }
 
@@ -1028,16 +1124,18 @@ class OrderFlowHandler {
           console.error('Error sending retry prompt:', sendErr);
         }
 
-        // Clear cancellation flag and progress message but keep session
+        // Clear cancellation flag, progress message, and order summary but keep session
         this.clearCancellation(chatId);
         this.progressMessages.delete(chatId);
+        this.orderSummaryMessages.delete(chatId);
         return;
       }
 
-      // For other errors, clear session, cancellation, and progress message
+      // For other errors, clear session, cancellation, progress message, and order summary
       this.clearSession(chatId);
       this.clearCancellation(chatId);
       this.progressMessages.delete(chatId);
+      this.orderSummaryMessages.delete(chatId);
     }
   }
 

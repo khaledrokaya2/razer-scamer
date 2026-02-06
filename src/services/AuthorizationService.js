@@ -1,164 +1,102 @@
 /**
  * AuthorizationService
  * 
- * Handles user authorization for the Telegram bot using database.
- * Checks if users exist in the database and their roles.
+ * Handles user authorization using .env whitelist
+ * Simple check against AUTHORIZED_USER_IDS environment variable
  * 
- * Following Single Responsibility Principle (SRP):
- * - Only handles authorization logic
- * - Delegates database operations to DatabaseService
+ * No database, no caching - just whitelist validation
  */
-
-const databaseService = require('./DatabaseService');
 
 class AuthorizationService {
   constructor() {
-    this.initialized = false;
-    // In-memory cache for user authorization (reduces DB load)
-    this.userCache = new Map(); // telegramUserId -> {user, timestamp}
-    // OPTIMIZATION: Extended from 30s to 5 minutes for better cache hit rate
-    this.CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache (reduces DB queries by 50%)
-
-    // Start cache cleanup interval
-    this.startCacheCleanup();
+    this.authorizedUserIds = new Set();
+    // OPTIMIZATION: Cache authorization checks (small Set, fast lookup)
+    this.authCache = new Map(); // userId -> boolean
+    this.loadAuthorizedUsers();
   }
 
   /**
-   * Start cleanup interval for expired cache entries
+   * Load authorized user IDs from environment
    */
-  startCacheCleanup() {
-    setInterval(() => {
-      const now = Date.now();
-      let cleanedCount = 0;
+  loadAuthorizedUsers() {
+    const userIdsString = process.env.AUTHORIZED_USER_IDS || '';
 
-      for (const [userId, cached] of this.userCache.entries()) {
-        if (now - cached.timestamp > this.CACHE_TTL) {
-          this.userCache.delete(userId);
-          cleanedCount++;
-        }
-      }
+    if (!userIdsString) {
+      console.warn('⚠️ WARNING: No AUTHORIZED_USER_IDS set in .env file!');
+      console.warn('⚠️ No users will be able to access the bot.');
+      return;
+    }
 
-      if (cleanedCount > 0) {
-        console.log(`🧹 Cleaned ${cleanedCount} expired auth cache entries`);
-      }
-    }, 2 * 60 * 1000); // Check every 2 minutes
+    // Parse comma-separated list of Telegram IDs
+    const userIds = userIdsString.split(',').map(id => id.trim()).filter(id => id.length > 0);
+
+    this.authorizedUserIds = new Set(userIds);
+    console.log(`✅ Loaded ${this.authorizedUserIds.size} authorized user(s) from .env`);
   }
 
   /**
-   * Initialize the authorization service
+   * Initialize the authorization service (no-op for compatibility)
    */
   async initialize() {
-    try {
-      await databaseService.connect();
-      this.initialized = true;
-      console.log('🔐 Authorization service initialized with database');
-    } catch (err) {
-      console.error('❌ Failed to initialize authorization service:', err);
-      throw err;
-    }
+    console.log('🔐 Authorization service initialized with whitelist');
   }
 
   /**
-   * Checks if a user is authorized to use the bot (exists in database)
-   * Uses in-memory cache to reduce database load
+   * Checks if a user is authorized to use the bot
    * 
    * @param {string} telegramUserId - Telegram user ID to check
-   * @returns {Promise<{authorized: boolean, user: UserAccount|null, reason: string}>}
+   * @returns {Promise<{authorized: boolean, reason: string}>}
    */
   async checkAuthorization(telegramUserId) {
-    try {
-      // Check cache first
-      const cached = this.userCache.get(telegramUserId);
-      if (cached && (Date.now() - cached.timestamp) < this.CACHE_TTL) {
-        console.log(`🔍 Authorization check for ${telegramUserId}: ALLOWED (from cache)`);
-        return {
-          authorized: true,
-          user: cached.user,
-          reason: 'Authorized'
-        };
-      }
+    const userIdStr = telegramUserId.toString();
 
-      // Cache miss or expired - query database
-      const user = await databaseService.getUserByTelegramId(telegramUserId);
+    // OPTIMIZATION: Check cache first (avoid repeated Set lookups)
+    if (this.authCache.has(userIdStr)) {
+      const isAuthorized = this.authCache.get(userIdStr);
+      return {
+        authorized: isAuthorized,
+        reason: isAuthorized ? 'Authorized' : 'User not in authorized list'
+      };
+    }
 
-      if (!user) {
-        console.log(`🔍 Authorization check for ${telegramUserId}: DENIED (not in database)`);
-        return {
-          authorized: false,
-          user: null,
-          reason: 'User not found in database'
-        };
-      }
+    // First-time check
+    const isAuthorized = this.authorizedUserIds.has(userIdStr);
 
-      // Cache the result
-      this.userCache.set(telegramUserId, {
-        user: user,
-        timestamp: Date.now()
-      });
+    // Cache result
+    this.authCache.set(userIdStr, isAuthorized);
 
-      console.log(`🔍 Authorization check for ${telegramUserId}: ALLOWED (${user.role}, cached)`);
+    if (isAuthorized) {
+      console.log(`🔍 Authorization check for ${telegramUserId}: ALLOWED`);
       return {
         authorized: true,
-        user: user,
         reason: 'Authorized'
       };
-    } catch (err) {
-      console.error('Error checking authorization:', err);
+    } else {
+      console.log(`🔍 Authorization check for ${telegramUserId}: DENIED (not in whitelist)`);
       return {
         authorized: false,
-        user: null,
-        reason: 'Database error'
+        reason: 'User not in authorized list'
       };
     }
   }
 
   /**
-   * Invalidate cache for a user (call when user data changes)
-   * @param {string} telegramUserId - Telegram user ID
-   */
-  invalidateCache(telegramUserId) {
-    this.userCache.delete(telegramUserId);
-    console.log(`🗑️ Cache invalidated for user ${telegramUserId}`);
-  }
-
-  /**
-   * Invalidate all cache (call after bulk operations like daily renewal)
-   */
-  invalidateAllCache() {
-    const count = this.userCache.size;
-    this.userCache.clear();
-    console.log(`🗑️ All cache cleared (${count} entries)`);
-  }
-
-  /**
-   * Check if user is admin
+   * Check if user is authorized (simple boolean check)
    * 
    * @param {string} telegramUserId - Telegram user ID
-   * @returns {Promise<boolean>} True if user is admin
+   * @returns {boolean} True if authorized
    */
-  async isAdmin(telegramUserId) {
-    try {
-      const user = await databaseService.getUserByTelegramId(telegramUserId);
-      return user && user.isAdmin();
-    } catch (err) {
-      console.error('Error checking admin status:', err);
-      return false;
-    }
-  }
+  isAuthorized(telegramUserId) {
+    const userIdStr = telegramUserId.toString();
 
-  /**
-   * Get user from database
-   * 
-   * @param {string} telegramUserId - Telegram user ID
-   * @returns {Promise<UserAccount|null>} User account or null
-   */
-  async getUser(telegramUserId) {
-    try {
-      return await databaseService.getUserByTelegramId(telegramUserId);
-    } catch (err) {
-      console.error('Error getting user:', err);
-      return null;
+    // OPTIMIZATION: Use cache if available
+    if (this.authCache.has(userIdStr)) {
+      return this.authCache.get(userIdStr);
     }
+
+    const isAuthorized = this.authorizedUserIds.has(userIdStr);
+    this.authCache.set(userIdStr, isAuthorized);
+    return isAuthorized;
   }
 }
 

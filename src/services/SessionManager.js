@@ -13,32 +13,41 @@ class SessionManager {
   constructor() {
     // In-memory storage for user sessions
     // Key: Telegram chat ID (string)
-    // Value: Session object containing state, credentials, browser, and page
+    // Value: Session object containing state and credentials
     this.sessions = {};
 
-    // Auto-cleanup inactive sessions after 30 minutes
-    this.SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
-    this.startCleanupInterval();
+    // Session timeout for memory optimization
+    this.SESSION_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours
+    this.startSessionCleanup();
   }
 
   /**
-   * Start cleanup interval to remove expired sessions
+   * Start automatic cleanup of old sessions
+   * Prevents memory leaks from inactive users
    */
-  startCleanupInterval() {
+  startSessionCleanup() {
     setInterval(() => {
       const now = Date.now();
-      console.log('🧹 Running session cleanup...');
+      let cleaned = 0;
 
       for (const [chatId, session] of Object.entries(this.sessions)) {
-        if (session.lastActivity) {
-          const inactiveTime = now - session.lastActivity;
-          if (inactiveTime > this.SESSION_TIMEOUT) {
-            console.log(`⏰ Session for chat ${chatId} expired - cleaning up...`);
-            delete this.sessions[chatId];
-          }
+        // Add timestamp if missing
+        if (!session.timestamp) {
+          session.timestamp = now;
+          continue;
+        }
+
+        // Remove if older than timeout and not logged in
+        if (session.state !== 'logged_in' && now - session.timestamp > this.SESSION_TIMEOUT) {
+          delete this.sessions[chatId];
+          cleaned++;
         }
       }
-    }, 5 * 60 * 1000); // Check every 5 minutes
+
+      if (cleaned > 0) {
+        console.log(`🧹 Session cleanup: ${cleaned} old sessions removed`);
+      }
+    }, 30 * 60 * 1000); // Check every 30 minutes
   }
 
   /**
@@ -48,8 +57,8 @@ class SessionManager {
    */
   createSession(chatId) {
     this.sessions[chatId] = {
-      state: 'idle',           // Current state: idle, awaiting_email, awaiting_password, logged_in
-      lastActivity: Date.now() // Track last activity for cleanup
+      state: 'idle',  // Current state: idle, awaiting_email, awaiting_password, logged_in
+      timestamp: Date.now()
     };
     console.log(`📝 Session created for user ${chatId}`);
   }
@@ -73,7 +82,7 @@ class SessionManager {
   updateState(chatId, state) {
     if (this.sessions[chatId]) {
       this.sessions[chatId].state = state;
-      this.sessions[chatId].lastActivity = Date.now();
+      this.sessions[chatId].timestamp = Date.now();
       console.log(`🔄 Session state updated for ${chatId}: ${state}`);
     }
   }
@@ -100,7 +109,6 @@ class SessionManager {
   setPassword(chatId, password) {
     if (this.sessions[chatId]) {
       this.sessions[chatId].password = password;
-      this.sessions[chatId].lastActivity = Date.now();
       console.log(`🔑 Password stored for ${chatId}`);
     }
   }

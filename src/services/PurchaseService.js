@@ -56,12 +56,12 @@ class PurchaseService {
 
   /**
    * Get available cards from game page
-   * @param {number} userId - User ID (for browser management)
+   * @param {number} telegramUserId - Telegram User ID (for browser management)
    * @param {string} gameUrl - Game catalog URL
    * @returns {Promise<Array>} Array of card options {name, index, disabled}
    */
-  async getAvailableCards(userId, gameUrl) {
-    const page = await browserManager.navigateToUrl(userId, gameUrl);
+  async getAvailableCards(telegramUserId, gameUrl) {
+    const page = await browserManager.navigateToUrl(telegramUserId, gameUrl);
 
     try {
       // Quick page load check - don't wait too long
@@ -304,7 +304,7 @@ class PurchaseService {
         throw new Error('No cards found. The page might not have loaded properly or the game might not be available.');
       }
 
-      browserManager.updateActivity(userId);
+      browserManager.updateActivity(telegramUserId);
       return cardsData.cards;
 
     } catch (err) {
@@ -383,10 +383,9 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters {userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber}
    * @returns {Promise<Object>} Purchase data
    */
-  async completePurchase({ userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber = 1 }) {
+  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, checkCancellation, cardNumber = 1, gameName, cardName }) {
     let currentStage = this.STAGES.IDLE;
     let transactionId = null;
-    const databaseService = require('./DatabaseService');
 
     try {
       console.log('🛒 Starting purchase process...');
@@ -1058,27 +1057,17 @@ class PurchaseService {
           console.error('⚠️ Could not extract PIN or Serial - marking as FAILED');
           console.log(`📍 Stage: ${currentStage}`);
 
-          // Save to database with final status
-          try {
-            await databaseService.createPurchaseTransaction({
-              orderId: orderId,
-              transactionId: finalTransactionId,
-              cardNumber: cardNumber,
-              status: finalStatus
-            });
-            console.log(`📝 Purchase saved to database (card #${cardNumber}, status: ${finalStatus})`);
-          } catch (dbErr) {
-            console.error('⚠️ Failed to save purchase to database:', dbErr.message);
-          }
-
           // Return result with FAILED markers - user will check manually
+          // NO DB SAVE - will be saved after sending to user
           return {
             success: false,
             transactionId: finalTransactionId,
             pinCode: 'FAILED',
-            serial: 'FAILED',
+            serialNumber: 'FAILED',
             requiresManualCheck: true,
-            stage: currentStage
+            stage: currentStage,
+            gameName: gameName,
+            cardValue: cardName  // Use cardName as cardValue
           };
         }
 
@@ -1086,27 +1075,17 @@ class PurchaseService {
         console.log(`📦 Product: ${purchaseData.productName}`);
         console.log(`🆔 Transaction ID: ${finalTransactionId}`);
         console.log(`📍 Stage: ${currentStage}`);
-        // � SECURITY: PIN and Serial not logged to console
+        // 🔒 SECURITY: PIN and Serial not logged to console
 
-        // Save to database with final status
-        try {
-          await databaseService.createPurchaseTransaction({
-            orderId: orderId,
-            transactionId: finalTransactionId,
-            cardNumber: cardNumber,
-            status: finalStatus
-          });
-          console.log(`📝 Purchase saved to database (card #${cardNumber}, status: ${finalStatus})`);
-        } catch (dbErr) {
-          console.error('⚠️ Failed to save purchase to database:', dbErr.message);
-        }
-
+        // Return data - NO DB SAVE yet, will be saved after sending to user
         return {
           success: true,
           transactionId: finalTransactionId,
           pinCode: purchaseData.pinCode,
-          serial: purchaseData.serial,
-          stage: currentStage
+          serialNumber: purchaseData.serial,
+          stage: currentStage,
+          gameName: gameName,
+          cardValue: cardName  // Use cardName as cardValue
         };
 
       } else {
@@ -1120,27 +1099,14 @@ class PurchaseService {
       console.error(`❌ Purchase failed at stage: ${currentStage}`);
       console.error(`❌ Error: ${err.message}`);
 
-      // Save failed purchase to database (regardless of stage)
-      try {
-        await databaseService.createPurchaseTransaction({
-          orderId: orderId,
-          transactionId: transactionId || null,  // NULL if failed before transaction page
-          cardNumber: cardNumber,
-          status: 'failed'
-        });
-        console.log(`📝 Failed purchase saved to database (card #${cardNumber}, stage: ${currentStage}, status: failed)`);
-      } catch (dbErr) {
-        console.error('⚠️ Failed to save failed purchase to database:', dbErr.message);
-      }
-
-      // Add stage information to error
+      // Add stage information to error (NO DB SAVE - will be handled upstream)
       err.stage = currentStage;
       err.transactionId = transactionId;
 
       throw err;
     } finally {
       // Update activity timestamp
-      browserManager.updateActivity(userId);
+      browserManager.updateActivity(telegramUserId);
     }
   }
 
@@ -1148,24 +1114,24 @@ class PurchaseService {
    * Process multiple purchases with NO RETRY logic
    * If transaction page reached, skip to next card (no retry)
    * If error before transaction page, also skip to next card (no retry)
+   * IMMEDIATE DB SAVE: Calls onCardCompleted after each successful purchase
    * @param {Object} params - Purchase parameters
    * @returns {Promise<Array>} Array of purchase results (including failed ones)
    */
-  async processBulkPurchases({ userId, gameUrl, cardIndex, cardName, quantity, backupCodes, onProgress, checkCancellation, orderId, onFirstPurchaseComplete }) {
-    // Get user's existing browser session
-    const page = browserManager.getPage(userId);
+  async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, backupCodes, onProgress, onCardCompleted, checkCancellation }) {
+    // Get user's existing browser session (using telegram user ID)
+    const page = browserManager.getPage(telegramUserId);
 
     if (!page) {
       throw new Error('No active browser session. Please login first.');
     }
 
     // Mark browser as in-use to prevent cleanup during purchase
-    browserManager.markInUse(userId);
+    browserManager.markInUse(telegramUserId);
 
     const purchases = [];
     let successCount = 0;
     let failedCount = 0;
-    let firstPurchaseCompleted = false;
     let backupCodeIndex = 0; // Track which backup code to use next
 
     console.log(`\n${'='.repeat(60)}`);
@@ -1197,42 +1163,38 @@ class PurchaseService {
 
         try {
           const result = await this.completePurchase({
-            userId,
+            telegramUserId,  // Changed from userId
             page,
             gameUrl,
             cardIndex,
             backupCode: backupCodes[backupCodeIndex], // Use current backup code from array
             checkCancellation,
-            orderId,
-            cardNumber: i  // Pass card number (1, 2, 3...)
+            cardNumber: i,  // Pass card number (1, 2, 3...)
+            gameName,       // For later DB save
+            cardName        // For later DB save
           });
 
-          // Increment backup code index after successful use
-          backupCodeIndex++;
-          console.log(`   Backup code used successfully (${backupCodeIndex}/${backupCodes.length} used)`);
-
-
-          // Increment backup code index after successful use
+          // Increment backup code index after successful purchase (code was used)
           backupCodeIndex++;
           console.log(`   Backup code used successfully (${backupCodeIndex}/${backupCodes.length} used)`);
 
           purchases.push(result);
-
-          // CRITICAL: Reduce attempts after FIRST purchase (success or fail)
-          if (!firstPurchaseCompleted && onFirstPurchaseComplete) {
-            try {
-              await onFirstPurchaseComplete();
-              firstPurchaseCompleted = true;
-            } catch (attemptErr) {
-              console.error('⚠️ Error in onFirstPurchaseComplete callback:', attemptErr.message);
-            }
-          }
 
           if (result.success) {
             successCount++;
             console.log(`✅ Card ${i}/${quantity} completed successfully!`);
             console.log(`   Transaction ID: ${result.transactionId}`);
             // 🔒 SECURITY: PIN and Serial not logged to console
+
+            // IMMEDIATE DB SAVE: Save this card to database right now
+            if (onCardCompleted) {
+              try {
+                await onCardCompleted(result, i);
+                console.log(`   💾 Card ${i} saved to database immediately`);
+              } catch (saveErr) {
+                console.error(`   ⚠️ Failed to save card ${i} to database:`, saveErr.message);
+              }
+            }
           } else {
             failedCount++;
             console.log(`⚠️ Card ${i}/${quantity} reached transaction page but extraction FAILED`);
@@ -1254,18 +1216,12 @@ class PurchaseService {
           console.error(`❌ Card ${i}/${quantity} failed at stage: ${err.stage || 'unknown'}`);
           console.error(`   Error: ${err.message}`);
 
-          // Increment backup code index even if purchase failed (code was likely consumed)
-          backupCodeIndex++;
-          console.log(`   Backup code consumed (${backupCodeIndex}/${backupCodes.length} used)`);
-
-          // CRITICAL: Reduce attempts after FIRST purchase attempt (even if failed)
-          if (!firstPurchaseCompleted && onFirstPurchaseComplete) {
-            try {
-              await onFirstPurchaseComplete();
-              firstPurchaseCompleted = true;
-            } catch (attemptErr) {
-              console.error('⚠️ Error in onFirstPurchaseComplete callback:', attemptErr.message);
-            }
+          // Only increment backup code if it was actually used (invalid code error)
+          if (err instanceof InvalidBackupCodeError) {
+            backupCodeIndex++;
+            console.log(`   Backup code was used but invalid (${backupCodeIndex}/${backupCodes.length} used)`);
+          } else {
+            console.log(`   Backup code NOT consumed - error occurred before 2FA`);
           }
 
           // Check if this is a cancellation error
@@ -1338,7 +1294,7 @@ class PurchaseService {
       throw err;
     } finally {
       // Mark browser as not in-use after purchase completes or fails
-      browserManager.markNotInUse(userId);
+      browserManager.markNotInUse(telegramUserId);
     }
   }
 }

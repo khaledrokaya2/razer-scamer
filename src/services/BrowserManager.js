@@ -14,11 +14,10 @@ class BrowserManager {
     // Map of userId -> { browser, page, lastActivity, inUse }
     this.userBrowsers = new Map();
 
-    // OPTIMIZATION: Reduced timeout from 30 to 5 minutes to save memory
-    // Browser stays open while in use, closes after 5 minutes of inactivity
-    this.INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    // OPTIMIZATION: Keep browser open for 1 day (users don't want to re-login frequently)
+    this.INACTIVITY_TIMEOUT = 1 * 24 * 60 * 60 * 1000; // 1 day
 
-    // Start cleanup interval (check every 5 minutes)
+    // Start cleanup interval (check every 2 minutes for faster resource recovery)
     this.startCleanupInterval();
   }
 
@@ -71,7 +70,7 @@ class BrowserManager {
     const isDevelopment = process.env.NODE_ENV === 'development';
 
     const browser = await puppeteer.launch({
-      headless: true,
+      headless: isDevelopment,
       slowMo: 0,
       args: [
         '--no-sandbox',
@@ -80,7 +79,21 @@ class BrowserManager {
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
         '--no-zygote',
-        '--single-process'
+        '--single-process',
+        // OPTIMIZATION: Performance flags for faster page loads
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+        '--disable-ipc-flooding-protection',
+        '--disable-hang-monitor',
+        '--disable-extensions',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--metrics-recording-only',
+        '--no-first-run',
+        '--safebrowsing-disable-auto-update',
+        '--mute-audio'
       ]
     });
 
@@ -217,7 +230,7 @@ class BrowserManager {
           this.closeBrowser(userId);
         }
       }
-    }, 5 * 60000); // Check every 5 minutes
+    }, 2 * 60000); // OPTIMIZATION: Check every 2 minutes for faster cleanup
   }
 
   /**
