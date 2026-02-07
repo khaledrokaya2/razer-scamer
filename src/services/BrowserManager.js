@@ -70,7 +70,7 @@ class BrowserManager {
     const isDevelopment = process.env.NODE_ENV === 'development';
 
     const browser = await puppeteer.launch({
-      headless: isDevelopment,
+      headless: true,
       slowMo: 0,
       args: [
         '--no-sandbox',
@@ -80,7 +80,6 @@ class BrowserManager {
         '--disable-gpu',
         '--no-zygote',
         '--single-process',
-        // OPTIMIZATION: Performance flags for faster page loads
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
@@ -96,12 +95,6 @@ class BrowserManager {
         '--mute-audio'
       ]
     });
-
-    if (isDevelopment) {
-      console.log('🖥️ Running in DEVELOPMENT mode - Browser window visible');
-    } else {
-      console.log('🚀 Running in PRODUCTION mode - Headless browser');
-    }
 
     return browser;
   }
