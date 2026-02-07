@@ -179,7 +179,7 @@ class TelegramBotController {
         [{ text: '🛒 Create Order' }],
         [{ text: '💰 Check Balance' }],
         [{ text: '📋 Order History' }],
-        [{ text: '⚙️ Update Credentials' }]
+        [{ text: '⚙️ Update Credentials' }, { text: '🚪 Logout' }]
       ],
       resize_keyboard: true,
       persistent: true
@@ -541,6 +541,11 @@ class TelegramBotController {
         return;
       }
 
+      if (text === '🚪 Logout') {
+        await this.handleLogoutButton(chatId, telegramUserId);
+        return;
+      }
+
       const session = sessionManager.getSession(chatId);
 
       // Handle login flow
@@ -567,6 +572,33 @@ class TelegramBotController {
       }
     } catch (err) {
       console.error('Error handling message:', err);
+    }
+  }
+
+  /**
+   * Handle logout button
+   * @param {string} chatId - Chat ID
+   * @param {string} telegramUserId - Telegram user ID
+   */
+  async handleLogoutButton(chatId, telegramUserId) {
+    const browserManager = require('../services/BrowserManager');
+
+    try {
+      // Close browser session for this user
+      await browserManager.closeBrowser(telegramUserId);
+
+      await this.safeSendMessage(
+        chatId,
+        '🚪 **Logged Out**\n\n' +
+        'Your session has been closed.\n',
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('Error during logout:', err);
+      await this.safeSendMessage(
+        chatId,
+        '❌ Error during logout. Please try again.'
+      );
     }
   }
 
