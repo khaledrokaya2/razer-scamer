@@ -391,7 +391,94 @@ class DatabaseService {
       throw err;
     }
   }
+  // ============================================================================
+  // USER OPERATIONS (for storing encrypted credentials)
+  // ============================================================================
 
+  /**
+   * Get user by telegram ID
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<User|null>} User or null if not found
+   */
+  async getUserByTelegramId(telegramUserId) {
+    try {
+      await this.connect();
+      const { User } = require('../models/DatabaseModels');
+
+      const result = await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query('SELECT * FROM user_accounts WHERE telegram_user_id = @telegram_user_id');
+
+      return result.recordset.length > 0 ? new User(result.recordset[0]) : null;
+    } catch (err) {
+      console.error('Error getting user:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Create or update user with encrypted credentials
+   * @param {string} telegramUserId - Telegram user ID
+   * @param {string} emailEncrypted - Encrypted email
+   * @param {string} passwordEncrypted - Encrypted password
+   * @returns {Promise<User>} Created or updated user
+   */
+  async saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted) {
+    try {
+      await this.connect();
+      const { User } = require('../models/DatabaseModels');
+
+      // Check if user exists
+      const existingUser = await this.getUserByTelegramId(telegramUserId);
+
+      if (existingUser) {
+        // Update existing user
+        const result = await this.pool.request()
+          .input('telegram_user_id', sql.BigInt, telegramUserId)
+          .input('email_encrypted', sql.NVarChar(500), emailEncrypted)
+          .input('password_encrypted', sql.NVarChar(500), passwordEncrypted)
+          .query(`
+            UPDATE user_accounts 
+            SET email_encrypted = @email_encrypted, 
+                password_encrypted = @password_encrypted
+            OUTPUT INSERTED.*
+            WHERE telegram_user_id = @telegram_user_id
+          `);
+
+        return new User(result.recordset[0]);
+      } else {
+        // User doesn't exist - this shouldn't happen as users should be created via authorization
+        throw new Error('User account not found. Please contact administrator.');
+      }
+    } catch (err) {
+      console.error('Error saving user credentials:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Delete user credentials (sets them to NULL)
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<boolean>} True if deleted
+   */
+  async deleteUserCredentials(telegramUserId) {
+    try {
+      await this.connect();
+
+      await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query(`
+          UPDATE user_accounts 
+          SET email_encrypted = NULL, password_encrypted = NULL 
+          WHERE telegram_user_id = @telegram_user_id
+        `);
+
+      return true;
+    } catch (err) {
+      console.error('Error deleting user credentials:', err);
+      throw err;
+    }
+  }
   /**
    * Close database connection pool
    */

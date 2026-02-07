@@ -1,5 +1,5 @@
 /**
- * Main Entry Pointt
+ * Main Entry Point
  * 
  * This file serves as the application entry point.
  * It initializes configuration, services, and starts the bot.
@@ -42,7 +42,7 @@ async function initializeServices() {
   await authService.initialize();
 
   // Initialize Telegram bot controller with bot token
-  botController.initialize(process.env.TELEGRAM_BOT_TOKEN);
+  botController.initialize(process.env.TELEGRAM_TEST_BOT_TOKEN);
 
   console.log('✅ All services initialized');
 }

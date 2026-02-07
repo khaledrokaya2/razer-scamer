@@ -97,6 +97,40 @@ END
 GO
 
 -- ============================================================================
+-- USER_ACCOUNTS TABLE - Add encrypted credentials columns
+-- ============================================================================
+IF OBJECT_ID('dbo.user_accounts', 'U') IS NOT NULL
+BEGIN
+  PRINT 'USER_ACCOUNTS table exists - adding encrypted credential columns...';
+
+  -- Add email_encrypted if it doesn't exist
+  IF NOT EXISTS (SELECT *
+  FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_NAME = 'user_accounts' AND COLUMN_NAME = 'email_encrypted')
+    BEGIN
+    ALTER TABLE dbo.user_accounts ADD email_encrypted NVARCHAR(500) NULL;
+    PRINT '  ✅ Added email_encrypted column';
+  END
+
+  -- Add password_encrypted if it doesn't exist
+  IF NOT EXISTS (SELECT *
+  FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_NAME = 'user_accounts' AND COLUMN_NAME = 'password_encrypted')
+    BEGIN
+    ALTER TABLE dbo.user_accounts ADD password_encrypted NVARCHAR(500) NULL;
+    PRINT '  ✅ Added password_encrypted column';
+  END
+
+  PRINT '✅ USER_ACCOUNTS table updated with credential columns';
+END
+ELSE
+BEGIN
+  PRINT '⚠️  WARNING: USER_ACCOUNTS table does not exist!';
+  PRINT '   Please run the main setup-database.sql first.';
+END
+GO
+
+-- ============================================================================
 -- PURCHASES TABLE - Create or Alter
 -- ============================================================================
 IF OBJECT_ID('dbo.purchases', 'U') IS NULL
@@ -211,6 +245,20 @@ PRINT '';
 
 -- Show table schemas
 PRINT '============================================';
+PRINT 'USER_ACCOUNTS Table Structure:';
+PRINT '============================================';
+SELECT
+  COLUMN_NAME,
+  DATA_TYPE,
+  CHARACTER_MAXIMUM_LENGTH,
+  IS_NULLABLE,
+  COLUMN_DEFAULT
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME = 'user_accounts'
+ORDER BY ORDINAL_POSITION;
+PRINT '';
+
+PRINT '============================================';
 PRINT 'ORDERS Table Structure:';
 PRINT '============================================';
 SELECT
@@ -249,11 +297,12 @@ PRINT '- Old records may have NULL values in new columns';
 PRINT '- telegram_user_id will be NULL for old orders';
 PRINT '- game_name, card_value will be NULL for old records';
 PRINT '- pin_encrypted will be NULL (old system used memory-only)';
+PRINT '- email_encrypted, password_encrypted will be NULL until user updates credentials';
 PRINT '';
 PRINT 'Next Steps:';
 PRINT '1. Add AUTHORIZED_USER_IDS to .env file';
 PRINT '2. Add ENCRYPTION_KEY to .env file (64 hex chars)';
-PRINT '3. (Optional) Manually update old records with telegram_user_id';
+PRINT '3. Users can now use "Update Credentials" menu to save login info';
 PRINT '4. Run: npm start';
 PRINT '';
 

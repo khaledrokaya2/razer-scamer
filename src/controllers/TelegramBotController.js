@@ -168,7 +168,7 @@ class TelegramBotController {
   }
 
   /**
-   * Show main menu with 3 options (persistent keyboard buttons)
+   * Show main menu with 4 options (persistent keyboard buttons)
    * @param {string} chatId - Chat ID
    */
   async showMainMenu(chatId) {
@@ -178,7 +178,8 @@ class TelegramBotController {
       keyboard: [
         [{ text: '🛒 Create Order' }],
         [{ text: '💰 Check Balance' }],
-        [{ text: '📋 Order History' }]
+        [{ text: '📋 Order History' }],
+        [{ text: '⚙️ Update Credentials' }]
       ],
       resize_keyboard: true,
       persistent: true
@@ -340,7 +341,7 @@ class TelegramBotController {
             await orderFlowHandler.handleBack(this.bot, chatId);
 
           } else if (callbackData === 'login') {
-            await this.handleLoginButton(chatId);
+            await this.handleLoginButton(chatId, telegramUserId);
 
           } else {
             console.log(`❓ Unknown callback: ${callbackData}`);
@@ -355,18 +356,80 @@ class TelegramBotController {
   /**
    * Handle login button click
    * @param {string} chatId - Telegram chat ID
+   * @param {string} telegramUserId - Telegram user ID
    */
-  async handleLoginButton(chatId) {
-    // Create session if doesn't exist
-    if (!sessionManager.getSession(chatId)) {
-      sessionManager.createSession(chatId);
+  async handleLoginButton(chatId, telegramUserId) {
+    const db = require('../services/DatabaseService');
+    const encryptionService = require('../utils/encryption');
+    const scraperService = require('../services/RazerScraperService');
+
+    try {
+      // Check if user has stored credentials
+      const user = await db.getUserByTelegramId(telegramUserId);
+
+      if (user && user.hasCredentials()) {
+        // Use stored credentials for automatic login
+        const loadingMessage = await this.safeSendMessage(chatId, '⏳ Logging in with stored credentials...');
+
+        try {
+          // Decrypt credentials
+          const email = encryptionService.decrypt(user.email_encrypted);
+          const password = encryptionService.decrypt(user.password_encrypted);
+
+          // Attempt login
+          await scraperService.login(telegramUserId, email, password);
+
+          // Delete loading message and show success
+          if (loadingMessage) {
+            try {
+              await this.bot.deleteMessage(chatId, loadingMessage.message_id);
+            } catch (delErr) {
+              console.log('Could not delete loading message');
+            }
+          }
+
+          await this.safeSendMessage(chatId, '✅ Logged in successfully with saved credentials!');
+          return;
+
+        } catch (loginErr) {
+          console.error('Auto-login failed:', loginErr);
+
+          // Delete loading message
+          if (loadingMessage) {
+            try {
+              await this.bot.deleteMessage(chatId, loadingMessage.message_id);
+            } catch (delErr) {
+              console.log('Could not delete loading message');
+            }
+          }
+
+          // Notify user and ask for manual login
+          await this.safeSendMessage(
+            chatId,
+            '⚠️ Automatic login failed. Your stored credentials may be outdated.\n\n' +
+            'Please update your credentials using the ⚙️ Update Credentials menu option.'
+          );
+
+          return;
+        }
+      }
+
+      // No stored credentials - ask for manual login
+      // Create session if doesn't exist
+      if (!sessionManager.getSession(chatId)) {
+        sessionManager.createSession(chatId);
+      }
+
+      // Update session state
+      sessionManager.updateState(chatId, 'awaiting_email');
+
+      // Ask for email
+      this.bot.sendMessage(chatId, '📧 Please enter your Razer account email:');
+
+    } catch (err) {
+      console.error('Error in login button handler:', err);
+      await this.safeSendMessage(chatId, '❌ An error occurred. Please try again.');
     }
-
-    // Update session state
-    sessionManager.updateState(chatId, 'awaiting_email');
-
-    // Ask for email
-    this.bot.sendMessage(chatId, '📧 Please enter your Razer account email:');
   }
 
   /**
@@ -473,6 +536,11 @@ class TelegramBotController {
         return;
       }
 
+      if (text === '⚙️ Update Credentials') {
+        await this.handleUpdateCredentials(chatId);
+        return;
+      }
+
       const session = sessionManager.getSession(chatId);
 
       // Handle login flow
@@ -481,6 +549,10 @@ class TelegramBotController {
           await this.handleEmailInput(chatId, text);
         } else if (session.state === 'awaiting_password') {
           await this.handlePasswordInput(chatId, telegramUserId, text);
+        } else if (session.state === 'update_credentials_email') {
+          await this.handleUpdateCredentialsEmail(chatId, text);
+        } else if (session.state === 'update_credentials_password') {
+          await this.handleUpdateCredentialsPassword(chatId, telegramUserId, text);
         }
       }
 
@@ -495,6 +567,96 @@ class TelegramBotController {
       }
     } catch (err) {
       console.error('Error handling message:', err);
+    }
+  }
+
+  /**
+   * Handle update credentials menu option
+   * @param {string} chatId - Chat ID
+   */
+  async handleUpdateCredentials(chatId) {
+    // Create session if doesn't exist
+    if (!sessionManager.getSession(chatId)) {
+      sessionManager.createSession(chatId);
+    }
+
+    // Update session state to update credentials flow
+    sessionManager.updateState(chatId, 'update_credentials_email');
+
+    // Ask for email
+    this.bot.sendMessage(
+      chatId,
+      '⚙️ **Update Credentials**\n\n' +
+      'Please enter your Razer account email:\n\n' +
+      '⚠️ Your credentials will be encrypted and stored securely.',
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  /**
+   * Handle update credentials email input
+   * @param {string} chatId - Chat ID
+   * @param {string} email - Email input
+   */
+  async handleUpdateCredentialsEmail(chatId, email) {
+    // Store email in session
+    sessionManager.setEmail(chatId, email.trim());
+
+    // Update state
+    sessionManager.updateState(chatId, 'update_credentials_password');
+
+    // Ask for password
+    this.bot.sendMessage(chatId, '🔑 Please enter your Razer account password:');
+  }
+
+  /**
+   * Handle update credentials password input
+   * @param {string} chatId - Chat ID
+   * @param {string} telegramUserId - Telegram user ID
+   * @param {string} password - Password input
+   */
+  async handleUpdateCredentialsPassword(chatId, telegramUserId, password) {
+    const db = require('../services/DatabaseService');
+    const encryptionService = require('../utils/encryption');
+    const session = sessionManager.getSession(chatId);
+
+    try {
+      // Get email and password from session
+      const email = session.email;
+      const passwordTrimmed = password.trim();
+
+      // Encrypt credentials
+      const emailEncrypted = encryptionService.encrypt(email);
+      const passwordEncrypted = encryptionService.encrypt(passwordTrimmed);
+
+      // Save to database
+      await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
+
+      // Clear credentials from memory
+      sessionManager.clearCredentials(chatId);
+
+      // Reset session state
+      sessionManager.updateState(chatId, 'idle');
+
+      await this.safeSendMessage(
+        chatId,
+        '✅ **Credentials Updated Successfully!**\n\n' +
+        'Your credentials have been encrypted and saved.\n' +
+        'You can now use automatic login! 🎉',
+        { parse_mode: 'Markdown' }
+      );
+
+    } catch (err) {
+      console.error('Error saving credentials:', err);
+
+      // Clear credentials on error
+      sessionManager.clearCredentials(chatId);
+      sessionManager.updateState(chatId, 'idle');
+
+      await this.safeSendMessage(
+        chatId,
+        '❌ Failed to save credentials. Please try again later.'
+      );
     }
   }
 
@@ -521,6 +683,8 @@ class TelegramBotController {
    * @param {string} password - Password input
    */
   async handlePasswordInput(chatId, telegramUserId, password) {
+    const db = require('../services/DatabaseService');
+    const encryptionService = require('../utils/encryption');
     const session = sessionManager.getSession(chatId);
 
     // Store password temporarily
@@ -537,6 +701,17 @@ class TelegramBotController {
         session.password
       );
 
+      // Login successful - save encrypted credentials to database
+      try {
+        const emailEncrypted = encryptionService.encrypt(session.email);
+        const passwordEncrypted = encryptionService.encrypt(session.password);
+        await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
+        console.log(`✅ Saved encrypted credentials for user ${telegramUserId}`);
+      } catch (saveErr) {
+        console.error('Failed to save credentials (login still successful):', saveErr);
+        // Continue anyway - login was successful
+      }
+
       // Clear credentials from memory
       sessionManager.clearCredentials(chatId);
 
@@ -551,7 +726,11 @@ class TelegramBotController {
           console.log('Could not delete loading message');
         }
       }
-      await this.safeSendMessage(chatId, '✅ Logged in successfully!');
+      await this.safeSendMessage(
+        chatId,
+        '✅ Logged in successfully!\n\n' +
+        '💾 Your credentials have been saved for automatic login next time.'
+      );
 
     } catch (err) {
       console.error('Login error:', err);

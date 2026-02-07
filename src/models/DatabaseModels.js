@@ -98,7 +98,35 @@ class Purchase {
   }
 }
 
+/**
+ * User Model
+ * Represents a user account with stored encrypted credentials
+ * Maps to user_accounts table
+ */
+class User {
+  constructor(data) {
+    this.id = data.id;
+    this.telegram_user_id = data.telegram_user_id;
+    this.username = data.username;
+    this.created_at = data.created_at;
+    this.AllowedAttempts = data.AllowedAttempts;
+    this.SubscriptionType = data.SubscriptionType;
+    this.SubscriptionExpiresAt = data.SubscriptionExpiresAt;
+    this.role = data.role;
+    this.email_encrypted = data.email_encrypted;
+    this.password_encrypted = data.password_encrypted;
+  }
+
+  /**
+   * Check if user has stored credentials
+   */
+  hasCredentials() {
+    return this.email_encrypted && this.password_encrypted;
+  }
+}
+
 module.exports = {
   Order,
-  Purchase
+  Purchase,
+  User
 };
