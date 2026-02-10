@@ -44,6 +44,12 @@ Thumbs.db
 sessions/
 *.session
 
+# Temporary PIN files
+temp_pins/
+temp/
+*.txt
+*.md
+
 # Test coverage
 coverage/
 

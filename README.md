@@ -92,6 +92,39 @@
 
 **Razer Scraper Bot** is an enterprise-grade Telegram bot that automates the purchase of Razer Gold game cards through intelligent web scraping and browser automation. Built with reliability and scalability in mind, it supports multi-user environments with role-based access control and subscription management.
 
+---
+
+## 🚀 Production Deployment
+
+### Quick Deploy on Digital Ocean + ASP Monster
+
+We provide comprehensive deployment guides for production:
+
+- 📘 **[DEPLOYMENT.md](DEPLOYMENT.md)** - Complete step-by-step deployment guide (15 steps, ~25 min)
+  - Server setup & hardening
+  - Security configuration (firewall, fail2ban, SSH)
+  - Dependencies installation
+  - PM2 process management
+  - Monitoring & backups
+  
+- ⚡ **[QUICK_START.md](QUICK_START.md)** - Fast deployment reference (copy & paste commands)
+  - 5-step quick setup
+  - Essential commands
+  - Common troubleshooting
+
+- 🔒 **[SECURITY.md](SECURITY.md)** - Security best practices & checklist
+  - Pre-deployment security checklist
+  - Common mistakes to avoid
+  - Monitoring procedures
+  - Incident response plan
+
+**Recommended Setup:**
+- **Server**: Digital Ocean (2GB RAM, 60GB SSD, London region)
+- **Database**: ASP Monster MSSQL Free Tier (1GB storage, EU-based)
+- **Cost**: $12/month (server) + $0 (database) = **$12/month total**
+
+---
+
 ## 🏗️ Architecture (SOLID Principles)
 
 ### Key Capabilities
