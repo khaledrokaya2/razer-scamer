@@ -10,6 +10,7 @@
  */
 
 const browserManager = require('./BrowserManager');
+const logger = require('../utils/logger');
 
 /**
  * Custom error for insufficient balance
@@ -65,7 +66,7 @@ class PurchaseService {
 
     try {
       // Quick page load check - don't wait too long
-      console.log('⏳ Waiting for page to load...');
+      logger.http('Waiting for page to load...');
 
       // Check if page loaded successfully and user is logged in
       await page.waitForSelector('body', { timeout: 10000 });
@@ -105,11 +106,11 @@ class PurchaseService {
         throw new Error('Login required - user needs to authenticate first');
       }
 
-      console.log(`📄 Page loaded: ${pageStatus.title}`);
-      console.log(`🎯 Quick scan: ${pageStatus.cardCount} cards, ${pageStatus.paymentCount} payment methods`);
+      logger.info(`Page loaded: ${pageStatus.title}`);
+      logger.debug(`Quick scan: ${pageStatus.cardCount} cards, ${pageStatus.paymentCount} payment methods`);
 
       // OPTIMIZED: Wait for cards to load, then try all detection methods in one pass
-      console.log('⏳ Waiting for cards to load (max 5 seconds)...');
+      logger.http('Waiting for cards to load (max 5 seconds)...');
 
       // Wait for any card-related selector to appear (5 second timeout)
       try {
@@ -121,16 +122,16 @@ class PurchaseService {
           // Or wait 5 seconds maximum
           new Promise((resolve) => setTimeout(resolve, 5000))
         ]);
-        console.log('✅ Card elements detected on page');
+        logger.success('Card elements detected on page');
       } catch (waitErr) {
-        console.log('⚠️ Card elements not found within 5 seconds, will try extraction anyway...');
+        logger.warn('Card elements not found within 5 seconds, will try extraction anyway...');
       }
 
       // Additional small wait for dynamic content to settle
       await new Promise(resolve => setTimeout(resolve, 300));
 
       // OPTIMIZED: Try ALL 3 detection methods in ONE evaluation
-      console.log('🔍 Extracting cards using unified detection...');
+      logger.debug('Extracting cards using unified detection...');
 
       const cardsData = await page.evaluate(() => {
         let detectedCards = [];
@@ -291,13 +292,13 @@ class PurchaseService {
         };
       });
 
-      console.log(`✅ Cards detected using: ${cardsData.method}`);
-      console.log(`📦 Found ${cardsData.totalFound} card options`);
+      logger.success(`Cards detected using: ${cardsData.method}`);
+      logger.info(`Found ${cardsData.totalFound} card options`);
 
       // Log card details for debugging
       cardsData.cards.forEach((card, idx) => {
         const status = card.disabled ? '(OUT OF STOCK)' : '(AVAILABLE)';
-        console.log(`   ${idx}: ${card.name} ${status}`);
+        logger.debug(`   ${idx}: ${card.name} ${status}`);
       });
 
       if (cardsData.cards.length === 0) {
@@ -308,10 +309,10 @@ class PurchaseService {
       return cardsData.cards;
 
     } catch (err) {
-      console.error('❌ Error getting available cards:', err.message);
+      logger.error('Error getting available cards:', err.message);
 
       // Enhanced debugging info
-      console.log('🔍 Page debugging info:');
+      logger.debug('Page debugging info:');
       try {
         const pageInfo = await page.evaluate(() => ({
           url: window.location.href,
@@ -322,15 +323,15 @@ class PurchaseService {
           allRadioNames: [...document.querySelectorAll('input[type="radio"]')].map(r => r.getAttribute('name')).filter(Boolean),
           bodyText: document.body ? document.body.textContent.substring(0, 200) : 'No body'
         }));
-        console.log('   URL:', pageInfo.url);
-        console.log('   Title:', pageInfo.title);
-        console.log('   Cards Container Found:', pageInfo.hasCardsContainer);
-        console.log('   Card Containers:', pageInfo.cardContainers);
-        console.log('   Radio Inputs:', pageInfo.radioInputs);
-        console.log('   Radio Names:', pageInfo.allRadioNames);
-        console.log('   Body Preview:', pageInfo.bodyText);
+        logger.debug('   URL:', pageInfo.url);
+        logger.debug('   Title:', pageInfo.title);
+        logger.debug('   Cards Container Found:', pageInfo.hasCardsContainer);
+        logger.debug('   Card Containers:', pageInfo.cardContainers);
+        logger.debug('   Radio Inputs:', pageInfo.radioInputs);
+        logger.debug('   Radio Names:', pageInfo.allRadioNames);
+        logger.debug('   Body Preview:', pageInfo.bodyText);
       } catch (debugErr) {
-        console.log('   Could not get page debug info:', debugErr.message);
+        logger.debug('   Could not get page debug info:', debugErr.message);
       }
 
       throw err;
@@ -350,11 +351,11 @@ class PurchaseService {
     while (attempts < this.MAX_RELOAD_ATTEMPTS) {
       // Check if order was cancelled
       if (checkCancellation && checkCancellation()) {
-        console.log('🛑 Stock check cancelled by user');
+        logger.warn('Stock check cancelled by user');
         throw new Error('Order cancelled by user');
       }
 
-      console.log(`🔄 Checking stock status... (Attempt ${attempts + 1}/${this.MAX_RELOAD_ATTEMPTS})`);
+      logger.debug(`Checking stock status... (Attempt ${attempts + 1}/${this.MAX_RELOAD_ATTEMPTS})`);
 
       const isInStock = await page.evaluate((index) => {
         const radioInputs = document.querySelectorAll("input[type='radio'][data-v-498979e2]");
@@ -362,11 +363,11 @@ class PurchaseService {
       }, cardIndex);
 
       if (isInStock) {
-        console.log('✅ Card is IN STOCK!');
+        logger.success('Card is IN STOCK!');
         return true;
       }
 
-      console.log('⏳ Out of stock, waiting 2 seconds before retry...');
+      logger.debug('Out of stock, waiting 2 seconds before retry...');
       await new Promise(resolve => setTimeout(resolve, this.RELOAD_CHECK_INTERVAL));
 
       // Reload page
@@ -388,7 +389,7 @@ class PurchaseService {
     let transactionId = null;
 
     try {
-      console.log('🛒 Starting purchase process...');
+      logger.purchase('Starting purchase process...');
 
       // Check cancellation before starting
       if (checkCancellation && checkCancellation()) {
@@ -397,7 +398,7 @@ class PurchaseService {
 
       // STAGE 1: Navigate to game page
       currentStage = this.STAGES.NAVIGATING;
-      console.log(`📍 Stage: ${currentStage}`);
+      logger.debug(`Stage: ${currentStage}`);
       await page.goto(gameUrl, { waitUntil: 'networkidle2' });
 
       // Wait for cards
@@ -413,7 +414,7 @@ class PurchaseService {
 
       // STAGE 2: Select card
       currentStage = this.STAGES.SELECTING_CARD;
-      console.log(`📍 Stage: ${currentStage}`);
+      logger.debug(`Stage: ${currentStage}`);
 
       // Check if card is in stock, wait if not
       const isInStock = await page.evaluate((index) => {
@@ -422,12 +423,12 @@ class PurchaseService {
       }, cardIndex);
 
       if (!isInStock) {
-        console.log('⚠️ Card is OUT OF STOCK, waiting for restock...');
+        logger.warn('Card is OUT OF STOCK, waiting for restock...');
         await this.waitForCardInStock(page, cardIndex, checkCancellation);
       }
 
       // Select card - ensure we click the right one based on actual HTML structure
-      console.log(`📦 Selecting card at index ${cardIndex}...`);
+      logger.purchase(`Selecting card at index ${cardIndex}...`);
 
       // Wait for card containers to be fully loaded and clickable
       await page.waitForSelector('#webshop_step_sku .selection-tile', {
@@ -437,7 +438,7 @@ class PurchaseService {
 
       // Get all card containers from the cards section
       const cardContainers = await page.$$('#webshop_step_sku .selection-tile');
-      console.log(`Found ${cardContainers.length} card containers`);
+      logger.debug(`Found ${cardContainers.length} card containers`);
 
       if (cardIndex >= cardContainers.length) {
         throw new Error(`Card index ${cardIndex} is out of range. Available cards: ${cardContainers.length}`);
@@ -451,15 +452,15 @@ class PurchaseService {
 
       // Method 1: Click the label (most reliable for radio inputs)
       try {
-        console.log('🎯 Trying to click card label...');
+        logger.debug('Trying to click card label...');
         const label = await selectedCardContainer.$('label');
         if (label) {
           await label.click();
-          console.log('✅ Clicked card label');
+          logger.success('Clicked card label');
           cardSelected = true;
         }
       } catch (err) {
-        console.log('⚠️ Label click failed, trying radio input...');
+        logger.debug('Label click failed, trying radio input...');
       }
 
       // Method 2: Click the radio input directly
@@ -468,18 +469,18 @@ class PurchaseService {
           const radioInput = await selectedCardContainer.$('input[type="radio"][name="paymentAmountItem"]');
           if (radioInput) {
             await radioInput.click();
-            console.log('✅ Clicked card radio input');
+            logger.success('Clicked card radio input');
             cardSelected = true;
           }
         } catch (err) {
-          console.log('⚠️ Radio input click failed, trying container...');
+          logger.debug('Radio input click failed, trying container...');
         }
       }
 
       // Method 3: Click the container itself
       if (!cardSelected) {
         await selectedCardContainer.click();
-        console.log('✅ Clicked card container');
+        logger.success('Clicked card container');
         cardSelected = true;
       }
 
@@ -497,7 +498,7 @@ class PurchaseService {
       }, cardIndex);
 
       if (!isSelected) {
-        console.log('⚠️ Card not selected, trying JavaScript selection...');
+        logger.debug('Card not selected, trying JavaScript selection...');
         // Final fallback: use JavaScript to directly select the radio button
         await page.evaluate((index) => {
           const cardContainers = document.querySelectorAll('#webshop_step_sku .selection-tile');
@@ -515,7 +516,7 @@ class PurchaseService {
         }, cardIndex);
       }
 
-      console.log(`✅ Card ${cardIndex} selected successfully`);
+      logger.success(`Card ${cardIndex} selected successfully`);
 
       // Check cancellation
       if (checkCancellation && checkCancellation()) {
@@ -524,7 +525,7 @@ class PurchaseService {
 
       // STAGE 3: Select payment method
       currentStage = this.STAGES.SELECTING_PAYMENT;
-      console.log(`📍 Stage: ${currentStage}`);
+      logger.debug(`Stage: ${currentStage}`);
 
       // Wait for payment methods section to load
       await page.waitForSelector("#webshop_step_payment_channels", {
@@ -533,7 +534,7 @@ class PurchaseService {
       });
 
       // Select Razer Gold as payment method
-      console.log('💳 Selecting Razer Gold payment...');
+      logger.purchase('Selecting Razer Gold payment...');
 
       // Wait for payment methods container to load
       await page.waitForSelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']", {
@@ -548,36 +549,36 @@ class PurchaseService {
         throw new Error('❌ Could not find Razer Gold payment container');
       }
 
-      console.log('✅ Found Razer Gold payment container');
+      logger.success('Found Razer Gold payment container');
 
       // Try clicking the label first (most reliable method based on HTML structure)
       try {
-        console.log('🎯 Trying to click the label...');
+        logger.debug('Trying to click the label...');
         const label = await razerGoldContainer.$('label');
         if (label) {
           await label.click();
-          console.log('✅ Clicked Razer Gold label');
+          logger.success('Clicked Razer Gold label');
         } else {
           throw new Error('Label not found');
         }
       } catch (err) {
-        console.log('⚠️ Label click failed, trying radio input...');
+        logger.debug('Label click failed, trying radio input...');
 
         // Fallback: click the radio input directly
         try {
           const radioInput = await razerGoldContainer.$('input[type="radio"][name="paymentChannelItem"]');
           if (radioInput) {
             await radioInput.click();
-            console.log('✅ Clicked Razer Gold radio input');
+            logger.success('Clicked Razer Gold radio input');
           } else {
             throw new Error('Radio input not found');
           }
         } catch (radioErr) {
-          console.log('⚠️ Radio input click failed, trying container...');
+          logger.debug('Radio input click failed, trying container...');
 
           // Final fallback: click the container itself
           await razerGoldContainer.click();
-          console.log('✅ Clicked Razer Gold container');
+          logger.success('Clicked Razer Gold container');
         }
       }
 
@@ -591,7 +592,7 @@ class PurchaseService {
       });
 
       if (!isRazerGoldSelected) {
-        console.log('⚠️ Razer Gold not selected, trying alternative selection...');
+        logger.debug('Razer Gold not selected, trying alternative selection...');
 
         // Alternative selection method using JavaScript
         await page.evaluate(() => {
@@ -617,7 +618,7 @@ class PurchaseService {
         }
       }
 
-      console.log('✅ Razer Gold payment method selected successfully');
+      logger.success('Razer Gold payment method selected successfully');
 
       // Check cancellation
       if (checkCancellation && checkCancellation()) {
@@ -626,10 +627,10 @@ class PurchaseService {
 
       // STAGE 4: Click checkout
       currentStage = this.STAGES.CLICKING_CHECKOUT;
-      console.log(`📍 Stage: ${currentStage}`);
+      logger.debug(`Stage: ${currentStage}`);
 
       // Click checkout
-      console.log('🛒 Clicking checkout...');
+      logger.purchase('Clicking checkout...');
 
       // Try multiple selectors for checkout button
       let checkoutButton = null;
@@ -649,11 +650,11 @@ class PurchaseService {
             timeout: 5000
           });
           if (checkoutButton) {
-            console.log(`✅ Found checkout button with selector: ${selector}`);
+            logger.success(`Found checkout button with selector: ${selector}`);
             break;
           }
         } catch (err) {
-          console.log(`⚠️ Checkout selector failed: ${selector}`);
+          logger.debug(`Checkout selector failed: ${selector}`);
           continue;
         }
       }
@@ -677,12 +678,12 @@ class PurchaseService {
       }
 
       await checkoutButton.click();
-      console.log('✅ Checkout button clicked successfully');
+      logger.success('Checkout button clicked successfully');
 
       // Wait for navigation after checkout
-      console.log('⏳ Waiting for page to load after checkout...');
+      logger.http('Waiting for page to load after checkout...');
       await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {
-        console.log('ℹ️ Navigation timeout - will check URL...');
+        logger.debug('Navigation timeout - will check URL...');
       });
 
       // Give a moment for any redirects to complete
@@ -690,21 +691,21 @@ class PurchaseService {
 
       // Check URL after checkout
       const urlAfterCheckout = await page.url();
-      console.log('📍 URL after checkout:', urlAfterCheckout);
+      logger.debug('URL after checkout:', urlAfterCheckout);
 
       // Check if redirected to reload page (insufficient balance)
       if (urlAfterCheckout.includes('/gold/reload') || urlAfterCheckout.includes('gold.razer.com/global/en/gold/reload')) {
-        console.error('❌ Redirected to reload page - insufficient Razer Gold balance');
+        logger.error('Redirected to reload page - insufficient Razer Gold balance');
         throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
       }
 
       // Check for unexpected redirects
       if (!urlAfterCheckout.includes(gameUrl) && !urlAfterCheckout.includes('/gold/purchase/')) {
-        console.error(`⚠️ Unexpected URL after checkout: ${urlAfterCheckout}`);
+        logger.error(`Unexpected URL after checkout: ${urlAfterCheckout}`);
         throw new Error(`Unexpected redirect to: ${urlAfterCheckout}. Order processing cancelled.`);
       }
 
-      console.log('✅ Checkout successful, checking next step...');
+      logger.success('Checkout successful, checking next step...');
 
       // Check cancellation
       if (checkCancellation && checkCancellation()) {
@@ -713,10 +714,10 @@ class PurchaseService {
 
       // STAGE 5: Process 2FA or direct transaction
       currentStage = this.STAGES.PROCESSING_2FA;
-      console.log(`📍 Stage: ${currentStage}`);
+      logger.debug(`Stage: ${currentStage}`);
 
       // Wait for either 2FA modal OR direct transaction page (two scenarios)
-      console.log('� Checking if 2FA is required or direct processing...');
+      logger.debug('Checking if 2FA is required or direct processing...');
 
       const checkoutResult = await Promise.race([
         // Scenario 1: 2FA modal appears (requires backup code)
@@ -740,18 +741,18 @@ class PurchaseService {
 
       // Handle reload page redirect
       if (checkoutResult.type === 'reload') {
-        console.error('❌ Redirected to reload page - insufficient balance');
+        logger.error('Redirected to reload page - insufficient balance');
         throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
       }
 
       // Handle direct transaction (no 2FA required)
       if (checkoutResult.type === 'direct') {
-        console.log('✅ No 2FA required - proceeding directly to transaction page');
+        logger.success('No 2FA required - proceeding directly to transaction page');
         // Skip 2FA section and go directly to transaction handling
       }
       // Handle 2FA flow
       else if (checkoutResult.type === '2fa') {
-        console.log('✅ 2FA modal detected - processing backup code...');
+        logger.debug('2FA modal detected - processing backup code...');
 
         // Step 2: Wait for any OTP iframe (first one)
         await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 30000 });
@@ -759,7 +760,7 @@ class PurchaseService {
         let frame = await frameHandle.contentFrame();
 
         // Step 3: Click “Choose another method” inside iframe
-        console.log('🔄 Clicking choose another method...');
+        logger.debug('Clicking choose another method...');
         const chooseAnother = await frame.waitForSelector("button[class*='arrowed']", { visible: true, timeout: 20000 });
         await chooseAnother.click();
 
@@ -775,12 +776,12 @@ class PurchaseService {
 
         // Step 6: Wait for and click “Backup Codes” button
         // Try clicking the one with “Backup” in its text
-        console.log('🔑 Selecting backup code option...');
+        logger.debug('Selecting backup code option...');
         const backupButton = await frame.$$("ul[class*='alt-menu'] button");
         await backupButton[1].click();
 
         // Enter backup code (8 digits)
-        console.log('🔢 Entering backup code...');
+        logger.debug('Entering backup code...');
 
         if (!backupCode || backupCode.length !== 8) {
           throw new Error('Invalid backup code - must be 8 digits');
@@ -802,13 +803,13 @@ class PurchaseService {
 
         // After entering all digits, the form auto-submits and page navigates
         // We need to wait for navigation without trying to access the detached frame
-        console.log('⏳ Backup code entered, waiting for validation...');
+        logger.debug('Backup code entered, waiting for validation...');
 
         // CRITICAL FIX: Check for error popup on main page (not inside iframe)
         // The error appears as: <div id="main-alert" class="show error notification">
         try {
           // Quick check for error alert popup (3 seconds max)
-          console.log('🔍 Checking for error alert popup...');
+          logger.debug('Checking for error alert popup...');
           await page.waitForFunction(() => {
             const errorAlert = document.querySelector('#main-alert.show.error');
             if (errorAlert) {
@@ -821,12 +822,12 @@ class PurchaseService {
           }, { timeout: 3000, polling: 300 });
 
           // If we reach here, error alert was found
-          console.error('❌ Invalid backup code - error alert detected');
+          logger.error('Invalid backup code - error alert detected');
           throw new InvalidBackupCodeError('The backup code you entered is incorrect or expired. Please enter another valid backup code.');
         } catch (errorCheckErr) {
           // No error alert found within 3 seconds - this is GOOD
           if (errorCheckErr.name === 'TimeoutError') {
-            console.log('✅ No error alert detected - waiting for navigation...');
+            logger.success('No error alert detected - waiting for navigation...');
 
             // Now wait for navigation (give it up to 20 seconds)
             try {
@@ -840,19 +841,19 @@ class PurchaseService {
                 gameUrl
               );
 
-              console.log('✅ Navigation detected - backup code accepted');
+              logger.success('Navigation detected - backup code accepted');
             } catch (navErr) {
               // Navigation timeout - check where we are
-              console.log('⏳ Navigation timeout - checking current URL...');
+              logger.debug('Navigation timeout - checking current URL...');
               const currentUrl = page.url();
 
               if (currentUrl.includes('/transaction/')) {
-                console.log('✅ Already on transaction page - backup code accepted');
+                logger.success('Already on transaction page - backup code accepted');
               } else if (currentUrl.includes(gameUrl)) {
-                console.error('❌ Still on game page after 20 seconds - backup code likely invalid');
+                logger.error('Still on game page after 20 seconds - backup code likely invalid');
                 throw new InvalidBackupCodeError('The backup code validation timed out. The code may be incorrect or expired. Please enter another valid backup code.');
               } else {
-                console.log('✅ Navigated to unknown page - continuing...');
+                logger.info('Navigated to unknown page - continuing...');
               }
             }
           } else {
@@ -863,11 +864,11 @@ class PurchaseService {
       }
       else if (checkoutResult.type === 'direct') {
         // No 2FA required - already on transaction page
-        console.log('✅ Skipping 2FA - already redirected to transaction page');
+        logger.success('Skipping 2FA - already redirected to transaction page');
       }
       else {
         // Unknown state - check current URL
-        console.log('⚠️ Unknown state after checkout, checking current URL...');
+        logger.warn('Unknown state after checkout, checking current URL...');
         const currentCheckUrl = page.url();
 
         if (!currentCheckUrl.includes('/transaction/') && !currentCheckUrl.includes(gameUrl)) {
@@ -876,14 +877,14 @@ class PurchaseService {
       }
 
       // Navigation successful - check where we landed
-      console.log('✅ Proceeding to check transaction result');
+      logger.success('Proceeding to check transaction result');
 
       const currentUrl = page.url();
-      console.log('📍 Current URL:', currentUrl);
+      logger.debug('Current URL:', currentUrl);
 
       // Check if redirected to reload page (insufficient balance)
       if (currentUrl.includes('/gold/reload')) {
-        console.error('❌ Redirected to reload page - insufficient Razer Gold balance');
+        logger.error('Redirected to reload page - insufficient Razer Gold balance');
         throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
       }
 
@@ -891,16 +892,16 @@ class PurchaseService {
       // Check if successful transaction page (URL contains /transaction/)
       if (currentUrl.includes('/transaction/')) {
         currentStage = this.STAGES.REACHED_TRANSACTION;
-        console.log(`📍 Stage: ${currentStage}`);
-        console.log('✅ Reached transaction page!');
+        logger.debug(`Stage: ${currentStage}`);
+        logger.success('Reached transaction page!');
 
         // Extract transaction ID from URL
         transactionId = currentUrl.split('/transaction/')[1];
-        console.log('🆔 Transaction ID:', transactionId);
+        logger.info('Transaction ID:', transactionId);
 
         // Check cancellation before proceeding to extraction
         if (checkCancellation && checkCancellation()) {
-          console.log('🛑 Order cancelled after reaching transaction page');
+          logger.warn('Order cancelled after reaching transaction page');
           const error = new Error('Order cancelled by user');
           error.transactionId = transactionId;
           throw error;
@@ -908,10 +909,10 @@ class PurchaseService {
 
         // STAGE 7: Extract PIN data
         currentStage = this.STAGES.EXTRACTING_DATA;
-        console.log(`📍 Stage: ${currentStage}`);
+        logger.debug(`Stage: ${currentStage}`);
 
         // Wait for the "Order processing..." page to finish
-        console.log('⏳ Waiting for order to complete processing...');
+        logger.debug('Waiting for order to complete processing...');
 
         try {
           // OPTIMIZATION: Reduced to 10s (safe because transaction ID already captured)
@@ -923,22 +924,22 @@ class PurchaseService {
             new Promise((resolve) => setTimeout(resolve, 10000))  // Fallback timeout
           ]);
 
-          console.log('✅ Order processing completed - "Congratulations!" page loaded');
+          logger.success('Order processing completed - "Congratulations!" page loaded');
         } catch (waitErr) {
-          console.log('⚠️ Timeout (10s) waiting for congratulations message, will try extraction anyway...');
+          logger.warn('Timeout (10s) waiting for congratulations message, will try extraction anyway...');
         }
 
         // Additional wait for PIN block to be visible with shorter timeout
         try {
           await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 5000 });
-          console.log('✅ PIN block is visible');
+          logger.success('PIN block is visible');
         } catch (pinWaitErr) {
-          console.log('⚠️ PIN block not found with selector, will try extraction anyway...');
+          logger.warn('PIN block not found with selector, will try extraction anyway...');
         }
 
 
         // Check transaction status from the page with 10-second timeout
-        console.log('🔍 Checking transaction status...');
+        logger.debug('Checking transaction status...');
 
         let statusCheck;
         try {
@@ -964,20 +965,20 @@ class PurchaseService {
             )
           ]);
         } catch (evalErr) {
-          console.log('⚠️ Error checking status:', evalErr.message);
+          logger.warn('Error checking status:', evalErr.message);
           statusCheck = { status: 'unknown', message: 'Error during status check' };
         }
 
-        console.log(`📊 Transaction Status: ${statusCheck.status} - ${statusCheck.message}`);
+        logger.info(`Transaction Status: ${statusCheck.status} - ${statusCheck.message}`);
 
         // If status is still unknown, assume success since we're on the transaction page
         if (statusCheck.status === 'unknown' || statusCheck.status === 'timeout') {
-          console.log('⚠️ Could not extract status clearly, but we are on transaction page');
+          logger.warn('Could not extract status clearly, but we are on transaction page');
           // Don't retry - just mark for manual verification
         }
 
         // Extract pin and serial from the success page
-        console.log('📄 Extracting purchase data from success page...');
+        logger.debug('Extracting purchase data from success page...');
 
         let purchaseData;
         try {
@@ -1027,7 +1028,7 @@ class PurchaseService {
             )
           ]);
         } catch (extractErr) {
-          console.error('⚠️ Error during extraction:', extractErr.message);
+          logger.error('Error during extraction:', extractErr.message);
           purchaseData = {
             pinCode: '',
             serial: '',
@@ -1054,8 +1055,8 @@ class PurchaseService {
         // SOLUTION #2: Don't throw error if extraction fails - mark as FAILED
         // Transaction ID is already saved, so no retry will happen
         if (!purchaseSuccess) {
-          console.error('⚠️ Could not extract PIN or Serial - marking as FAILED');
-          console.log(`📍 Stage: ${currentStage}`);
+          logger.error('Could not extract PIN or Serial - marking as FAILED');
+          logger.debug(`Stage: ${currentStage}`);
 
           // Return result with FAILED markers - user will check manually
           // NO DB SAVE - will be saved after sending to user
@@ -1071,10 +1072,10 @@ class PurchaseService {
           };
         }
 
-        console.log('✅ Transaction completed successfully!');
-        console.log(`📦 Product: ${purchaseData.productName}`);
-        console.log(`🆔 Transaction ID: ${finalTransactionId}`);
-        console.log(`📍 Stage: ${currentStage}`);
+        logger.success('Transaction completed successfully!');
+        logger.info(`Product: ${purchaseData.productName}`);
+        logger.info(`Transaction ID: ${finalTransactionId}`);
+        logger.debug(`Stage: ${currentStage}`);
         // 🔒 SECURITY: PIN and Serial not logged to console
 
         // Return data - NO DB SAVE yet, will be saved after sending to user
@@ -1091,13 +1092,13 @@ class PurchaseService {
       } else {
         // Not on transaction page - something went wrong BEFORE reaching transaction
         currentStage = this.STAGES.FAILED;
-        console.log(`📍 Stage: ${currentStage} - Did not reach transaction page`);
+        logger.debug(`Stage: ${currentStage} - Did not reach transaction page`);
         throw new Error(`Did not reach transaction page. Current URL: ${currentUrl}`);
       }
 
     } catch (err) {
-      console.error(`❌ Purchase failed at stage: ${currentStage}`);
-      console.error(`❌ Error: ${err.message}`);
+      logger.error(`Purchase failed at stage: ${currentStage}`);
+      logger.error(`Error: ${err.message}`);
 
       // Add stage information to error (NO DB SAVE - will be handled upstream)
       err.stage = currentStage;
@@ -1134,17 +1135,17 @@ class PurchaseService {
     let failedCount = 0;
     let backupCodeIndex = 0; // Track which backup code to use next
 
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`🎮 Starting bulk purchase: ${quantity} x ${cardName}`);
-    console.log(`   Backup Codes Available: ${backupCodes.length} codes`);
-    console.log(`${'='.repeat(60)}\n`);
+    logger.purchase(`\n${'='.repeat(60)}`);
+    logger.purchase(`Starting bulk purchase: ${quantity} x ${cardName}`);
+    logger.debug(`   Backup Codes Available: ${backupCodes.length} codes`);
+    logger.purchase(`${'='.repeat(60)}\n`);
 
     try {
       // SOLUTION #2: No retry - process each card once
       for (let i = 1; i <= quantity; i++) {
         // Check if order was cancelled
         if (checkCancellation && checkCancellation()) {
-          console.log('🛑 Order cancelled by user');
+          logger.warn('Order cancelled by user');
           const error = new Error('Order cancelled by user');
           error.purchases = purchases;  // Include what we have so far
           throw error;
@@ -1152,14 +1153,14 @@ class PurchaseService {
 
         // Check if we have backup codes available (in case more than 10 cards ordered)
         if (backupCodeIndex >= backupCodes.length) {
-          console.error(`❌ No more backup codes available (used ${backupCodeIndex}/${backupCodes.length})`);
+          logger.error(`No more backup codes available (used ${backupCodeIndex}/${backupCodes.length})`);
           const codeError = new Error('All backup codes have been used. Cannot process remaining cards.');
           codeError.purchases = purchases;
           throw codeError;
         }
 
-        console.log(`\n--- Processing Card ${i}/${quantity} ---`);
-        console.log(`   Using backup code ${backupCodeIndex + 1}/${backupCodes.length}`);
+        logger.purchase(`\n--- Processing Card ${i}/${quantity} ---`);
+        logger.debug(`   Using backup code ${backupCodeIndex + 1}/${backupCodes.length}`);
 
         try {
           const result = await this.completePurchase({
@@ -1176,30 +1177,30 @@ class PurchaseService {
 
           // Increment backup code index after successful purchase (code was used)
           backupCodeIndex++;
-          console.log(`   Backup code used successfully (${backupCodeIndex}/${backupCodes.length} used)`);
+          logger.debug(`   Backup code used successfully (${backupCodeIndex}/${backupCodes.length} used)`);
 
           purchases.push(result);
 
           if (result.success) {
             successCount++;
-            console.log(`✅ Card ${i}/${quantity} completed successfully!`);
-            console.log(`   Transaction ID: ${result.transactionId}`);
+            logger.success(`Card ${i}/${quantity} completed successfully!`);
+            logger.info(`   Transaction ID: ${result.transactionId}`);
             // 🔒 SECURITY: PIN and Serial not logged to console
 
             // IMMEDIATE DB SAVE: Save this card to database right now
             if (onCardCompleted) {
               try {
                 await onCardCompleted(result, i);
-                console.log(`   💾 Card ${i} saved to database immediately`);
+                logger.database(`   Card ${i} saved to database immediately`);
               } catch (saveErr) {
-                console.error(`   ⚠️ Failed to save card ${i} to database:`, saveErr.message);
+                logger.error(`   Failed to save card ${i} to database:`, saveErr.message);
               }
             }
           } else {
             failedCount++;
-            console.log(`⚠️ Card ${i}/${quantity} reached transaction page but extraction FAILED`);
-            console.log(`   Transaction ID: ${result.transactionId}`);
-            console.log(`   Status: Requires manual check on website`);
+            logger.warn(`Card ${i}/${quantity} reached transaction page but extraction FAILED`);
+            logger.info(`   Transaction ID: ${result.transactionId}`);
+            logger.warn(`   Status: Requires manual check on website`);
           }
 
           // Update progress after EVERY card (success or failed)
@@ -1207,33 +1208,33 @@ class PurchaseService {
             try {
               await onProgress(i, quantity);
             } catch (progressErr) {
-              console.log('⚠️ Progress callback error:', progressErr.message);
+              logger.debug('Progress callback error:', progressErr.message);
             }
           }
 
         } catch (err) {
           failedCount++;
-          console.error(`❌ Card ${i}/${quantity} failed at stage: ${err.stage || 'unknown'}`);
-          console.error(`   Error: ${err.message}`);
+          logger.error(`Card ${i}/${quantity} failed at stage: ${err.stage || 'unknown'}`);
+          logger.error(`   Error: ${err.message}`);
 
           // Only increment backup code if it was actually used (invalid code error)
           if (err instanceof InvalidBackupCodeError) {
             backupCodeIndex++;
-            console.log(`   Backup code was used but invalid (${backupCodeIndex}/${backupCodes.length} used)`);
+            logger.debug(`   Backup code was used but invalid (${backupCodeIndex}/${backupCodes.length} used)`);
           } else {
-            console.log(`   Backup code NOT consumed - error occurred before 2FA`);
+            logger.debug(`   Backup code NOT consumed - error occurred before 2FA`);
           }
 
           // Check if this is a cancellation error
           if (err.message && err.message.includes('cancelled by user')) {
-            console.log('🛑 Cancelling remaining cards...');
+            logger.warn('Cancelling remaining cards...');
             err.purchases = purchases;  // Include what we have so far
             throw err;
           }
 
           // Don't retry if it's insufficient balance
           if (err instanceof InsufficientBalanceError) {
-            console.error('💰 Insufficient balance - stopping all remaining purchases');
+            logger.error('Insufficient balance - stopping all remaining purchases');
             const balanceError = new Error('Insufficient Razer Gold balance');
             balanceError.purchases = purchases;
             throw balanceError;
@@ -1241,7 +1242,7 @@ class PurchaseService {
 
           // Don't retry if it's invalid backup code
           if (err instanceof InvalidBackupCodeError) {
-            console.error('🔑 Invalid backup code - stopping all remaining purchases');
+            logger.error('Invalid backup code - stopping all remaining purchases');
             const codeError = new Error('Invalid backup code');
             codeError.purchases = purchases;
             throw codeError;
@@ -1261,28 +1262,28 @@ class PurchaseService {
 
           purchases.push(failedPurchase);
 
-          console.log(`⏭️ Skipping to next card (no retry)`);
+          logger.debug(`Skipping to next card (no retry)`);
 
           // Update progress even for failed cards
           if (onProgress) {
             try {
               await onProgress(i, quantity);
             } catch (progressErr) {
-              console.log('⚠️ Progress callback error:', progressErr.message);
+              logger.debug('Progress callback error:', progressErr.message);
             }
           }
         }
       }
 
-      console.log(`\n${'='.repeat(60)}`);
-      console.log(`✅ All cards processed! Success: ${successCount}, Failed: ${failedCount}, Total: ${quantity}`);
-      console.log(`   Backup codes used: ${backupCodeIndex}/${backupCodes.length}`);
-      console.log(`${'='.repeat(60)}\n`);
+      logger.purchase(`\n${'='.repeat(60)}`);
+      logger.success(`All cards processed! Success: ${successCount}, Failed: ${failedCount}, Total: ${quantity}`);
+      logger.debug(`   Backup codes used: ${backupCodeIndex}/${backupCodes.length}`);
+      logger.purchase(`${'='.repeat(60)}\n`);
 
       return purchases;
 
     } catch (err) {
-      console.error('💥 Bulk purchase process stopped:', err.message);
+      logger.error('Bulk purchase process stopped:', err.message);
 
       // Always return what we have so far (even on error)
       if (err.purchases) {

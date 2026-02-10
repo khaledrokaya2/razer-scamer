@@ -1,4 +1,5 @@
 const BrowserManager = require('./BrowserManager');
+const logger = require('../utils/logger');
 
 /**
  * Service for verifying Razer transaction status by scraping transaction pages
@@ -18,7 +19,7 @@ class TransactionVerificationService {
     const url = `https://gold.razer.com/global/en/transaction/purchase/${transactionId}`;
 
     try {
-      console.log(`Verifying transaction: ${transactionId}`);
+      logger.http(`Verifying transaction: ${transactionId}`);
 
       // Navigate to transaction page
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
@@ -36,12 +37,12 @@ class TransactionVerificationService {
           return false;
         }, { timeout: 15000, polling: 100 });
 
-        console.log(`Transaction ${transactionId}: Status element loaded`);
+        logger.debug(`Transaction ${transactionId}: Status element loaded`);
 
         // Additional small wait for content to fully render
         await new Promise(resolve => setTimeout(resolve, 100));
       } catch (waitErr) {
-        console.log(`Transaction ${transactionId}: Timeout waiting for status element`);
+        logger.debug(`Transaction ${transactionId}: Timeout waiting for status element`);
         // Continue anyway and try to extract
       }
 
@@ -50,7 +51,7 @@ class TransactionVerificationService {
 
       // Check for loading error
       if (html.includes('Transaction Loading Error')) {
-        console.log(`Transaction ${transactionId}: Loading error detected`);
+        logger.warn(`Transaction ${transactionId}: Loading error detected`);
         return {
           success: false,
           status: 'failed',
@@ -60,7 +61,7 @@ class TransactionVerificationService {
 
       // Check if not logged in (redirected to login)
       if (html.includes('login-form') || page.url().includes('/login')) {
-        console.log(`Transaction ${transactionId}: Not logged in`);
+        logger.warn(`Transaction ${transactionId}: Not logged in`);
         return {
           success: false,
           status: 'failed',
@@ -75,12 +76,12 @@ class TransactionVerificationService {
 
       const statusMatch = html.match(/<p[^>]*class="text-uppercase mb-0">Status<\/p>\s*<p[^>]*class="text--brand">([^<]+)<\/p>/i);
       if (!statusMatch) {
-        console.log(`Transaction ${transactionId}: Could not find status in HTML`);
+        logger.debug(`Transaction ${transactionId}: Could not find status in HTML`);
 
         // Debug: Check what status-related content exists
         const debugMatch = html.match(/<p[^>]*class="text-uppercase mb-0">[^<]*status[^<]*<\/p>/gi);
         if (debugMatch) {
-          console.log(`   Found status labels:`, debugMatch);
+          logger.debug(`   Found status labels:`, debugMatch);
         }
 
         return {
@@ -91,7 +92,7 @@ class TransactionVerificationService {
       }
 
       const transactionStatus = statusMatch[1].trim();
-      console.log(`Transaction ${transactionId}: Status = ${transactionStatus}`);
+      logger.debug(`Transaction ${transactionId}: Status = ${transactionStatus}`);
 
       // Check if status is SUCCESS
       if (transactionStatus === 'SUCCESS') {
@@ -100,7 +101,7 @@ class TransactionVerificationService {
         const serialMatch = html.match(/<p[^>]*class="text-uppercase mb-0">Serial No\.<\/p>\s*<p[^>]*class="text--brand">([^<]+)<\/p>/i);
 
         if (!pinMatch || !serialMatch) {
-          console.log(`Transaction ${transactionId}: SUCCESS but could not extract PIN/Serial`);
+          logger.warn(`Transaction ${transactionId}: SUCCESS but could not extract PIN/Serial`);
           return {
             success: false,
             status: 'failed',
@@ -111,7 +112,7 @@ class TransactionVerificationService {
         const pin = pinMatch[1].trim();
         const serial = serialMatch[1].trim();
 
-        console.log(`Transaction ${transactionId}: SUCCESS - Data extracted`);
+        logger.success(`Transaction ${transactionId}: SUCCESS - Data extracted`);
         // 🔒 SECURITY: PIN and Serial not logged to console
         return {
           success: true,
@@ -121,7 +122,7 @@ class TransactionVerificationService {
         };
       } else {
         // Transaction failed (OUT_OF_STOCK, CANCELLED, etc.)
-        console.log(`Transaction ${transactionId}: Failed with status ${transactionStatus}`);
+        logger.warn(`Transaction ${transactionId}: Failed with status ${transactionStatus}`);
         return {
           success: false,
           status: 'failed',
@@ -129,7 +130,7 @@ class TransactionVerificationService {
         };
       }
     } catch (err) {
-      console.error(`Error verifying transaction ${transactionId}:`, err);
+      logger.error(`Error verifying transaction ${transactionId}:`, err);
       return {
         success: false,
         status: 'failed',
@@ -156,7 +157,7 @@ class TransactionVerificationService {
 
       // Check if verification was cancelled
       if (checkCancellation && checkCancellation()) {
-        console.log('🛑 Verification cancelled by user');
+        logger.order('Verification cancelled by user');
         const error = new Error('Verification cancelled by user');
         error.partialResults = results;
         throw error;
@@ -167,7 +168,7 @@ class TransactionVerificationService {
         try {
           await onProgress(current, total);
         } catch (err) {
-          console.log('⚠️ Progress callback error:', err.message);
+          logger.warn('Progress callback error:', err.message);
         }
       }
 

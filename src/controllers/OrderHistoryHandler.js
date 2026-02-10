@@ -8,6 +8,7 @@
 
 const databaseService = require('../services/DatabaseService');
 const encryptionService = require('../utils/encryption');
+const logger = require('../utils/logger');
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -15,6 +16,8 @@ class OrderHistoryHandler {
   constructor() {
     // Track current page for each user
     this.userPages = new Map(); // chatId -> currentPage (0-indexed)
+    // Track order history message IDs for deletion
+    this.historyMessages = new Map(); // chatId -> messageId
   }
 
   /**
@@ -117,13 +120,16 @@ class OrderHistoryHandler {
         buttons.push([{ text: '📥 Get PINs (TXT)', callback_data: `history_get_pins_${order.id}` }]);
       }
 
-      await bot.sendMessage(chatId, orderMessage, {
+      const historyMsg = await bot.sendMessage(chatId, orderMessage, {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: buttons }
       });
 
+      // Store message ID for later deletion
+      this.historyMessages.set(chatId, historyMsg.message_id);
+
     } catch (err) {
-      console.error('Error showing order history:', err);
+      logger.error('Error showing order history:', err);
       await bot.sendMessage(chatId,
         `❌ Error loading order history.\n\n` +
         `Please try again later.`,
@@ -139,6 +145,17 @@ class OrderHistoryHandler {
    * @param {string} telegramUserId - Telegram user ID
    */
   async handleNext(bot, chatId, telegramUserId) {
+    // Delete the previous history message
+    const historyMsgId = this.historyMessages.get(chatId);
+    if (historyMsgId) {
+      try {
+        await bot.deleteMessage(chatId, historyMsgId);
+        this.historyMessages.delete(chatId);
+      } catch (delErr) {
+        logger.debug('Could not delete history message');
+      }
+    }
+
     const currentPage = this.getCurrentPage(chatId);
     this.setCurrentPage(chatId, currentPage + 1);
     await this.showOrderHistory(bot, chatId, telegramUserId);
@@ -151,6 +168,17 @@ class OrderHistoryHandler {
    * @param {string} telegramUserId - Telegram user ID
    */
   async handlePrev(bot, chatId, telegramUserId) {
+    // Delete the previous history message
+    const historyMsgId = this.historyMessages.get(chatId);
+    if (historyMsgId) {
+      try {
+        await bot.deleteMessage(chatId, historyMsgId);
+        this.historyMessages.delete(chatId);
+      } catch (delErr) {
+        logger.debug('Could not delete history message');
+      }
+    }
+
     const currentPage = this.getCurrentPage(chatId);
     this.setCurrentPage(chatId, Math.max(0, currentPage - 1));
     await this.showOrderHistory(bot, chatId, telegramUserId);
@@ -199,7 +227,7 @@ class OrderHistoryHandler {
           const decryptedPin = encryptionService.decrypt(purchase.pin_encrypted);
           pins.push(decryptedPin);
         } catch (err) {
-          console.error(`Failed to decrypt PIN for purchase ${purchase.id}:`, err);
+          logger.error(`Failed to decrypt PIN for purchase ${purchase.id}:`, err);
           pins.push('DECRYPTION_FAILED');
         }
       }
@@ -216,7 +244,7 @@ class OrderHistoryHandler {
       try {
         await fs.mkdir(tempDir, { recursive: true });
       } catch (err) {
-        console.log('Temp directory already exists or created');
+        logger.debug('Temp directory already exists or created');
       }
 
       // Write file
@@ -236,11 +264,11 @@ class OrderHistoryHandler {
       try {
         await fs.unlink(filepath);
       } catch (err) {
-        console.log('Could not delete temp file:', filepath);
+        logger.warn('Could not delete temp file:', filepath);
       }
 
     } catch (err) {
-      console.error('Error generating PIN file:', err);
+      logger.error('Error generating PIN file:', err);
       await bot.sendMessage(chatId,
         `❌ Error generating PIN file.\n\n` +
         `Please try again later.`
@@ -254,6 +282,7 @@ class OrderHistoryHandler {
    */
   reset(chatId) {
     this.userPages.delete(chatId);
+    this.historyMessages.delete(chatId);
   }
 }
 

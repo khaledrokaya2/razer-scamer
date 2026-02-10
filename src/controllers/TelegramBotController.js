@@ -12,6 +12,7 @@ const sessionManager = require('../services/SessionManager');
 const scraperService = require('../services/RazerScraperService');
 const orderFlowHandler = require('./OrderFlowHandler');
 const orderHistoryHandler = require('./OrderHistoryHandler');
+const logger = require('../utils/logger');
 
 class TelegramBotController {
   constructor() {
@@ -52,7 +53,7 @@ class TelegramBotController {
     }
 
     this.bot = new TelegramBot(token, { polling: true });
-    console.log('🤖 Telegram bot initialized');
+    logger.bot('Telegram bot initialized');
 
     this.registerHandlers();
   }
@@ -113,9 +114,9 @@ class TelegramBotController {
     try {
       return await this.bot.sendMessage(chatId, text, options);
     } catch (err) {
-      console.error(`❌ Failed to send message to ${chatId}:`, err.message);
+      logger.error(`Failed to send message to ${chatId}:`, err.message);
       if (err.response && err.response.body && err.response.body.description) {
-        console.error(`   Telegram Error: ${err.response.body.description}`);
+        logger.error(`   Telegram Error: ${err.response.body.description}`);
       }
       return null;
     }
@@ -159,7 +160,7 @@ class TelegramBotController {
       // Show main menu
       await this.showMainMenu(chatId);
     } catch (err) {
-      console.error('Error in /start command:', err);
+      logger.error('Error in /start command:', err);
       this.bot.sendMessage(
         chatId,
         '❌ System Error. Please try again later.'
@@ -203,13 +204,13 @@ class TelegramBotController {
     // Prevent race conditions with state locking
     const lockKey = `${chatId}:${callbackData}`;
     if (this.processingCallbacks.has(lockKey)) {
-      console.log(`⚠️ Callback already processing: ${lockKey}`);
+      logger.bot(`Callback already processing: ${lockKey}`);
       try {
         await this.bot.answerCallbackQuery(query.id, {
           text: 'Please wait, processing your previous request...'
         });
       } catch (err) {
-        console.log('Could not answer duplicate callback');
+        logger.warn('Could not answer duplicate callback');
       }
       return;
     }
@@ -240,13 +241,13 @@ class TelegramBotController {
       await this.handleUserCallback(chatId, telegramUserId, callbackData, query.id);
 
     } catch (err) {
-      console.error('Error handling callback:', err);
+      logger.error('Error handling callback:', err);
       try {
         await this.bot.answerCallbackQuery(query.id, {
           text: 'An error occurred.'
         });
       } catch (answerErr) {
-        console.log('Could not answer callback query');
+        logger.warn('Could not answer callback query');
       }
     } finally {
       this.processingCallbacks.delete(lockKey);
@@ -265,7 +266,7 @@ class TelegramBotController {
     try {
       await this.bot.answerCallbackQuery(queryId);
     } catch (err) {
-      console.log('⚠️ Could not answer callback query');
+      logger.warn('Could not answer callback query');
     }
 
     try {
@@ -283,6 +284,10 @@ class TelegramBotController {
           await orderHistoryHandler.handlePrev(this.bot, chatId, telegramUserId);
           break;
 
+        case 'update_credentials_cancel':
+          await this.handleUpdateCredentialsCancel(chatId);
+          break;
+
         default:
           // Handle order history PIN retrieval
           if (callbackData.startsWith('history_get_pins_')) {
@@ -296,13 +301,6 @@ class TelegramBotController {
               return;
             }
 
-            // Delete the game menu message for cleaner UI
-            try {
-              await this.bot.deleteMessage(chatId, query.message.message_id);
-            } catch (err) {
-              console.log('Could not delete game menu message');
-            }
-
             const gameId = callbackData.replace('order_game_', '');
             await orderFlowHandler.handleGameSelection(this.bot, chatId, gameId, telegramUserId);
 
@@ -310,13 +308,6 @@ class TelegramBotController {
             if (!await this.ensureBrowserSession(null, chatId, telegramUserId)) {
               orderFlowHandler.clearSession(chatId);
               return;
-            }
-
-            // Delete the card menu message for cleaner UI
-            try {
-              await this.bot.deleteMessage(chatId, query.message.message_id);
-            } catch (err) {
-              console.log('Could not delete card menu message');
             }
 
             const parts = callbackData.replace('order_card_', '').split('_');
@@ -331,24 +322,17 @@ class TelegramBotController {
             await orderFlowHandler.handleCancelProcessing(this.bot, chatId);
 
           } else if (callbackData === 'order_back_to_games') {
-            // Delete the card menu message for cleaner UI
-            try {
-              await this.bot.deleteMessage(chatId, query.message.message_id);
-            } catch (err) {
-              console.log('Could not delete card menu message');
-            }
-
             await orderFlowHandler.handleBack(this.bot, chatId);
 
           } else if (callbackData === 'login') {
             await this.handleLoginButton(chatId, telegramUserId);
 
           } else {
-            console.log(`❓ Unknown callback: ${callbackData}`);
+            logger.warn(`Unknown callback: ${callbackData}`);
           }
       }
     } catch (err) {
-      console.error('Error in user callback:', err);
+      logger.error('Error in user callback:', err);
       await this.safeSendMessage(chatId, '❌ An error occurred. Please try again.');
     }
   }
@@ -384,7 +368,7 @@ class TelegramBotController {
             try {
               await this.bot.deleteMessage(chatId, loadingMessage.message_id);
             } catch (delErr) {
-              console.log('Could not delete loading message');
+              logger.warn('Could not delete loading message');
             }
           }
 
@@ -392,14 +376,14 @@ class TelegramBotController {
           return;
 
         } catch (loginErr) {
-          console.error('Auto-login failed:', loginErr);
+          logger.error('Auto-login failed:', loginErr);
 
           // Delete loading message
           if (loadingMessage) {
             try {
               await this.bot.deleteMessage(chatId, loadingMessage.message_id);
             } catch (delErr) {
-              console.log('Could not delete loading message');
+              logger.warn('Could not delete loading message');
             }
           }
 
@@ -427,7 +411,7 @@ class TelegramBotController {
       this.bot.sendMessage(chatId, '📧 Please enter your Razer account email:');
 
     } catch (err) {
-      console.error('Error in login button handler:', err);
+      logger.error('Error in login button handler:', err);
       await this.safeSendMessage(chatId, '❌ An error occurred. Please try again.');
     }
   }
@@ -465,7 +449,7 @@ class TelegramBotController {
       // Delete the loading message
       checkBalanceMessage.then(msg => {
         this.bot.deleteMessage(chatId, msg.message_id).catch(() => {
-          console.log('Could not delete loading message');
+          logger.warn('Could not delete loading message');
         });
       });
 
@@ -478,7 +462,7 @@ class TelegramBotController {
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
-      console.error('Balance check error:', err);
+      logger.error('Balance check error:', err);
       this.bot.sendMessage(
         chatId,
         '❌ Failed to get balance. Please try logging in again.',
@@ -532,6 +516,20 @@ class TelegramBotController {
       }
 
       if (text === '📋 Order History') {
+        // Delete previous history message if exists
+        const historyMsgId = orderHistoryHandler.historyMessages.get(chatId);
+        if (historyMsgId) {
+          try {
+            await this.bot.deleteMessage(chatId, historyMsgId);
+            orderHistoryHandler.historyMessages.delete(chatId);
+          } catch (delErr) {
+            logger.debug('Could not delete previous history message');
+          }
+        }
+
+        // Reset to first page (newest order)
+        orderHistoryHandler.setCurrentPage(chatId, 0);
+
         await orderHistoryHandler.showOrderHistory(this.bot, chatId, telegramUserId);
         return;
       }
@@ -571,7 +569,7 @@ class TelegramBotController {
         }
       }
     } catch (err) {
-      console.error('Error handling message:', err);
+      logger.error('Error handling message:', err);
     }
   }
 
@@ -594,7 +592,7 @@ class TelegramBotController {
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
-      console.error('Error during logout:', err);
+      logger.error('Error during logout:', err);
       await this.safeSendMessage(
         chatId,
         '❌ Error during logout. Please try again.'
@@ -615,13 +613,19 @@ class TelegramBotController {
     // Update session state to update credentials flow
     sessionManager.updateState(chatId, 'update_credentials_email');
 
-    // Ask for email
+    // Ask for email with cancel button
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '❌ Cancel', callback_data: 'update_credentials_cancel' }]
+      ]
+    };
+
     this.bot.sendMessage(
       chatId,
       '⚙️ **Update Credentials**\n\n' +
       'Please enter your Razer account email:\n\n' +
       '⚠️ Your credentials will be encrypted and stored securely.',
-      { parse_mode: 'Markdown' }
+      { parse_mode: 'Markdown', reply_markup: keyboard }
     );
   }
 
@@ -637,8 +641,37 @@ class TelegramBotController {
     // Update state
     sessionManager.updateState(chatId, 'update_credentials_password');
 
-    // Ask for password
-    this.bot.sendMessage(chatId, '🔑 Please enter your Razer account password:');
+    // Ask for password with cancel button
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '❌ Cancel', callback_data: 'update_credentials_cancel' }]
+      ]
+    };
+
+    this.bot.sendMessage(
+      chatId,
+      '🔑 Please enter your Razer account password:',
+      { reply_markup: keyboard }
+    );
+  }
+
+  /**
+   * Handle update credentials cancellation
+   * @param {string} chatId - Chat ID
+   */
+  async handleUpdateCredentialsCancel(chatId) {
+    // Clear credentials from session
+    sessionManager.clearCredentials(chatId);
+
+    // Reset session state
+    sessionManager.updateState(chatId, 'idle');
+
+    await this.safeSendMessage(
+      chatId,
+      '❌ **Credential Update Cancelled**\n\n' +
+      'The credential update process has been cancelled.',
+      { parse_mode: 'Markdown' }
+    );
   }
 
   /**
@@ -679,7 +712,7 @@ class TelegramBotController {
       );
 
     } catch (err) {
-      console.error('Error saving credentials:', err);
+      logger.error('Error saving credentials:', err);
 
       // Clear credentials on error
       sessionManager.clearCredentials(chatId);
@@ -738,9 +771,9 @@ class TelegramBotController {
         const emailEncrypted = encryptionService.encrypt(session.email);
         const passwordEncrypted = encryptionService.encrypt(session.password);
         await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
-        console.log(`✅ Saved encrypted credentials for user ${telegramUserId}`);
+        logger.success(`Saved encrypted credentials for user ${telegramUserId}`);
       } catch (saveErr) {
-        console.error('Failed to save credentials (login still successful):', saveErr);
+        logger.error('Failed to save credentials (login still successful):', saveErr);
         // Continue anyway - login was successful
       }
 
@@ -755,7 +788,7 @@ class TelegramBotController {
         try {
           await this.bot.deleteMessage(chatId, logginMessage.message_id);
         } catch (delErr) {
-          console.log('Could not delete loading message');
+          logger.warn('Could not delete loading message');
         }
       }
       await this.safeSendMessage(
@@ -765,7 +798,7 @@ class TelegramBotController {
       );
 
     } catch (err) {
-      console.error('Login error:', err);
+      logger.error('Login error:', err);
 
       // Clear credentials on error
       sessionManager.clearCredentials(chatId);
@@ -791,7 +824,7 @@ class TelegramBotController {
    * Start the bot
    */
   start() {
-    console.log('🚀 Telegram bot is running...');
+    logger.bot('Telegram bot is running...');
   }
 
   /**
@@ -800,7 +833,7 @@ class TelegramBotController {
   async stop() {
     if (this.bot) {
       await this.bot.stopPolling();
-      console.log('🛑 Telegram bot stopped');
+      logger.bot('Telegram bot stopped');
     }
   }
 }

@@ -11,6 +11,7 @@
  */
 
 const browserManager = require('./BrowserManager');
+const logger = require('../utils/logger');
 
 class RazerScraperService {
   constructor() {
@@ -36,21 +37,21 @@ class RazerScraperService {
 
     try {
       // Navigate to Razer login page
-      console.log('🔗 Opening Razer login page...');
+      logger.http('Opening Razer login page...');
       await page.goto(this.LOGIN_URL, { waitUntil: 'networkidle2' });
 
       // Wait for email and password input fields to appear
-      console.log('⏳ Waiting for login form...');
+      logger.info('Waiting for login form...');
       await page.waitForSelector('#input-login-email', { visible: true, timeout: 20000 });
       await page.waitForSelector('#input-login-password', { visible: true, timeout: 20000 });
 
       // Type credentials into the form (delay simulates human typing)
-      console.log('✍️ Typing credentials...');
+      logger.info('Typing credentials...');
       await page.type('#input-login-email', email, { delay: 50 });
       await page.type('#input-login-password', password, { delay: 50 });
 
       // Click submit button and wait for navigation to complete
-      console.log('🔓 Submitting login form...');
+      logger.info('Submitting login form...');
       const submitButton = await page.$('button[type="submit"]');
       const innerHTML = await page.evaluate(el => el.innerHTML, submitButton);
       if (innerHTML !== "LOG IN")
@@ -63,7 +64,7 @@ class RazerScraperService {
       // Verify login success by checking if we're on the dashboard
       const currentUrl = page.url();
       if (currentUrl !== "https://razerid.razer.com" && currentUrl !== "https://razerid.razer.com/") {
-        console.log('✅ Login successful!');
+        logger.success('Login successful!');
         browserManager.updateActivity(userId);
         return { browser, page };
       } else {
@@ -72,7 +73,7 @@ class RazerScraperService {
       }
     } catch (err) {
       // Don't close browser on error - let user retry
-      console.error('❌ Login error:', err.message);
+      logger.error('Login error:', err.message);
       throw err;
     }
   }
@@ -88,11 +89,11 @@ class RazerScraperService {
   async getBalance(userId, page) {
     try {
       // Navigate to dashboard page
-      console.log('🛍️ Navigating to dashboard...');
+      logger.http('Navigating to dashboard...');
       await page.goto(this.DASHBOARD_URL, { waitUntil: 'networkidle2' });
 
       // Wait for balance elements to appear on the page
-      console.log('📦 Waiting for balance elements...');
+      logger.info('Waiting for balance elements...');
       await page.waitForSelector('.info-balance', { visible: true, timeout: 20000 });
 
       // Extract balance data from the page
@@ -106,11 +107,11 @@ class RazerScraperService {
         };
       });
 
-      console.log('✅ Balance retrieved:', balance);
+      logger.success('Balance retrieved:', balance);
       browserManager.updateActivity(userId);
       return balance;
     } catch (err) {
-      console.error('❌ Failed to get balance:', err.message);
+      logger.error('Failed to get balance:', err.message);
       throw new Error('Failed to retrieve balance from dashboard');
     }
   }

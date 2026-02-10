@@ -7,6 +7,7 @@
 
 const databaseService = require('./DatabaseService');
 const purchaseService = require('./PurchaseService');
+const logger = require('../utils/logger');
 
 class OrderService {
   constructor() {
@@ -48,8 +49,8 @@ class OrderService {
       }
 
       if (cleaned > 0 || skipped > 0) {
-        console.log(`🧹 Cleanup: ${cleaned} old orders removed, ${skipped} active orders skipped`);
-        console.log(`📊 Memory: ${this.orderPins.size} orders, ${this.activeOrders.size} active`);
+        logger.order(`Cleanup: ${cleaned} old orders removed, ${skipped} active orders skipped`);
+        logger.order(`Memory: ${this.orderPins.size} orders, ${this.activeOrders.size} active`);
       }
     }, 15 * 60 * 1000); // OPTIMIZATION: Check every 15 minutes (faster cleanup)
   }
@@ -61,7 +62,7 @@ class OrderService {
    */
   async createOrderSimple({ telegramUserId, gameName, cardName, cardsCount }) {
     try {
-      console.log('📝 Creating order in database...');
+      logger.order('Creating order in database...');
 
       const order = await databaseService.createOrder(
         telegramUserId,  // Pass telegram user ID directly
@@ -76,11 +77,11 @@ class OrderService {
         timestamp: Date.now()
       });
 
-      console.log(`✅ Order created: ID ${order.id}`);
+      logger.success(`Order created: ID ${order.id}`);
       return order;
 
     } catch (err) {
-      console.error('❌ Error creating order:', err);
+      logger.error('Error creating order:', err);
       throw err;
     }
   }
@@ -114,15 +115,15 @@ class OrderService {
 
       // CONCURRENCY FIX: Mark order as active to prevent cleanup
       this.activeOrders.add(order.id);
-      console.log(`🔒 Order ${order.id} marked as active (total active: ${this.activeOrders.size})`);
+      logger.order(`Order ${order.id} marked as active (total active: ${this.activeOrders.size})`);
 
-      console.log(`\n${'='.repeat(60)}`);
-      console.log(`📦 Processing Order #${order.id}`);
-      console.log(`   Game: ${gameName}`);
-      console.log(`   Card: ${cardName}`);
-      console.log(`   Quantity: ${quantity}`);
-      console.log(`   Backup Codes: ${backupCodes.length} codes provided`);
-      console.log(`${'='.repeat(60)}\n`);
+      logger.order(`\n${'='.repeat(60)}`);
+      logger.order(`Processing Order #${order.id}`);
+      logger.order(`   Game: ${gameName}`);
+      logger.order(`   Card: ${cardName}`);
+      logger.order(`   Quantity: ${quantity}`);
+      logger.order(`   Backup Codes: ${backupCodes.length} codes provided`);
+      logger.order(`${'='.repeat(60)}\n`);
 
       // Step 2: Process purchases with IMMEDIATE database save after each card
       const purchases = await purchaseService.processBulkPurchases({
@@ -150,7 +151,7 @@ class OrderService {
 
             // 2. Increment order progress in database
             const updatedOrder = await databaseService.incrementOrderProgress(order.id);
-            console.log(`   📊 Order progress: ${updatedOrder.completed_purchases}/${updatedOrder.cards_count}`);
+            logger.order(`   Order progress: ${updatedOrder.completed_purchases}/${updatedOrder.cards_count}`);
 
             // 3. Store in memory for later sending to user
             const orderData = this.orderPins.get(order.id);
@@ -166,7 +167,7 @@ class OrderService {
               });
             }
           } catch (dbErr) {
-            console.error(`   ❌ Failed to save card ${cardNumber} to database:`, dbErr.message);
+            logger.error(`Failed to save card ${cardNumber} to database:`, dbErr.message);
             // Don't throw - continue processing remaining cards
           }
         }
@@ -199,13 +200,13 @@ class OrderService {
       // Get final order state
       order = await databaseService.getOrderById(order.id);
 
-      console.log(`\n✅ Order #${order.id} completed successfully!`);
-      console.log(`   Total purchases: ${order.completed_purchases}/${order.cards_count}`);
-      console.log(`   Status: ${order.status}`);
+      logger.success(`Order #${order.id} completed successfully!`);
+      logger.order(`   Total purchases: ${order.completed_purchases}/${order.cards_count}`);
+      logger.order(`   Status: ${order.status}`);
 
       // CONCURRENCY FIX: Remove from active orders after completion
       this.activeOrders.delete(order.id);
-      console.log(`🔓 Order ${order.id} marked as inactive (total active: ${this.activeOrders.size})`);
+      logger.order(`Order ${order.id} marked as inactive (total active: ${this.activeOrders.size})`);
 
       return {
         order,
@@ -213,17 +214,17 @@ class OrderService {
       };
 
     } catch (err) {
-      console.error('❌ Order processing failed:', err.message);
+      logger.error('Order processing failed:', err.message);
 
       // CONCURRENCY FIX: Remove from active orders on ANY error
       if (order) {
         this.activeOrders.delete(order.id);
-        console.log(`🔓 Order ${order.id} marked as inactive after error (total active: ${this.activeOrders.size})`);
+        logger.order(`Order ${order.id} marked as inactive after error (total active: ${this.activeOrders.size})`);
       }
 
       // Handle cancellation - save what we have and return partial results
       if (err.message && err.message.includes('cancelled by user')) {
-        console.log('🛑 Processing cancellation - returning partial order...');
+        logger.order('Processing cancellation - returning partial order...');
 
         if (order && err.purchases && err.purchases.length > 0) {
           // NOTE: Successful purchases already saved to database immediately during processing
@@ -245,7 +246,7 @@ class OrderService {
           await databaseService.updateOrderStatus(order.id, 'completed');
           order = await databaseService.getOrderById(order.id);
 
-          console.log(`✅ Partial order saved: ${order.completed_purchases}/${order.cards_count} cards`);
+          logger.success(`Partial order saved: ${order.completed_purchases}/${order.cards_count} cards`);
 
           // Return partial results
           err.partialOrder = {
@@ -255,7 +256,7 @@ class OrderService {
         } else if (order) {
           // No purchases completed, just mark as failed
           await databaseService.updateOrderStatus(order.id, 'failed');
-          console.log(`🛑 Order #${order.id} cancelled with no completed purchases`);
+          logger.order(`Order #${order.id} cancelled with no completed purchases`);
         }
 
         throw err;
@@ -298,8 +299,8 @@ class OrderService {
   clearOrderPins(orderId) {
     const deleted = this.orderPins.delete(orderId);
     if (deleted) {
-      console.log(`🗑️ Cleared pins from memory for order ${orderId}`);
-      console.log(`📊 Memory: ${this.orderPins.size} orders remaining`);
+      logger.order(`Cleared pins from memory for order ${orderId}`);
+      logger.order(`Memory: ${this.orderPins.size} orders remaining`);
     }
   }
 }

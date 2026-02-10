@@ -7,6 +7,8 @@
  * No database, no caching - just whitelist validation
  */
 
+const logger = require('../utils/logger');
+
 class AuthorizationService {
   constructor() {
     this.authorizedUserIds = new Set();
@@ -22,8 +24,8 @@ class AuthorizationService {
     const userIdsString = process.env.AUTHORIZED_USER_IDS || '';
 
     if (!userIdsString) {
-      console.warn('⚠️ WARNING: No AUTHORIZED_USER_IDS set in .env file!');
-      console.warn('⚠️ No users will be able to access the bot.');
+      logger.warn('WARNING: No AUTHORIZED_USER_IDS set in .env file!');
+      logger.warn('No users will be able to access the bot.');
       return;
     }
 
@@ -31,14 +33,14 @@ class AuthorizationService {
     const userIds = userIdsString.split(',').map(id => id.trim()).filter(id => id.length > 0);
 
     this.authorizedUserIds = new Set(userIds);
-    console.log(`✅ Loaded ${this.authorizedUserIds.size} authorized user(s) from .env`);
+    logger.success(`Loaded ${this.authorizedUserIds.size} authorized user(s) from .env`);
   }
 
   /**
    * Initialize the authorization service (no-op for compatibility)
    */
   async initialize() {
-    console.log('🔐 Authorization service initialized with whitelist');
+    logger.system('Authorization service initialized with whitelist');
   }
 
   /**
@@ -66,13 +68,13 @@ class AuthorizationService {
     this.authCache.set(userIdStr, isAuthorized);
 
     if (isAuthorized) {
-      console.log(`🔍 Authorization check for ${telegramUserId}: ALLOWED`);
+      logger.debug(`Authorization check for ${telegramUserId}: ALLOWED`);
       return {
         authorized: true,
         reason: 'Authorized'
       };
     } else {
-      console.log(`🔍 Authorization check for ${telegramUserId}: DENIED (not in whitelist)`);
+      logger.warn(`Authorization check for ${telegramUserId}: DENIED (not in whitelist)`);
       return {
         authorized: false,
         reason: 'User not in authorized list'

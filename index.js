@@ -13,63 +13,113 @@
 // Load environment variables from .env file
 require('dotenv').config();
 
+// Import logger
+const logger = require('./src/utils/logger');
+
 // Import services and controllers
 const authService = require('./src/services/AuthorizationService');
 const botController = require('./src/controllers/TelegramBotController');
+
+/**
+ * Get environment-specific configuration
+ * Returns bot token and database config based on NODE_ENV
+ */
+function getEnvironmentConfig() {
+  const env = process.env.NODE_ENV || 'development';
+  const isDevelopment = env === 'development';
+
+  return {
+    environment: env,
+    isDevelopment,
+    botToken: isDevelopment
+      ? process.env.TELEGRAM_TEST_BOT_TOKEN
+      : process.env.TELEGRAM_BOT_TOKEN,
+    dbConnectionString: isDevelopment
+      ? process.env.TEST_DB_CONNECTION_STRING
+      : process.env.DB_CONNECTION_STRING,
+    dbServer: isDevelopment
+      ? process.env.TEST_DB_SERVER
+      : process.env.DB_SERVER,
+    dbName: isDevelopment
+      ? process.env.TEST_DB_NAME
+      : process.env.DB_NAME
+  };
+}
 
 /**
  * Validates required environment variables
  * Exits the process if critical variables are missing
  */
 function validateEnvironment() {
-  const requiredVars = ['TELEGRAM_BOT_TOKEN'];
-  const missing = requiredVars.filter(varName => !process.env[varName]);
+  const config = getEnvironmentConfig();
+  const errors = [];
 
-  if (missing.length > 0) {
-    console.error('❌ Missing required environment variables:', missing.join(', '));
-    console.error('Please check your .env file');
+  // Check bot token
+  if (!config.botToken) {
+    const envVar = config.isDevelopment ? 'TELEGRAM_TEST_BOT_TOKEN' : 'TELEGRAM_BOT_TOKEN';
+    errors.push(`${envVar} (required for ${config.environment} environment)`);
+  }
+
+  // Check database config (either connection string or individual params)
+  const hasConnectionString = !!config.dbConnectionString;
+  const hasIndividualParams = config.dbServer && config.dbName;
+
+  if (!hasConnectionString && !hasIndividualParams) {
+    const prefix = config.isDevelopment ? 'TEST_DB' : 'DB';
+    errors.push(`Either ${prefix}_CONNECTION_STRING or both ${prefix}_SERVER and ${prefix}_NAME`);
+  }
+
+  if (errors.length > 0) {
+    logger.error('Missing required environment variables:');
+    errors.forEach(err => logger.error(`  - ${err}`));
+    logger.error('Please check your .env file');
     process.exit(1);
   }
+
+  return config;
 }
 
 /**
  * Initialize all services with configuration
  */
-async function initializeServices() {
-  console.log('🔧 Initializing services...');
+async function initializeServices(config) {
+  logger.system('Initializing services...');
 
   // Initialize authorization service (whitelist check only - no database)
   await authService.initialize();
 
-  // Initialize Telegram bot controller with bot token
-  botController.initialize(process.env.TELEGRAM_BOT_TOKEN);
+  // Initialize Telegram bot controller with environment-specific bot token
+  const botType = config.isDevelopment ? 'TEST' : 'PRODUCTION';
+  logger.bot(`Starting ${botType} bot...`);
+  botController.initialize(config.botToken);
 
-  console.log('✅ All services initialized');
+  logger.success('All services initialized');
 }
 
 /**
  * Starts the application
  */
 async function startApplication() {
-  console.log('');
-  console.log('╔════════════════════════════════════╗');
-  console.log('║   Razer Scraper Telegram Bot       ║');
-  console.log('╚════════════════════════════════════╝');
-  console.log('');
+  logger.header('Razer Scraper Telegram Bot');
 
-  // Validate environment configuration
-  validateEnvironment();
+  // Validate environment configuration and get config
+  const config = validateEnvironment();
+
+  // Set database environment config for DatabaseService
+  process.env.DB_CONNECTION_STRING = config.dbConnectionString;
+  process.env.DB_SERVER = config.dbServer;
+  process.env.DB_NAME = config.dbName;
 
   // Initialize all services
-  await initializeServices();
+  await initializeServices(config);
 
   // Start the bot
   botController.start();
 
-  console.log('');
-  console.log('✨ Bot is ready to accept commands!');
-  console.log('📝 Users can start interacting with /start command');
-  console.log('');
+  logger.separator();
+  logger.success('Bot is ready to accept commands!');
+  logger.info('Users can start interacting with /start command');
+  logger.separator();
 }
 
 /**
@@ -77,17 +127,17 @@ async function startApplication() {
  * Ensures proper cleanup when the application is stopped
  */
 async function handleShutdown() {
-  console.log('');
-  console.log('🛑 Shutting down gracefully...');
+  logger.separator();
+  logger.system('Shutting down gracefully...');
 
   try {
     // Stop the bot
     await botController.stop();
 
-    console.log('✅ Shutdown complete');
+    logger.success('Shutdown complete');
     process.exit(0);
   } catch (err) {
-    console.error('❌ Error during shutdown:', err);
+    logger.error('Error during shutdown:', err);
     process.exit(1);
   }
 }
@@ -98,12 +148,12 @@ process.on('SIGTERM', handleShutdown); // Kill command
 
 // Handle uncaught errors
 process.on('uncaughtException', (err) => {
-  console.error('💥 Uncaught Exception:', err);
+  logger.error('Uncaught Exception:', err);
   handleShutdown();
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+  logger.error('Unhandled Rejection:', reason);
   handleShutdown();
 });
 

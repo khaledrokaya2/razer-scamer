@@ -6,6 +6,7 @@
  */
 
 const crypto = require('crypto');
+const logger = require('./logger');
 
 class EncryptionService {
   constructor() {
@@ -30,7 +31,7 @@ class EncryptionService {
     }
 
     // Generate a random key for development (WARNING: Don't use in production)
-    console.warn('⚠️ WARNING: No ENCRYPTION_KEY set in .env, using random key (data will not persist across restarts)');
+    logger.warn('WARNING: No ENCRYPTION_KEY set in .env, using random key (data will not persist across restarts)');
     return crypto.randomBytes(32);
   }
 
@@ -56,7 +57,7 @@ class EncryptionService {
       // Return IV + encrypted data (both as hex, separated by :)
       return `${iv.toString('hex')}:${encrypted}`;
     } catch (err) {
-      console.error('Encryption error:', err);
+      logger.error('Encryption error:', err);
       throw new Error('Failed to encrypt data');
     }
   }
@@ -88,7 +89,7 @@ class EncryptionService {
 
       return decrypted;
     } catch (err) {
-      console.error('Decryption error:', err);
+      logger.error('Decryption error:', err);
       throw new Error('Failed to decrypt data');
     }
   }

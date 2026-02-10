@@ -12,6 +12,7 @@
 const { getAllGames, getGameById } = require('../config/games-catalog');
 const purchaseService = require('../services/PurchaseService');
 const orderService = require('../services/OrderService');
+const logger = require('../utils/logger');
 
 class OrderFlowHandler {
   constructor() {
@@ -25,6 +26,10 @@ class OrderFlowHandler {
     this.cancellingMessages = new Map(); // chatId -> messageId
     // Track order summary message IDs for deletion
     this.orderSummaryMessages = new Map(); // chatId -> messageId
+    // Track game menu message IDs for deletion
+    this.gameMenuMessages = new Map(); // chatId -> messageId
+    // Track card menu message IDs for deletion
+    this.cardMenuMessages = new Map(); // chatId -> messageId
 
     // Session timeout and cleanup for memory optimization
     this.SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
@@ -65,7 +70,7 @@ class OrderFlowHandler {
       }
 
       if (cleaned > 0) {
-        console.log(`🧹 OrderFlow cleanup: ${cleaned} old sessions removed`);
+        logger.order(`OrderFlow cleanup: ${cleaned} old sessions removed`);
       }
     }, 10 * 60 * 1000); // Check every 10 minutes
   }
@@ -120,12 +125,12 @@ class OrderFlowHandler {
     const errorMessage = error.message || '';
 
     // Log full error details for debugging
-    console.error('🔍 Full error details for debugging:');
-    console.error('Error name:', error.name);
-    console.error('Error message:', errorMessage);
-    console.error('Error stack:', error.stack);
-    if (error.code) console.error('Error code:', error.code);
-    if (error.number) console.error('SQL Error number:', error.number);
+    logger.error('🔍 Full error details for debugging:');
+    logger.error('Error name:', error.name);
+    logger.error('Error message:', errorMessage);
+    logger.error('Error stack:', error.stack);
+    if (error.code) logger.error('Error code:', error.code);
+    if (error.number) logger.error('SQL Error number:', error.number);
 
     if (errorMessage.includes('Invalid backup code') || errorMessage.includes('incorrect')) {
       return `❌ *ERROR*     \n` +
@@ -278,6 +283,8 @@ class OrderFlowHandler {
    */
   clearSession(chatId) {
     this.orderSessions.delete(chatId);
+    this.gameMenuMessages.delete(chatId);
+    this.cardMenuMessages.delete(chatId);
   }
 
   /**
@@ -312,7 +319,7 @@ class OrderFlowHandler {
     keyboard.push([{ text: '❌ Cancel Order', callback_data: 'order_cancel' }]);
 
     try {
-      await bot.sendMessage(chatId,
+      const gameMenuMsg = await bot.sendMessage(chatId,
         `🎮 *SELECT GAME*    \n` +
         `Choose the game you want:\n`,
         {
@@ -320,8 +327,10 @@ class OrderFlowHandler {
           reply_markup: { inline_keyboard: keyboard }
         }
       );
+      // Store message ID for later deletion
+      this.gameMenuMessages.set(chatId, gameMenuMsg.message_id);
     } catch (err) {
-      console.error('Error showing game selection:', err);
+      logger.error('Error showing game selection:', err);
     }
   }
 
@@ -331,10 +340,52 @@ class OrderFlowHandler {
    * @param {number} chatId - Chat ID
    */
   async handleCancel(bot, chatId) {
+    // Delete game menu message if exists
+    const gameMenuMsgId = this.gameMenuMessages.get(chatId);
+    if (gameMenuMsgId) {
+      try {
+        await bot.deleteMessage(chatId, gameMenuMsgId);
+      } catch (delErr) {
+        logger.debug('Could not delete game menu message');
+      }
+    }
+
+    // Delete card menu message if exists
+    const cardMenuMsgId = this.cardMenuMessages.get(chatId);
+    if (cardMenuMsgId) {
+      try {
+        await bot.deleteMessage(chatId, cardMenuMsgId);
+      } catch (delErr) {
+        logger.debug('Could not delete card menu message');
+      }
+    }
+
+    // Delete order summary message if exists
+    const summaryMsgId = this.orderSummaryMessages.get(chatId);
+    if (summaryMsgId) {
+      try {
+        await bot.deleteMessage(chatId, summaryMsgId);
+      } catch (delErr) {
+        logger.debug('Could not delete order summary message');
+      }
+    }
+
+    // Delete progress message if exists
+    const progressMsgId = this.progressMessages.get(chatId);
+    if (progressMsgId) {
+      try {
+        await bot.deleteMessage(chatId, progressMsgId);
+      } catch (delErr) {
+        logger.debug('Could not delete progress message');
+      }
+    }
+
+    // Now clear session and maps
     this.clearSession(chatId);
     this.clearCancellation(chatId);
     this.progressMessages.delete(chatId);
     this.orderSummaryMessages.delete(chatId);
+
     try {
       await bot.sendMessage(chatId,
         `❌ *ORDER CANCELLED*   \n` +
@@ -342,7 +393,7 @@ class OrderFlowHandler {
         `Use /start to create a new order.`
         , { parse_mode: 'Markdown' });
     } catch (err) {
-      console.error('Error sending cancel message:', err);
+      logger.error('Error sending cancel message:', err);
     }
   }
 
@@ -369,7 +420,7 @@ class OrderFlowHandler {
       // Store message ID for later deletion
       this.cancellingMessages.set(chatId, cancelMsg.message_id);
     } catch (err) {
-      console.error('Error sending cancelling message:', err);
+      logger.error('Error sending cancelling message:', err);
     }
   }
 
@@ -379,6 +430,17 @@ class OrderFlowHandler {
    * @param {number} chatId - Chat ID
    */
   async handleBack(bot, chatId) {
+    // Delete the card menu message before showing games
+    const cardMenuMsgId = this.cardMenuMessages.get(chatId);
+    if (cardMenuMsgId) {
+      try {
+        await bot.deleteMessage(chatId, cardMenuMsgId);
+        this.cardMenuMessages.delete(chatId);
+      } catch (delErr) {
+        logger.debug('Could not delete card menu message');
+      }
+    }
+
     const session = this.getSession(chatId);
     if (session) {
       session.step = 'select_game';
@@ -399,17 +461,17 @@ class OrderFlowHandler {
    * @param {string} telegramUserId - Telegram user ID
    */
   async handleGameSelection(bot, chatId, gameId, telegramUserId) {
-    console.log(`🎮 Game selected: ${gameId} for chat ${chatId}`);
+    logger.order(`Game selected: ${gameId} for chat ${chatId}`);
 
     const game = getGameById(gameId);
 
     if (!game) {
-      console.error(`❌ Invalid game ID: ${gameId}`);
+      logger.error(`Invalid game ID: ${gameId}`);
       await bot.sendMessage(chatId, '❌ Invalid game selection');
       return;
     }
 
-    console.log(`✅ Game found: ${game.name}`);
+    logger.info(`Game found: ${game.name}`);
 
     // Update session
     this.updateSession(chatId, {
@@ -431,18 +493,29 @@ class OrderFlowHandler {
     );
 
     try {
-      console.log(`🔍 Scraping cards from: ${game.link}`);
+      logger.http(`Scraping cards from: ${game.link}`);
 
       // Get available cards from Razer (use telegramUserId)
       const cards = await purchaseService.getAvailableCards(telegramUserId, game.link);
 
-      console.log(`✅ Found ${cards.length} cards`);
+      logger.success(`Found ${cards.length} cards`);
+
+      // Delete the game menu message before showing cards
+      const gameMenuMsgId = this.gameMenuMessages.get(chatId);
+      if (gameMenuMsgId) {
+        try {
+          await bot.deleteMessage(chatId, gameMenuMsgId);
+          this.gameMenuMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete game menu message');
+        }
+      }
 
       // PERFORMANCE FIX #7: Better error handling around message deletion
       try {
         await bot.deleteMessage(chatId, loadingMsg.message_id);
       } catch (delErr) {
-        console.log('⚠️ Could not delete loading message (may already be deleted)');
+        logger.debug('Could not delete loading message (may already be deleted)');
       }
 
       // Create keyboard with card options
@@ -459,7 +532,7 @@ class OrderFlowHandler {
         { text: '❌ Cancel', callback_data: 'order_cancel' }
       ]);
 
-      await bot.sendMessage(chatId,
+      const cardMenuMsg = await bot.sendMessage(chatId,
         `💎 *SELECT CARD VALUE* \n` +
         `🎮 *Game:* ${game.name}\n\n` +
         `Choose a card denomination:\n\n` +
@@ -471,16 +544,18 @@ class OrderFlowHandler {
           reply_markup: { inline_keyboard: keyboard }
         }
       );
+      // Store message ID for later deletion
+      this.cardMenuMessages.set(chatId, cardMenuMsg.message_id);
 
     } catch (err) {
-      console.error(`❌ Error loading cards for ${game.name}:`, err.message);
-      console.error(err.stack);
+      logger.error(`Error loading cards for ${game.name}:`, err.message);
+      logger.error(err.stack);
 
       // PERFORMANCE FIX #7: Safe message deletion
       try {
         await bot.deleteMessage(chatId, loadingMsg.message_id);
       } catch (delErr) {
-        console.log('⚠️ Could not delete loading message');
+        logger.debug('Could not delete loading message');
       }
 
       await bot.sendMessage(chatId,
@@ -515,7 +590,7 @@ class OrderFlowHandler {
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
-        console.error('Error sending session expired message:', err);
+        logger.error('Error sending session expired message:', err);
       }
       return;
     }
@@ -526,6 +601,17 @@ class OrderFlowHandler {
       cardIndex: parseInt(cardIndex),
       cardName: cardName.replace(/_/g, ' ')
     });
+
+    // Delete the card menu message
+    const cardMenuMsgId = this.cardMenuMessages.get(chatId);
+    if (cardMenuMsgId) {
+      try {
+        await bot.deleteMessage(chatId, cardMenuMsgId);
+        this.cardMenuMessages.delete(chatId);
+      } catch (delErr) {
+        logger.debug('Could not delete card menu message');
+      }
+    }
 
     // Ask for quantity
     try {
@@ -542,7 +628,7 @@ class OrderFlowHandler {
         }
       );
     } catch (err) {
-      console.error('Error sending quantity prompt:', err);
+      logger.error('Error sending quantity prompt:', err);
     }
   }
 
@@ -639,7 +725,7 @@ class OrderFlowHandler {
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
-        console.error('Error sending count validation message:', err);
+        logger.error('Error sending count validation message:', err);
       }
       return;
     }
@@ -664,7 +750,7 @@ class OrderFlowHandler {
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
-        console.error('Error sending invalid code message:', err);
+        logger.error('Error sending invalid code message:', err);
       }
       return;
     }
@@ -688,7 +774,7 @@ class OrderFlowHandler {
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
-        console.error('Error sending invalid pattern message:', err);
+        logger.error('Error sending invalid pattern message:', err);
       }
       return;
     }
@@ -705,39 +791,17 @@ class OrderFlowHandler {
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
-        console.error('Error sending duplicate message:', err);
+        logger.error('Error sending duplicate message:', err);
       }
       return;
     }
 
     // Update session with array of backup codes
     this.updateSession(chatId, {
-      step: 'checking_balance',
+      step: 'processing',
       backupCodes: backupCodes, // Changed from backupCode to backupCodes (array)
       backupCodeIndex: 0 // Track which code to use next
     });
-
-    // Check balance before processing (silently)
-    try {
-      const scraperService = require('../services/RazerScraperService');
-      const browserManager = require('../services/BrowserManager');
-      const page = browserManager.getPage(telegramUserId);
-
-      const balance = await scraperService.getBalance(telegramUserId, page);
-
-      // Update to processing step
-      this.updateSession(chatId, {
-        step: 'processing'
-      });
-
-    } catch (err) {
-      console.error('Balance check error:', err);
-      await bot.sendMessage(chatId,
-        `❌ Failed to check balance. Please try again later.`
-      );
-      this.clearSession(chatId);
-      return;
-    }
 
     // Send ORDER SUMMARY and store message ID for later deletion
     try {
@@ -764,7 +828,7 @@ class OrderFlowHandler {
       // Store message ID for deletion later
       this.orderSummaryMessages.set(chatId, summaryMsg.message_id);
     } catch (err) {
-      console.error('Error sending order summary:', err);
+      logger.error('Error sending order summary:', err);
     }
 
     // Process order
@@ -799,7 +863,7 @@ class OrderFlowHandler {
               });
             } catch (editErr) {
               // If edit fails (message too old or deleted), send new message
-              console.log('Could not edit progress message, sending new one');
+              logger.debug('Could not edit progress message, sending new one');
               const newMsg = await bot.sendMessage(chatId, progressText, {
                 parse_mode: 'Markdown',
                 reply_markup: {
@@ -823,7 +887,7 @@ class OrderFlowHandler {
             this.progressMessages.set(chatId, msg.message_id);
           }
         } catch (err) {
-          console.log('Could not send progress update:', err.message);
+          logger.debug('Could not send progress update:', err.message);
         }
       };
 
@@ -851,7 +915,7 @@ class OrderFlowHandler {
           await bot.deleteMessage(chatId, progressMsgId);
           this.progressMessages.delete(chatId);
         } catch (delErr) {
-          console.log('⚠️ Could not delete progress message');
+          logger.debug('Could not delete progress message');
         }
       }
 
@@ -861,7 +925,7 @@ class OrderFlowHandler {
           await bot.deleteMessage(chatId, summaryMsgId);
           this.orderSummaryMessages.delete(chatId);
         } catch (delErr) {
-          console.log('⚠️ Could not delete order summary message');
+          logger.debug('Could not delete order summary message');
         }
       }
 
@@ -914,7 +978,7 @@ class OrderFlowHandler {
           fs.unlinkSync(filePath);
 
         } catch (err) {
-          console.error('Error sending TXT file:', err);
+          logger.error('Error sending TXT file:', err);
           // Fallback to message format
           const plainMessages = orderService.formatPinsPlain(result.pins);
           for (const message of plainMessages) {
@@ -926,7 +990,7 @@ class OrderFlowHandler {
         orderService.clearOrderPins(result.order.id);
 
       } catch (err) {
-        console.error('Error sending order results:', err);
+        logger.error('Error sending order results:', err);
       }
 
       // Clear session, cancellation flag, progress message, and order summary
@@ -936,12 +1000,7 @@ class OrderFlowHandler {
       this.orderSummaryMessages.delete(chatId);
 
     } catch (err) {
-      console.error('Order processing error:', err);
-
-      // Always clear progress message, cancelling message, and order summary on error
-      this.progressMessages.delete(chatId);
-      this.cancellingMessages.delete(chatId);
-      this.orderSummaryMessages.delete(chatId);
+      logger.error('Order processing error:', err);
 
       // Check if it was a user cancellation
       if (err.message && err.message.includes('cancelled by user')) {
@@ -957,7 +1016,7 @@ class OrderFlowHandler {
                 await bot.deleteMessage(chatId, cancellingMsgId);
                 this.cancellingMessages.delete(chatId);
               } catch (delErr) {
-                console.log('⚠️ Could not delete cancelling message');
+                logger.debug('Could not delete cancelling message');
               }
             }
 
@@ -968,7 +1027,7 @@ class OrderFlowHandler {
                 await bot.deleteMessage(chatId, progressMsgId);
                 this.progressMessages.delete(chatId);
               } catch (delErr) {
-                console.log('⚠️ Could not delete progress message');
+                logger.debug('Could not delete progress message');
               }
             }
 
@@ -979,7 +1038,7 @@ class OrderFlowHandler {
                 await bot.deleteMessage(chatId, summaryMsgId);
                 this.orderSummaryMessages.delete(chatId);
               } catch (delErr) {
-                console.log('⚠️ Could not delete order summary message');
+                logger.debug('Could not delete order summary message');
               }
             }
 
@@ -1028,7 +1087,7 @@ class OrderFlowHandler {
               fs.unlinkSync(filePath);
 
             } catch (fileErr) {
-              console.error('Error sending TXT file:', fileErr);
+              logger.error('Error sending TXT file:', fileErr);
               // Fallback to message format
               const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
               for (const message of plainMessages) {
@@ -1058,7 +1117,7 @@ class OrderFlowHandler {
                 await bot.deleteMessage(chatId, cancellingMsgId);
                 this.cancellingMessages.delete(chatId);
               } catch (delErr) {
-                console.log('⚠️ Could not delete cancelling message');
+                logger.debug('Could not delete cancelling message');
               }
             }
 
@@ -1069,7 +1128,18 @@ class OrderFlowHandler {
                 await bot.deleteMessage(chatId, progressMsgId);
                 this.progressMessages.delete(chatId);
               } catch (delErr) {
-                console.log('⚠️ Could not delete progress message');
+                logger.debug('Could not delete progress message');
+              }
+            }
+
+            // Delete the order summary message before sending results
+            const summaryMsgId = this.orderSummaryMessages.get(chatId);
+            if (summaryMsgId) {
+              try {
+                await bot.deleteMessage(chatId, summaryMsgId);
+                this.orderSummaryMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete order summary message');
               }
             }
 
@@ -1081,7 +1151,7 @@ class OrderFlowHandler {
             );
           }
         } catch (sendErr) {
-          console.error('Error sending cancellation message:', sendErr);
+          logger.error('Error sending cancellation message:', sendErr);
         }
 
         // Clear session, cancellation flag, progress message, cancelling message, and order summary
@@ -1096,10 +1166,43 @@ class OrderFlowHandler {
       // UX FIX #17: Use friendly error messages
       const friendlyError = this.getUserFriendlyError(err);
 
+      // Delete the order summary message before sending error
+      const summaryMsgId = this.orderSummaryMessages.get(chatId);
+      if (summaryMsgId) {
+        try {
+          await bot.deleteMessage(chatId, summaryMsgId);
+          this.orderSummaryMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete order summary message');
+        }
+      }
+
+      // Delete the progress message before sending error
+      const progressMsgId = this.progressMessages.get(chatId);
+      if (progressMsgId) {
+        try {
+          await bot.deleteMessage(chatId, progressMsgId);
+          this.progressMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete progress message');
+        }
+      }
+
+      // Delete the cancelling message if exists
+      const cancellingMsgId = this.cancellingMessages.get(chatId);
+      if (cancellingMsgId) {
+        try {
+          await bot.deleteMessage(chatId, cancellingMsgId);
+          this.cancellingMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete cancelling message');
+        }
+      }
+
       try {
         await bot.sendMessage(chatId, friendlyError, { parse_mode: 'Markdown' });
       } catch (sendErr) {
-        console.error('Error sending error message:', err);
+        logger.error('Error sending error message:', sendErr);
       }
 
       // CRITICAL FIX #4: Session recovery for recoverable errors
@@ -1121,21 +1224,23 @@ class OrderFlowHandler {
             { parse_mode: 'Markdown' }
           );
         } catch (sendErr) {
-          console.error('Error sending retry prompt:', sendErr);
+          logger.error('Error sending retry prompt:', sendErr);
         }
 
-        // Clear cancellation flag, progress message, and order summary but keep session
+        // Clear cancellation flag and message maps but keep session
         this.clearCancellation(chatId);
         this.progressMessages.delete(chatId);
         this.orderSummaryMessages.delete(chatId);
+        this.cancellingMessages.delete(chatId);
         return;
       }
 
-      // For other errors, clear session, cancellation, progress message, and order summary
+      // For other errors, clear session, cancellation, and all message maps
       this.clearSession(chatId);
       this.clearCancellation(chatId);
       this.progressMessages.delete(chatId);
       this.orderSummaryMessages.delete(chatId);
+      this.cancellingMessages.delete(chatId);
     }
   }
 

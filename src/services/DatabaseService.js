@@ -11,6 +11,7 @@
 const sql = require('mssql');
 const { Order, Purchase } = require('../models/DatabaseModels');
 const encryptionService = require('../utils/encryption');
+const logger = require('../utils/logger');
 
 class DatabaseService {
   constructor() {
@@ -32,7 +33,7 @@ class DatabaseService {
     this.MAX_RETRIES = 3;
     this.RETRY_DELAY = 1000; // 1 second
 
-    console.log('📝 Database pool configured: 2-10 connections');
+    logger.database('Database pool configured: 2-10 connections');
   }
 
   /**
@@ -41,7 +42,7 @@ class DatabaseService {
   async connect() {
     try {
       if (!this.pool) {
-        console.log('🔌 Connecting to SQL Database (MonsterASP)...');
+        logger.database('Connecting to SQL Database (MonsterASP)...');
 
         // OPTIMIZATION: Parse connection string and add pool config
         // Connection string format: Server=...;Database=...;User Id=...;Password=...;Encrypt=true
@@ -88,20 +89,20 @@ class DatabaseService {
 
         // Monitor pool health
         this.pool.on('error', err => {
-          console.error('💥 Database pool error:', err);
+          logger.error('Database pool error:', err);
           // Reset pool on critical errors
           if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
-            console.log('🔄 Resetting connection pool...');
+            logger.database('Resetting connection pool...');
             this.pool = null;
           }
         });
 
         await this.pool.connect();
-        console.log('✅ Database connected (pool: 2-10 connections)');
+        logger.success('Database connected (pool: 2-10 connections)');
       }
       return this.pool;
     } catch (err) {
-      console.error('❌ Database connection failed:', err.message);
+      logger.error('Database connection failed:', err.message);
       throw err;
     }
   }
@@ -127,7 +128,7 @@ class DatabaseService {
         err.message?.includes('Connection is closed');
 
       if (isTransient && retries > 0) {
-        console.warn(`⚠️ Transient DB error, retrying... (${retries} left)`);
+        logger.warn(`Transient DB error, retrying... (${retries} left)`);
         await new Promise(resolve => setTimeout(resolve, this.RETRY_DELAY));
         return this.executeWithRetry(queryFn, retries - 1);
       }
@@ -160,7 +161,7 @@ class DatabaseService {
 
       return new Order(result.recordset[0]);
     } catch (err) {
-      console.error('Error creating order:', err);
+      logger.error('Error creating order:', err);
       throw err;
     }
   }
@@ -179,7 +180,7 @@ class DatabaseService {
 
       return result.recordset.length > 0 ? new Order(result.recordset[0]) : null;
     } catch (err) {
-      console.error('Error getting order:', err);
+      logger.error('Error getting order:', err);
       throw err;
     }
   }
@@ -208,7 +209,7 @@ class DatabaseService {
 
       return result.recordset.map(row => new Order(row));
     } catch (err) {
-      console.error('Error getting paginated orders:', err);
+      logger.error('Error getting paginated orders:', err);
       throw err;
     }
   }
@@ -227,7 +228,7 @@ class DatabaseService {
 
       return result.recordset[0].count;
     } catch (err) {
-      console.error('Error getting order count:', err);
+      logger.error('Error getting order count:', err);
       throw err;
     }
   }
@@ -256,7 +257,7 @@ class DatabaseService {
 
       return new Order(result.recordset[0]);
     } catch (err) {
-      console.error('Error updating order status with count:', err);
+      logger.error('Error updating order status with count:', err);
       throw err;
     }
   }
@@ -283,7 +284,7 @@ class DatabaseService {
 
       return new Order(result.recordset[0]);
     } catch (err) {
-      console.error('Error updating order status:', err);
+      logger.error('Error updating order status:', err);
       throw err;
     }
   }
@@ -308,7 +309,7 @@ class DatabaseService {
 
       return new Order(result.recordset[0]);
     } catch (err) {
-      console.error('Error incrementing order progress:', err);
+      logger.error('Error incrementing order progress:', err);
       throw err;
     }
   }
@@ -327,7 +328,7 @@ class DatabaseService {
 
       return result.recordset.map(row => new Purchase(row));
     } catch (err) {
-      console.error('Error getting order purchases:', err);
+      logger.error('Error getting order purchases:', err);
       throw err;
     }
   }
@@ -360,7 +361,7 @@ class DatabaseService {
 
       return new Purchase(result.recordset[0]);
     } catch (err) {
-      console.error('Error creating purchase with encrypted PIN:', err);
+      logger.error('Error creating purchase with encrypted PIN:', err);
       throw err;
     }
   }
@@ -387,7 +388,7 @@ class DatabaseService {
 
       return new Purchase(result.recordset[0]);
     } catch (err) {
-      console.error('Error updating purchase status:', err);
+      logger.error('Error updating purchase status:', err);
       throw err;
     }
   }
@@ -411,7 +412,7 @@ class DatabaseService {
 
       return result.recordset.length > 0 ? new User(result.recordset[0]) : null;
     } catch (err) {
-      console.error('Error getting user:', err);
+      logger.error('Error getting user:', err);
       throw err;
     }
   }
@@ -451,7 +452,7 @@ class DatabaseService {
         throw new Error('User account not found. Please contact administrator.');
       }
     } catch (err) {
-      console.error('Error saving user credentials:', err);
+      logger.error('Error saving user credentials:', err);
       throw err;
     }
   }
@@ -475,7 +476,7 @@ class DatabaseService {
 
       return true;
     } catch (err) {
-      console.error('Error deleting user credentials:', err);
+      logger.error('Error deleting user credentials:', err);
       throw err;
     }
   }
@@ -486,7 +487,7 @@ class DatabaseService {
     if (this.pool) {
       await this.pool.close();
       this.pool = null;
-      console.log('🔒 Database connection closed');
+      logger.database('Database connection closed');
     }
   }
 }

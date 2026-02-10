@@ -9,6 +9,8 @@
  * - No scraping or bot logic
  */
 
+const logger = require('../utils/logger');
+
 class SessionManager {
   constructor() {
     // In-memory storage for user sessions
@@ -45,7 +47,7 @@ class SessionManager {
       }
 
       if (cleaned > 0) {
-        console.log(`🧹 Session cleanup: ${cleaned} old sessions removed`);
+        logger.info(`Session cleanup: ${cleaned} old sessions removed`);
       }
     }, 30 * 60 * 1000); // Check every 30 minutes
   }
@@ -60,7 +62,7 @@ class SessionManager {
       state: 'idle',  // Current state: idle, awaiting_email, awaiting_password, logged_in
       timestamp: Date.now()
     };
-    console.log(`📝 Session created for user ${chatId}`);
+    logger.debug(`Session created for user ${chatId}`);
   }
 
   /**
@@ -83,7 +85,7 @@ class SessionManager {
     if (this.sessions[chatId]) {
       this.sessions[chatId].state = state;
       this.sessions[chatId].timestamp = Date.now();
-      console.log(`🔄 Session state updated for ${chatId}: ${state}`);
+      logger.debug(`Session state updated for ${chatId}: ${state}`);
     }
   }
 
@@ -96,7 +98,7 @@ class SessionManager {
   setEmail(chatId, email) {
     if (this.sessions[chatId]) {
       this.sessions[chatId].email = email;
-      console.log(`📧 Email stored for ${chatId}`);
+      logger.debug(`Email stored for ${chatId}`);
     }
   }
 
@@ -109,7 +111,7 @@ class SessionManager {
   setPassword(chatId, password) {
     if (this.sessions[chatId]) {
       this.sessions[chatId].password = password;
-      console.log(`🔑 Password stored for ${chatId}`);
+      logger.debug(`Password stored for ${chatId}`);
     }
   }
 
@@ -122,7 +124,7 @@ class SessionManager {
     if (this.sessions[chatId]) {
       delete this.sessions[chatId].email;
       delete this.sessions[chatId].password;
-      console.log(`🔒 Credentials cleared for ${chatId}`);
+      logger.debug(`Credentials cleared for ${chatId}`);
     }
   }
 
@@ -133,7 +135,7 @@ class SessionManager {
    */
   async deleteSession(chatId) {
     delete this.sessions[chatId];
-    console.log(`🗑️ Session deleted for ${chatId}`);
+    logger.debug(`Session deleted for ${chatId}`);
   }
 }
 

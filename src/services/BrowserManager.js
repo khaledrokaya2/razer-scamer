@@ -8,6 +8,7 @@
  */
 
 const puppeteer = require('puppeteer');
+const logger = require('../utils/logger');
 
 class BrowserManager {
   constructor() {
@@ -31,13 +32,13 @@ class BrowserManager {
 
     // If browser exists and is still connected, reuse it
     if (existing && existing.browser.isConnected()) {
-      console.log(`♻️ Reusing existing browser for user ${userId}`);
+      logger.system(`Reusing existing browser for user ${userId}`);
       existing.lastActivity = Date.now();
       return { browser: existing.browser, page: existing.page };
     }
 
     // Create new browser
-    console.log(`🆕 Creating new browser for user ${userId}`);
+    logger.system(`Creating new browser for user ${userId}`);
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
 
@@ -70,7 +71,7 @@ class BrowserManager {
     const isDevelopment = process.env.NODE_ENV === 'development';
 
     const browser = await puppeteer.launch({
-      headless: true,
+      headless: !isDevelopment,
       slowMo: 0,
       args: [
         '--no-sandbox',
@@ -108,7 +109,7 @@ class BrowserManager {
   async navigateToUrl(userId, url) {
     const { page } = await this.getBrowser(userId);
 
-    console.log(`🔗 Navigating to: ${url}`);
+    logger.http(`Navigating to: ${url}`);
 
     try {
       // Navigate with extended timeout and multiple wait conditions
@@ -122,10 +123,10 @@ class BrowserManager {
 
       return page;
     } catch (err) {
-      console.error(`❌ Navigation failed to ${url}:`, err.message);
+      logger.error(`Navigation failed to ${url}:`, err.message);
 
       // If navigation fails, try one more time
-      console.log('🔄 Retrying navigation...');
+      logger.http('Retrying navigation...');
       await page.goto(url, {
         waitUntil: 'domcontentloaded',
         timeout: 30000
@@ -157,11 +158,11 @@ class BrowserManager {
   async closeBrowser(userId) {
     const existing = this.userBrowsers.get(userId);
     if (existing) {
-      console.log(`🔒 Closing browser for user ${userId}`);
+      logger.system(`Closing browser for user ${userId}`);
       try {
         await existing.browser.close();
       } catch (err) {
-        console.error(`Error closing browser for user ${userId}:`, err.message);
+        logger.error(`Error closing browser for user ${userId}:`, err.message);
       }
       this.userBrowsers.delete(userId);
     }
@@ -208,18 +209,18 @@ class BrowserManager {
   startCleanupInterval() {
     setInterval(() => {
       const now = Date.now();
-      console.log('🧹 Running cleanup for inactive browsers...');
+      logger.system('Running cleanup for inactive browsers...');
       for (const [userId, session] of this.userBrowsers.entries()) {
         const inactiveTime = now - session.lastActivity;
 
         // Skip if browser is currently in use
         if (session.inUse) {
-          console.log(`⏭️ Skipping browser for user ${userId} (in use)`);
+          logger.debug(`Skipping browser for user ${userId} (in use)`);
           continue;
         }
 
         if (inactiveTime > this.INACTIVITY_TIMEOUT) {
-          console.log(`⏰ Browser for user ${userId} inactive for ${Math.round(inactiveTime / 1000 / 60)} minutes - closing...`);
+          logger.system(`Browser for user ${userId} inactive for ${Math.round(inactiveTime / 1000 / 60)} minutes - closing...`);
           this.closeBrowser(userId);
         }
       }
@@ -230,20 +231,20 @@ class BrowserManager {
    * Close all browsers (for shutdown)
    */
   async closeAll() {
-    console.log('🛑 Closing all browser instances...');
+    logger.system('Closing all browser instances...');
     const promises = [];
 
     for (const [userId, session] of this.userBrowsers.entries()) {
       promises.push(
         session.browser.close().catch(err =>
-          console.error(`Error closing browser for user ${userId}:`, err.message)
+          logger.error(`Error closing browser for user ${userId}:`, err.message)
         )
       );
     }
 
     await Promise.all(promises);
     this.userBrowsers.clear();
-    console.log('✅ All browsers closed');
+    logger.success('All browsers closed');
   }
 
   /**
