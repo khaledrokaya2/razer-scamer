@@ -38,12 +38,12 @@ class RazerScraperService {
     try {
       // Navigate to Razer login page
       logger.http('Opening Razer login page...');
-      await page.goto(this.LOGIN_URL, { waitUntil: 'networkidle2' });
+      await page.goto(this.LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
       // Wait for email and password input fields to appear
       logger.info('Waiting for login form...');
-      await page.waitForSelector('#input-login-email', { visible: true, timeout: 20000 });
-      await page.waitForSelector('#input-login-password', { visible: true, timeout: 20000 });
+      await page.waitForSelector('#input-login-email', { visible: true, timeout: 8000 });
+      await page.waitForSelector('#input-login-password', { visible: true, timeout: 8000 });
 
       // Type credentials into the form (delay simulates human typing)
       logger.info('Typing credentials...');
@@ -58,7 +58,7 @@ class RazerScraperService {
         await page.click('button[type="submit"]');
       await Promise.all([
         page.click('button[type="submit"]'),
-        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 })
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 })
       ]);
 
       // Verify login success by checking if we're on the dashboard
@@ -90,11 +90,11 @@ class RazerScraperService {
     try {
       // Navigate to dashboard page
       logger.http('Navigating to dashboard...');
-      await page.goto(this.DASHBOARD_URL, { waitUntil: 'networkidle2' });
+      await page.goto(this.DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
       // Wait for balance elements to appear on the page
       logger.info('Waiting for balance elements...');
-      await page.waitForSelector('.info-balance', { visible: true, timeout: 20000 });
+      await page.waitForSelector('.info-balance', { visible: true, timeout: 6000 });
 
       // Extract balance data from the page
       // page.evaluate() runs code inside the browser context

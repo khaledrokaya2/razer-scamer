@@ -65,11 +65,11 @@ class PurchaseService {
     const page = await browserManager.navigateToUrl(telegramUserId, gameUrl);
 
     try {
-      // Quick page load check - don't wait too long
+      // Quick page load check - fast loading
       logger.http('Waiting for page to load...');
 
       // Check if page loaded successfully and user is logged in
-      await page.waitForSelector('body', { timeout: 10000 });
+      await page.waitForSelector('body', { timeout: 5000 });
 
       // Check for access denied or login required (improved logic)
       const pageStatus = await page.evaluate(() => {
@@ -109,26 +109,23 @@ class PurchaseService {
       logger.info(`Page loaded: ${pageStatus.title}`);
       logger.debug(`Quick scan: ${pageStatus.cardCount} cards, ${pageStatus.paymentCount} payment methods`);
 
-      // OPTIMIZED: Wait for cards to load, then try all detection methods in one pass
-      logger.http('Waiting for cards to load (max 5 seconds)...');
+      // OPTIMIZED: Wait for cards to load with minimal timeout
+      logger.http('Waiting for cards to load...');
 
-      // Wait for any card-related selector to appear (5 second timeout)
+      // Wait for any card-related selector to appear (2 second timeout)
       try {
         await Promise.race([
           // Try to wait for known card containers
           page.waitForSelector('#webshop_step_sku .selection-tile, div[class*="selection-tile"], input[name="paymentAmountItem"]',
-            { timeout: 5000 }
+            { timeout: 2000 }
           ),
-          // Or wait 5 seconds maximum
-          new Promise((resolve) => setTimeout(resolve, 5000))
+          // Or wait 2 seconds maximum
+          new Promise((resolve) => setTimeout(resolve, 2000))
         ]);
         logger.success('Card elements detected on page');
       } catch (waitErr) {
-        logger.warn('Card elements not found within 5 seconds, will try extraction anyway...');
+        logger.warn('Card elements not found within 2 seconds, will try extraction anyway...');
       }
-
-      // Additional small wait for dynamic content to settle
-      await new Promise(resolve => setTimeout(resolve, 300));
 
       // OPTIMIZED: Try ALL 3 detection methods in ONE evaluation
       logger.debug('Extracting cards using unified detection...');
@@ -399,12 +396,12 @@ class PurchaseService {
       // STAGE 1: Navigate to game page
       currentStage = this.STAGES.NAVIGATING;
       logger.debug(`Stage: ${currentStage}`);
-      await page.goto(gameUrl, { waitUntil: 'networkidle2' });
+      await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-      // Wait for cards
+      // Wait for cards with reduced timeout
       await page.waitForSelector("div[class*='selection-tile__text']", {
         visible: true,
-        timeout: 20000
+        timeout: 6000
       });
 
       // Check cancellation
@@ -433,7 +430,7 @@ class PurchaseService {
       // Wait for card containers to be fully loaded and clickable
       await page.waitForSelector('#webshop_step_sku .selection-tile', {
         visible: true,
-        timeout: 20000
+        timeout: 6000
       });
 
       // Get all card containers from the cards section
@@ -484,8 +481,8 @@ class PurchaseService {
         cardSelected = true;
       }
 
-      // Wait for selection to register
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Minimal wait for selection to register
+      await new Promise(resolve => setTimeout(resolve, 200));
 
       // Verify the card was selected by checking the radio input state
       const isSelected = await page.evaluate((index) => {
@@ -530,7 +527,7 @@ class PurchaseService {
       // Wait for payment methods section to load
       await page.waitForSelector("#webshop_step_payment_channels", {
         visible: true,
-        timeout: 20000
+        timeout: 6000
       });
 
       // Select Razer Gold as payment method
@@ -539,7 +536,7 @@ class PurchaseService {
       // Wait for payment methods container to load
       await page.waitForSelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']", {
         visible: true,
-        timeout: 20000
+        timeout: 6000
       });
 
       // Find the Razer Gold payment method specifically
@@ -582,8 +579,8 @@ class PurchaseService {
         }
       }
 
-      // Wait a moment for selection to register
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Minimal wait for selection to register
+      await new Promise(resolve => setTimeout(resolve, 200));
 
       // Verify Razer Gold was selected by checking the radio input
       const isRazerGoldSelected = await page.evaluate(() => {
@@ -647,7 +644,7 @@ class PurchaseService {
         try {
           checkoutButton = await page.waitForSelector(selector, {
             visible: true,
-            timeout: 5000
+            timeout: 3000
           });
           if (checkoutButton) {
             logger.success(`Found checkout button with selector: ${selector}`);
@@ -682,12 +679,12 @@ class PurchaseService {
 
       // Wait for navigation after checkout
       logger.http('Waiting for page to load after checkout...');
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {
         logger.debug('Navigation timeout - will check URL...');
       });
 
-      // Give a moment for any redirects to complete
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Minimal wait for redirects
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Check URL after checkout
       const urlAfterCheckout = await page.url();
@@ -726,17 +723,17 @@ class PurchaseService {
           if (!modal) return false;
           const style = window.getComputedStyle(modal);
           return style.display !== 'none' && style.visibility !== 'hidden';
-        }, { polling: 'mutation', timeout: 10000 }).then(() => ({ type: '2fa' })).catch(() => null),
+        }, { polling: 'mutation', timeout: 6000 }).then(() => ({ type: '2fa' })).catch(() => null),
 
         // Scenario 2: Direct redirect to transaction page (no 2FA)
         page.waitForFunction(() => {
           return window.location.href.includes('/transaction/');
-        }, { polling: 500, timeout: 10000 }).then(() => ({ type: 'direct' })).catch(() => null),
+        }, { polling: 300, timeout: 6000 }).then(() => ({ type: 'direct' })).catch(() => null),
 
         // Scenario 3: Redirect to reload page (insufficient balance)
         page.waitForFunction(() => {
           return window.location.href.includes('/gold/reload');
-        }, { polling: 500, timeout: 10000 }).then(() => ({ type: 'reload' })).catch(() => null)
+        }, { polling: 300, timeout: 6000 }).then(() => ({ type: 'reload' })).catch(() => null)
       ]).then(result => result || { type: 'unknown' });
 
       // Handle reload page redirect
@@ -755,7 +752,7 @@ class PurchaseService {
         logger.debug('2FA modal detected - processing backup code...');
 
         // Step 2: Wait for any OTP iframe (first one)
-        await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 30000 });
+        await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 8000 });
         let frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
         let frame = await frameHandle.contentFrame();
 
@@ -768,7 +765,7 @@ class PurchaseService {
         await page.waitForFunction(() => {
           const newIframe = document.querySelector('#purchaseOtpModal iframe[id^="otp-iframe-"]');
           return newIframe && newIframe.id !== 'otp-iframe-3';
-        }, { polling: 'mutation', timeout: 30000 });
+        }, { polling: 'mutation', timeout: 8000 });
 
         // Step 5: Switch to the new iframe
         frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
@@ -788,7 +785,7 @@ class PurchaseService {
         }
 
         // Wait for iframe and get its frame context
-        await page.waitForSelector('iframe[id^="otp-iframe-"]', { visible: true, timeout: 10000 });
+        await page.waitForSelector('iframe[id^="otp-iframe-"]', { visible: true, timeout: 6000 });
         const otpFrameElement = await page.$('iframe[id^="otp-iframe-"]');
         const otpFrame = await otpFrameElement.contentFrame();
 
@@ -797,7 +794,7 @@ class PurchaseService {
         // Type digits into inputs inside iframe
         for (let i = 0; i < 8; i++) {
           const inputSelector = `#otp-input-${i}`;
-          await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 5000 });
+          await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 3000 });
           await otpFrame.type(inputSelector, backupCode[i]);
         }
 
@@ -837,7 +834,7 @@ class PurchaseService {
                   // Success: Navigated away from game page
                   return !currentUrl.includes(gameUrl);
                 },
-                { timeout: 20000, polling: 500 },
+                { timeout: 15000, polling: 300 },
                 gameUrl
               );
 
@@ -915,35 +912,35 @@ class PurchaseService {
         logger.debug('Waiting for order to complete processing...');
 
         try {
-          // OPTIMIZATION: Reduced to 10s (safe because transaction ID already captured)
+          // OPTIMIZATION: Reduced to 5s (safe because transaction ID already captured)
           await Promise.race([
             page.waitForFunction(() => {
               const h2 = document.querySelector('h2[data-v-621e38f9]');
               return h2 && h2.textContent.includes('Congratulations');
-            }, { timeout: 10000 }),  // 10 seconds max
-            new Promise((resolve) => setTimeout(resolve, 10000))  // Fallback timeout
+            }, { timeout: 5000 }),  // 5 seconds max
+            new Promise((resolve) => setTimeout(resolve, 5000))  // Fallback timeout
           ]);
 
           logger.success('Order processing completed - "Congratulations!" page loaded');
         } catch (waitErr) {
-          logger.warn('Timeout (10s) waiting for congratulations message, will try extraction anyway...');
+          logger.warn('Timeout (5s) waiting for congratulations message, will try extraction anyway...');
         }
 
         // Additional wait for PIN block to be visible with shorter timeout
         try {
-          await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 5000 });
+          await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 3000 });
           logger.success('PIN block is visible');
         } catch (pinWaitErr) {
           logger.warn('PIN block not found with selector, will try extraction anyway...');
         }
 
 
-        // Check transaction status from the page with 10-second timeout
+        // Check transaction status from the page with 3-second timeout
         logger.debug('Checking transaction status...');
 
         let statusCheck;
         try {
-          // OPTIMIZATION: Reduced to 5s (safe because transaction ID already captured)
+          // OPTIMIZATION: Reduced to 3s (safe because transaction ID already captured)
           statusCheck = await Promise.race([
             page.evaluate(() => {
               // Look for status in the order summary section
@@ -961,7 +958,7 @@ class PurchaseService {
               return { status: 'unknown', message: 'Unknown status' };
             }),
             new Promise((resolve) =>
-              setTimeout(() => resolve({ status: 'timeout', message: 'Status check timed out' }), 5000)
+              setTimeout(() => resolve({ status: 'timeout', message: 'Status check timed out' }), 3000)
             )
           ]);
         } catch (evalErr) {
@@ -982,29 +979,24 @@ class PurchaseService {
 
         let purchaseData;
         try {
-          // OPTIMIZATION: Reduced to 5s (safe because transaction ID already captured)
+          // OPTIMIZATION: Reduced to 3s with parallel extraction
           purchaseData = await Promise.race([
             page.evaluate(() => {
-              // Extract PIN and Serial from the pin-block
+              // PARALLEL EXTRACTION: Extract all data in one pass
               const pinCodeElement = document.querySelector('div.pin-code');
               const serialElement = document.querySelector('div.pin-serial-number');
+              const productElement = document.querySelector('strong[data-v-621e38f9].text--white');
+              const transactionElements = document.querySelectorAll('span[data-v-175ddd8f]');
 
               const pinCode = pinCodeElement ? pinCodeElement.textContent.trim() : '';
               const serialRaw = serialElement ? serialElement.textContent.trim() : '';
               const serial = serialRaw.replace('S/N:', '').trim();
-
-              // Extract product name
-              const productElement = document.querySelector('strong[data-v-621e38f9].text--white');
               const productName = productElement ? productElement.textContent.trim() : '';
 
-              // Extract transaction ID from the order summary
-              const transactionElements = document.querySelectorAll('span[data-v-175ddd8f]');
+              // Extract transaction ID
               let transactionNumber = '';
-
               for (let i = 0; i < transactionElements.length; i++) {
                 const text = transactionElements[i].textContent.trim();
-                // Look for transaction number pattern (alphanumeric, usually 20+ chars)
-                // Skip dates, amounts, and short texts
                 if (text.length > 15 && /^[A-Z0-9]+$/i.test(text) && !text.includes('/') && !text.includes('.')) {
                   transactionNumber = text;
                   break;
@@ -1024,7 +1016,7 @@ class PurchaseService {
                 serial: '',
                 transactionId: '',
                 productName: ''
-              }), 5000)  // OPTIMIZATION: 5s timeout
+              }), 3000)  // OPTIMIZATION: 3s timeout
             )
           ]);
         } catch (extractErr) {

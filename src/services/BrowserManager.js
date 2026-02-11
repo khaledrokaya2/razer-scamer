@@ -72,28 +72,26 @@ class BrowserManager {
 
     const browser = await puppeteer.launch({
       headless: !isDevelopment,
-      slowMo: 0,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
         '--disable-gpu',
-        '--no-zygote',
-        '--single-process',
+        '--disable-software-rasterizer',
+        '--disable-extensions',
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
-        '--disable-features=TranslateUI,BlinkGenPropertyTrees',
-        '--disable-ipc-flooding-protection',
         '--disable-hang-monitor',
-        '--disable-extensions',
-        '--disable-default-apps',
         '--disable-sync',
+        '--disable-translate',
         '--metrics-recording-only',
         '--no-first-run',
-        '--safebrowsing-disable-auto-update',
-        '--mute-audio'
+        '--mute-audio',
+        '--aggressive-cache-discard',
+        '--disable-cache',
+        '--disable-application-cache',
+        '--disable-offline-load-stale-cache'
       ]
     });
 
@@ -112,10 +110,10 @@ class BrowserManager {
     logger.http(`Navigating to: ${url}`);
 
     try {
-      // Navigate with extended timeout and multiple wait conditions
+      // Navigate with fast loading strategy
       await page.goto(url, {
-        waitUntil: 'networkidle2',
-        timeout: 60000
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
       });
 
       // Update activity after successful navigation
@@ -125,11 +123,11 @@ class BrowserManager {
     } catch (err) {
       logger.error(`Navigation failed to ${url}:`, err.message);
 
-      // If navigation fails, try one more time
+      // If navigation fails, try one more time with minimal wait
       logger.http('Retrying navigation...');
       await page.goto(url, {
         waitUntil: 'domcontentloaded',
-        timeout: 30000
+        timeout: 20000
       });
 
       this.updateActivity(userId);

@@ -21,8 +21,8 @@ class TransactionVerificationService {
     try {
       logger.http(`Verifying transaction: ${transactionId}`);
 
-      // Navigate to transaction page
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      // Navigate to transaction page with fast loading
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
       // Wait for the status element to appear (this ensures dynamic content is loaded)
       try {
@@ -38,9 +38,6 @@ class TransactionVerificationService {
         }, { timeout: 15000, polling: 100 });
 
         logger.debug(`Transaction ${transactionId}: Status element loaded`);
-
-        // Additional small wait for content to fully render
-        await new Promise(resolve => setTimeout(resolve, 100));
       } catch (waitErr) {
         logger.debug(`Transaction ${transactionId}: Timeout waiting for status element`);
         // Continue anyway and try to extract

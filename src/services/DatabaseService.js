@@ -16,6 +16,7 @@ const logger = require('../utils/logger');
 class DatabaseService {
   constructor() {
     this.pool = null;
+    this.parsedConfig = null; // OPTIMIZATION: Pre-parse config once
 
     // OPTIMIZATION: Configure connection pool for concurrent users
     // MonsterASP free tier - configured for 50 max connections
@@ -33,7 +34,54 @@ class DatabaseService {
     this.MAX_RETRIES = 3;
     this.RETRY_DELAY = 1000; // 1 second
 
+    // OPTIMIZATION: Pre-parse connection string once
+    this.parseConnectionString();
+
     logger.database('Database pool configured: 2-10 connections');
+  }
+
+  /**
+   * Pre-parse connection string once for performance
+   */
+  parseConnectionString() {
+    if (!this.config) return;
+
+    const config = {};
+    const parts = this.config.split(';').filter(p => p.trim());
+
+    for (const part of parts) {
+      const [key, value] = part.split('=').map(s => s.trim());
+      if (key && value) {
+        const lowerKey = key.toLowerCase();
+        if (lowerKey === 'server' || lowerKey === 'data source') {
+          config.server = value;
+        } else if (lowerKey === 'database' || lowerKey === 'initial catalog') {
+          config.database = value;
+        } else if (lowerKey === 'user id' || lowerKey === 'uid') {
+          config.user = value;
+        } else if (lowerKey === 'password' || lowerKey === 'pwd') {
+          config.password = value;
+        } else if (lowerKey === 'encrypt') {
+          config.encrypt = value.toLowerCase() === 'true';
+        } else if (lowerKey === 'trustservercertificate') {
+          config.trustServerCertificate = value.toLowerCase() === 'true';
+        }
+      }
+    }
+
+    // Add pool configuration
+    config.pool = this.poolConfig;
+
+    // Add default options
+    config.options = {
+      encrypt: config.encrypt !== false,
+      trustServerCertificate: config.trustServerCertificate || false,
+      requestTimeout: 30000,
+      connectionTimeout: 15000,
+      enableArithAbort: true
+    };
+
+    this.parsedConfig = config;
   }
 
   /**
@@ -44,48 +92,13 @@ class DatabaseService {
       if (!this.pool) {
         logger.database('Connecting to SQL Database (MonsterASP)...');
 
-        // OPTIMIZATION: Parse connection string and add pool config
-        // Connection string format: Server=...;Database=...;User Id=...;Password=...;Encrypt=true
-        const connString = this.config;
-
-        // Parse connection string into config object
-        const config = {};
-        const parts = connString.split(';').filter(p => p.trim());
-
-        for (const part of parts) {
-          const [key, value] = part.split('=').map(s => s.trim());
-          if (key && value) {
-            const lowerKey = key.toLowerCase();
-            if (lowerKey === 'server' || lowerKey === 'data source') {
-              config.server = value;
-            } else if (lowerKey === 'database' || lowerKey === 'initial catalog') {
-              config.database = value;
-            } else if (lowerKey === 'user id' || lowerKey === 'uid') {
-              config.user = value;
-            } else if (lowerKey === 'password' || lowerKey === 'pwd') {
-              config.password = value;
-            } else if (lowerKey === 'encrypt') {
-              config.encrypt = value.toLowerCase() === 'true';
-            } else if (lowerKey === 'trustservercertificate') {
-              config.trustServerCertificate = value.toLowerCase() === 'true';
-            }
-          }
+        // OPTIMIZATION: Use pre-parsed config
+        if (!this.parsedConfig) {
+          throw new Error('Database configuration not parsed');
         }
 
-        // Add pool configuration
-        config.pool = this.poolConfig;
-
-        // Add default options
-        config.options = {
-          encrypt: config.encrypt !== false,
-          trustServerCertificate: config.trustServerCertificate || false,
-          requestTimeout: 30000,
-          connectionTimeout: 15000,
-          enableArithAbort: true
-        };
-
-        // Create pool
-        this.pool = new sql.ConnectionPool(config);
+        // Create pool with pre-parsed config
+        this.pool = new sql.ConnectionPool(this.parsedConfig);
 
         // Monitor pool health
         this.pool.on('error', err => {
