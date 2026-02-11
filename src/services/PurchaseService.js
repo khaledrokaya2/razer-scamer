@@ -117,7 +117,7 @@ class PurchaseService {
         await Promise.race([
           // Try to wait for known card containers
           page.waitForSelector('#webshop_step_sku .selection-tile, div[class*="selection-tile"], input[name="paymentAmountItem"]',
-            { timeout: 2000 }
+            { timeout: 5000 }
           ),
           // Or wait 2 seconds maximum
           new Promise((resolve) => setTimeout(resolve, 2000))
