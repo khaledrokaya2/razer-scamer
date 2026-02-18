@@ -98,7 +98,6 @@ class OrderService {
     cardName,
     cardIndex,
     quantity,
-    backupCodes, // Changed to array of backup codes
     onProgress,  // UX FIX #16: Progress callback
     checkCancellation  // Cancellation check callback
   }) {
@@ -122,7 +121,6 @@ class OrderService {
       logger.order(`   Game: ${gameName}`);
       logger.order(`   Card: ${cardName}`);
       logger.order(`   Quantity: ${quantity}`);
-      logger.order(`   Backup Codes: ${backupCodes.length} codes provided`);
       logger.order(`${'='.repeat(60)}\n`);
 
       // Step 2: Process purchases with IMMEDIATE database save after each card
@@ -133,7 +131,6 @@ class OrderService {
         cardName,
         gameName,
         quantity,
-        backupCodes,
         onProgress,  // Telegram progress update
         checkCancellation,
         // IMMEDIATE DB SAVE: Called after each successful card purchase
@@ -143,8 +140,10 @@ class OrderService {
             await databaseService.createPurchaseWithEncryptedPin({
               orderId: order.id,
               pinCode: purchaseResult.pinCode,
-              serialNumber: purchaseResult.serial || null,
+              serialNumber: purchaseResult.serialNumber || null,
               transactionId: purchaseResult.transactionId || null,
+              cardNumber: cardNumber,
+              status: 'success',
               gameName: gameName,
               cardValue: cardName
             });
@@ -158,7 +157,7 @@ class OrderService {
             if (orderData && orderData.pins) {
               orderData.pins.push({
                 pinCode: purchaseResult.pinCode,
-                serialNumber: purchaseResult.serial,
+                serialNumber: purchaseResult.serialNumber,
                 transactionId: purchaseResult.transactionId,
                 success: true,
                 requiresManualCheck: false,
@@ -214,7 +213,12 @@ class OrderService {
       };
 
     } catch (err) {
-      logger.error('Order processing failed:', err.message);
+      // Log cancellations as info, other errors as error
+      if (err.message && err.message.includes('cancelled by user')) {
+        logger.info('Order processing cancelled:', err.message);
+      } else {
+        logger.error('Order processing failed:', err.message);
+      }
 
       // CONCURRENCY FIX: Remove from active orders on ANY error
       if (order) {

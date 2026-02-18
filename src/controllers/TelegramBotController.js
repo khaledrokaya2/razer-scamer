@@ -22,6 +22,8 @@ class TelegramBotController {
     this.RATE_LIMIT_MS = 800; // OPTIMIZATION: 800ms for faster UX (5 users only)
     // State locking to prevent race conditions
     this.processingCallbacks = new Set();
+    // Track users currently auto-logging in
+    this.usersLoggingIn = new Set();
     // Cleanup rate limit map periodically
     this.startRateLimitCleanup();
   }
@@ -143,7 +145,18 @@ class TelegramBotController {
   async handleStartCommand(msg) {
     const chatId = msg.chat.id.toString();
 
+    const telegramUserId = msg.from.id.toString();
+
     try {
+      // Block if user is currently logging in
+      if (this.usersLoggingIn.has(telegramUserId)) {
+        return this.bot.sendMessage(
+          chatId,
+          '⏳ *Please wait...*\n\nLogin in progress. Try again in a moment.',
+          { parse_mode: 'Markdown' }
+        );
+      }
+
       // Check if user is authorized (whitelist check)
       const authResult = await authService.checkAuthorization(chatId);
 
@@ -159,12 +172,81 @@ class TelegramBotController {
 
       // Show main menu
       await this.showMainMenu(chatId);
+
+      // Auto-login if user has credentials
+      await this.autoLoginUser(chatId, telegramUserId);
     } catch (err) {
       logger.error('Error in /start command:', err);
       this.bot.sendMessage(
         chatId,
         '❌ System Error. Please try again later.'
       );
+    }
+  }
+
+  /**
+   * Auto-login user if credentials exist
+   * @param {string} chatId - Chat ID
+   * @param {string} telegramUserId - Telegram user ID
+   */
+  async autoLoginUser(chatId, telegramUserId) {
+    try {
+      // Safety check: don't auto-login if already logging in
+      if (this.usersLoggingIn.has(telegramUserId)) {
+        logger.debug(`User ${telegramUserId} is already logging in, skipping auto-login`);
+        return;
+      }
+
+      const db = require('../services/DatabaseService');
+      const browserManager = require('../services/BrowserManager');
+
+      // Check if user has credentials
+      const credentials = await db.getUserCredentials(telegramUserId);
+
+      if (!credentials || !credentials.email || !credentials.password) {
+        // No credentials, just skip auto-login
+        logger.debug(`User ${telegramUserId} has no credentials, skipping auto-login`);
+        return;
+      }
+
+      // Check if already has active browser session
+      if (browserManager.hasActiveBrowser(telegramUserId)) {
+        logger.debug(`User ${telegramUserId} already has active browser session`);
+        return;
+      }
+
+      // Mark user as logging in - block all interactions
+      this.usersLoggingIn.add(telegramUserId);
+
+      // Show login message
+      const loginMsg = await this.bot.sendMessage(chatId, '🔐 *Logging you in...*\n\nPlease wait...', { parse_mode: 'Markdown' });
+
+      try {
+        // Perform login
+        await scraperService.login(telegramUserId, credentials.email, credentials.password);
+
+        // Delete login message and show success
+        await this.bot.deleteMessage(chatId, loginMsg.message_id).catch(() => { });
+        await this.bot.sendMessage(chatId, '✅ *Logged in successfully!*\n\nYou can now use all features.', { parse_mode: 'Markdown' });
+
+        logger.success(`Auto-login successful for user ${telegramUserId}`);
+      } catch (loginErr) {
+        // Delete login message and show error
+        await this.bot.deleteMessage(chatId, loginMsg.message_id).catch(() => { });
+        logger.error(`Auto-login failed for user ${telegramUserId}:`, loginErr.message);
+
+        await this.bot.sendMessage(chatId,
+          '⚠️ *Auto-login failed*\n\n' +
+          'Please check your credentials in Settings.\n' +
+          'You can update them using: ⚙️ Settings → 🔐 Update Razer ID',
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } catch (err) {
+      logger.error('Error in auto-login:', err);
+    } finally {
+      // Always remove user from logging-in set
+      this.usersLoggingIn.delete(telegramUserId);
     }
   }
 
@@ -180,7 +262,7 @@ class TelegramBotController {
         [{ text: '🛒 Create Order' }],
         [{ text: '💰 Check Balance' }],
         [{ text: '📋 Order History' }],
-        [{ text: '⚙️ Update Credentials' }, { text: '🚪 Logout' }]
+        [{ text: '⚙️ Settings' }, { text: '🚪 Logout' }]
       ],
       resize_keyboard: true,
       persistent: true
@@ -237,6 +319,15 @@ class TelegramBotController {
         return;
       }
 
+      // Block all interactions if user is currently logging in
+      if (this.usersLoggingIn.has(telegramUserId)) {
+        await this.bot.answerCallbackQuery(query.id, {
+          text: '⏳ Please wait... Login in progress.',
+          show_alert: true
+        });
+        return;
+      }
+
       // Route callbacks
       await this.handleUserCallback(chatId, telegramUserId, callbackData, query.id);
 
@@ -288,6 +379,18 @@ class TelegramBotController {
           await this.handleUpdateCredentialsCancel(chatId);
           break;
 
+        case 'settings_razer_id':
+          await this.handleUpdateCredentials(chatId);
+          break;
+
+        case 'settings_backup_codes':
+          await this.handleBackupCodesMenu(chatId, telegramUserId);
+          break;
+
+        case 'close_menu':
+          await this.bot.deleteMessage(chatId, query.message.message_id).catch(() => { });
+          break;
+
         default:
           // Handle order history PIN retrieval
           if (callbackData.startsWith('history_get_pins_')) {
@@ -302,7 +405,13 @@ class TelegramBotController {
             }
 
             const gameId = callbackData.replace('order_game_', '');
-            await orderFlowHandler.handleGameSelection(this.bot, chatId, gameId, telegramUserId);
+
+            // Handle custom game URL
+            if (gameId === 'custom') {
+              await orderFlowHandler.handleCustomGameUrl(this.bot, chatId);
+            } else {
+              await orderFlowHandler.handleGameSelection(this.bot, chatId, gameId, telegramUserId);
+            }
 
           } else if (callbackData.startsWith('order_card_')) {
             if (!await this.ensureBrowserSession(null, chatId, telegramUserId)) {
@@ -321,8 +430,36 @@ class TelegramBotController {
           } else if (callbackData === 'order_cancel_processing') {
             await orderFlowHandler.handleCancelProcessing(this.bot, chatId);
 
+          } else if (callbackData.startsWith('scheduled_cancel_')) {
+            // Handle scheduled order cancellation
+            const getScheduledOrderService = require('../services/ScheduledOrderService');
+            const scheduledService = getScheduledOrderService(); // Get singleton instance
+
+            if (scheduledService) {
+              // Mark as cancelled
+              scheduledService.cancelScheduledOrder(chatId);
+
+              await this.bot.answerCallbackQuery(query.id, {
+                text: '🛑 Cancelling order...',
+                show_alert: false
+              });
+            }
+
           } else if (callbackData === 'order_back_to_games') {
             await orderFlowHandler.handleBack(this.bot, chatId);
+
+          } else if (callbackData === 'order_confirm_continue') {
+            await orderFlowHandler.showOrderConfirmation(this.bot, chatId);
+
+          } else if (callbackData === 'order_buy_now') {
+            if (!await this.ensureBrowserSession(null, chatId, telegramUserId)) {
+              orderFlowHandler.clearSession(chatId);
+              return;
+            }
+            await orderFlowHandler.handleBuyNow(this.bot, chatId, telegramUserId);
+
+          } else if (callbackData === 'order_schedule') {
+            await orderFlowHandler.handleScheduleOrder(this.bot, chatId);
 
           } else if (callbackData === 'login') {
             await this.handleLoginButton(chatId, telegramUserId);
@@ -352,49 +489,57 @@ class TelegramBotController {
       const user = await db.getUserByTelegramId(telegramUserId);
 
       if (user && user.hasCredentials()) {
-        // Use stored credentials for automatic login
-        const loadingMessage = await this.safeSendMessage(chatId, '⏳ Logging in with stored credentials...');
+        // Mark user as logging in - block all interactions
+        this.usersLoggingIn.add(telegramUserId);
 
         try {
-          // Decrypt credentials
-          const email = encryptionService.decrypt(user.email_encrypted);
-          const password = encryptionService.decrypt(user.password_encrypted);
+          // Use stored credentials for automatic login
+          const loadingMessage = await this.safeSendMessage(chatId, '⏳ Logging in with stored credentials...\n\nPlease wait...');
 
-          // Attempt login
-          await scraperService.login(telegramUserId, email, password);
+          try {
+            // Decrypt credentials
+            const email = encryptionService.decrypt(user.email_encrypted);
+            const password = encryptionService.decrypt(user.password_encrypted);
 
-          // Delete loading message and show success
-          if (loadingMessage) {
-            try {
-              await this.bot.deleteMessage(chatId, loadingMessage.message_id);
-            } catch (delErr) {
-              logger.warn('Could not delete loading message');
+            // Attempt login
+            await scraperService.login(telegramUserId, email, password);
+
+            // Delete loading message and show success
+            if (loadingMessage) {
+              try {
+                await this.bot.deleteMessage(chatId, loadingMessage.message_id);
+              } catch (delErr) {
+                logger.warn('Could not delete loading message');
+              }
             }
-          }
 
-          await this.safeSendMessage(chatId, '✅ Logged in successfully with saved credentials!');
-          return;
+            await this.safeSendMessage(chatId, '✅ Logged in successfully with saved credentials!');
+            return;
 
-        } catch (loginErr) {
-          logger.error('Auto-login failed:', loginErr);
+          } catch (loginErr) {
+            logger.error('Auto-login failed:', loginErr);
 
-          // Delete loading message
-          if (loadingMessage) {
-            try {
-              await this.bot.deleteMessage(chatId, loadingMessage.message_id);
-            } catch (delErr) {
-              logger.warn('Could not delete loading message');
+            // Delete loading message
+            if (loadingMessage) {
+              try {
+                await this.bot.deleteMessage(chatId, loadingMessage.message_id);
+              } catch (delErr) {
+                logger.warn('Could not delete loading message');
+              }
             }
+
+            // Notify user and ask for manual login
+            await this.safeSendMessage(
+              chatId,
+              '⚠️ Automatic login failed. Your stored credentials may be outdated.\n\n' +
+              'Please update your credentials using the ⚙️ Update Credentials menu option.'
+            );
+
+            return;
           }
-
-          // Notify user and ask for manual login
-          await this.safeSendMessage(
-            chatId,
-            '⚠️ Automatic login failed. Your stored credentials may be outdated.\n\n' +
-            'Please update your credentials using the ⚙️ Update Credentials menu option.'
-          );
-
-          return;
+        } finally {
+          // Always remove user from logging-in set
+          this.usersLoggingIn.delete(telegramUserId);
         }
       }
 
@@ -422,8 +567,22 @@ class TelegramBotController {
    * @param {string} telegramUserId - Telegram user ID
    */
   async handleCheckBalanceButton(chatId, telegramUserId) {
-    // Verify user has an active browser session
+    const db = require('../services/DatabaseService');
     const browserManager = require('../services/BrowserManager');
+
+    // Check if user has credentials first
+    const credentials = await db.getUserCredentials(telegramUserId);
+    if (!credentials || !credentials.email || !credentials.password) {
+      return this.bot.sendMessage(
+        chatId,
+        '⚠️ *No Credentials Found*\n\n' +
+        'Please add your Razer credentials first.\n\n' +
+        'Go to: ⚙️ Settings → 🔐 Update Razer ID',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    // Verify user has an active browser session
     if (!browserManager.hasActiveBrowser(telegramUserId)) {
       const keyboard = {
         inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
@@ -492,6 +651,16 @@ class TelegramBotController {
       return;
     }
 
+    // Block all interactions if user is currently logging in
+    if (this.usersLoggingIn.has(telegramUserId)) {
+      try {
+        await this.bot.sendMessage(chatId, '⏳ *Please wait...*\n\nLogin in progress. Try again in a moment.', { parse_mode: 'Markdown' });
+      } catch (err) {
+        logger.warn('Could not send login-in-progress message');
+      }
+      return;
+    }
+
     try {
       // Check authorization
       const authResult = await authService.checkAuthorization(telegramUserId);
@@ -499,6 +668,20 @@ class TelegramBotController {
 
       // Handle main menu button clicks (from ReplyKeyboard)
       if (text === '🛒 Create Order') {
+        // Check if user has credentials first
+        const db = require('../services/DatabaseService');
+        const credentials = await db.getUserCredentials(telegramUserId);
+
+        if (!credentials || !credentials.email || !credentials.password) {
+          return this.bot.sendMessage(
+            chatId,
+            '⚠️ *No Credentials Found*\n\n' +
+            'Please add your Razer credentials first.\n\n' +
+            'Go to: ⚙️ Settings → 🔐 Update Razer ID',
+            { parse_mode: 'Markdown' }
+          );
+        }
+
         // Check if user has active browser session
         if (!await this.ensureBrowserSession(null, chatId, telegramUserId)) {
           return;
@@ -534,8 +717,8 @@ class TelegramBotController {
         return;
       }
 
-      if (text === '⚙️ Update Credentials') {
-        await this.handleUpdateCredentials(chatId);
+      if (text === '⚙️ Settings') {
+        await this.handleSettingsMenu(chatId);
         return;
       }
 
@@ -556,16 +739,22 @@ class TelegramBotController {
           await this.handleUpdateCredentialsEmail(chatId, text);
         } else if (session.state === 'update_credentials_password') {
           await this.handleUpdateCredentialsPassword(chatId, telegramUserId, text);
+        } else if (session.state === 'update_backup_codes') {
+          await this.handleBackupCodesInput(chatId, telegramUserId, text);
         }
       }
 
       // Handle order flow text input
       const orderSession = orderFlowHandler.getSession(chatId);
       if (orderSession) {
-        if (orderSession.step === 'enter_quantity') {
+        if (orderSession.step === 'enter_custom_url') {
+          await orderFlowHandler.handleCustomUrlInput(this.bot, chatId, telegramUserId, text);
+        } else if (orderSession.step === 'enter_quantity') {
           await orderFlowHandler.handleQuantityInput(this.bot, chatId, text);
         } else if (orderSession.step === 'enter_backup_code') {
           await orderFlowHandler.handleBackupCodeInput(this.bot, chatId, telegramUserId, text);
+        } else if (orderSession.step === 'enter_schedule_time') {
+          await orderFlowHandler.handleScheduleTimeInput(this.bot, chatId, telegramUserId, text);
         }
       }
     } catch (err) {
@@ -596,6 +785,141 @@ class TelegramBotController {
       await this.safeSendMessage(
         chatId,
         '❌ Error during logout. Please try again.'
+      );
+    }
+  }
+
+  /**
+   * Handle Settings menu
+   * @param {string} chatId - Chat ID
+   */
+  async handleSettingsMenu(chatId) {
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '🔐 Razer ID', callback_data: 'settings_razer_id' }],
+        [{ text: '🔑 Backup Codes', callback_data: 'settings_backup_codes' }],
+        [{ text: '❌ Close', callback_data: 'close_menu' }]
+      ]
+    };
+
+    await this.bot.sendMessage(
+      chatId,
+      '⚙️ **SETTINGS MENU**\n\n' +
+      'Choose what you want to update:',
+      { parse_mode: 'Markdown', reply_markup: keyboard }
+    );
+  }
+
+  /**
+   * Handle Backup Codes menu
+   * @param {string} chatId - Chat ID
+   * @param {string} telegramUserId - Telegram user ID
+   */
+  async handleBackupCodesMenu(chatId, telegramUserId) {
+    const db = require('../services/DatabaseService');
+
+    try {
+      // Get current backup code count
+      const count = await db.getActiveBackupCodeCount(telegramUserId);
+
+      await this.bot.sendMessage(
+        chatId,
+        `🔑 **BACKUP CODES MANAGEMENT**\n\n` +
+        `Current active codes: ${count}/10\n\n` +
+        `Enter your 10 backup codes (one per line).\n` +
+        `This will replace any existing codes.\n\n` +
+        `Example:\n` +
+        `12345678\n` +
+        `87654321\n` +
+        `23456789\n` +
+        `...(7 more)\n\n` +
+        `⚠️ Each code must be exactly 8 digits.`,
+        { parse_mode: 'Markdown' }
+      );
+
+      // Set session state
+      if (!sessionManager.getSession(chatId)) {
+        sessionManager.createSession(chatId);
+      }
+      sessionManager.updateState(chatId, 'update_backup_codes');
+
+    } catch (err) {
+      logger.error('Error showing backup codes menu:', err);
+      await this.bot.sendMessage(chatId, '❌ Error accessing backup codes. Please try again.');
+    }
+  }
+
+  /**
+   * Handle Backup Codes input
+   * @param {string} chatId - Chat ID
+   * @param {string} telegramUserId - Telegram user ID
+   * @param {string} text - Input text
+   */
+  async handleBackupCodesInput(chatId, telegramUserId, text) {
+    const db = require('../services/DatabaseService');
+
+    try {
+      // Parse backup codes (one per line)
+      const codes = text.split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0);
+
+      // Validate count
+      if (codes.length !== 10) {
+        await this.bot.sendMessage(
+          chatId,
+          `❌ **INVALID INPUT**\n\n` +
+          `You entered ${codes.length} code(s).\n` +
+          `Please enter exactly 10 backup codes.\n\n` +
+          `Try again or /start to cancel.`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      // Validate format (8 digits each)
+      const invalidCodes = [];
+      for (let i = 0; i < codes.length; i++) {
+        if (!/^\d{8}$/.test(codes[i])) {
+          invalidCodes.push(`Line ${i + 1}: "${codes[i]}"`);
+        }
+      }
+
+      if (invalidCodes.length > 0) {
+        await this.bot.sendMessage(
+          chatId,
+          `❌ **INVALID FORMAT**\n\n` +
+          `Invalid codes found:\n${invalidCodes.join('\n')}\n\n` +
+          `Each code must be exactly 8 digits.\n\n` +
+          `Try again or /start to cancel.`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      // Save to database
+      await db.saveBackupCodes(telegramUserId, codes);
+
+      await this.bot.sendMessage(
+        chatId,
+        `✅ **BACKUP CODES SAVED**\n\n` +
+        `Your 10 backup codes have been\n` +
+        `securely encrypted and saved.\n\n` +
+        `They will be used automatically\n` +
+        `during purchases.\n\n` +
+        `Use /start to return to menu.`,
+        { parse_mode: 'Markdown' }
+      );
+
+      // Clear session
+      sessionManager.updateState(chatId, 'idle');
+
+    } catch (err) {
+      logger.error('Error saving backup codes:', err);
+      await this.bot.sendMessage(
+        chatId,
+        '❌ **ERROR**\n\nFailed to save backup codes.\nPlease try again.',
+        { parse_mode: 'Markdown' }
       );
     }
   }
@@ -755,68 +1079,76 @@ class TelegramBotController {
     // Store password temporarily
     sessionManager.setPassword(chatId, password.trim());
 
-    // Show loading message
-    const logginMessage = await this.safeSendMessage(chatId, '⏳ Logging in to Razer...');
+    // Mark user as logging in - block all interactions
+    this.usersLoggingIn.add(telegramUserId);
 
     try {
-      // Attempt login (use telegramUserId as browser session key)
-      await scraperService.login(
-        telegramUserId,  // Use telegram ID as browser session key
-        session.email,
-        session.password
-      );
+      // Show loading message
+      const logginMessage = await this.safeSendMessage(chatId, '⏳ Logging in to Razer...\n\nPlease wait...');
 
-      // Login successful - save encrypted credentials to database
       try {
-        const emailEncrypted = encryptionService.encrypt(session.email);
-        const passwordEncrypted = encryptionService.encrypt(session.password);
-        await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
-        logger.success(`Saved encrypted credentials for user ${telegramUserId}`);
-      } catch (saveErr) {
-        logger.error('Failed to save credentials (login still successful):', saveErr);
-        // Continue anyway - login was successful
-      }
+        // Attempt login (use telegramUserId as browser session key)
+        await scraperService.login(
+          telegramUserId,  // Use telegram ID as browser session key
+          session.email,
+          session.password
+        );
 
-      // Clear credentials from memory
-      sessionManager.clearCredentials(chatId);
-
-      // Update session state
-      sessionManager.updateState(chatId, 'logged_in');
-
-      // Delete loading message and show success
-      if (logginMessage) {
+        // Login successful - save encrypted credentials to database
         try {
-          await this.bot.deleteMessage(chatId, logginMessage.message_id);
-        } catch (delErr) {
-          logger.warn('Could not delete loading message');
+          const emailEncrypted = encryptionService.encrypt(session.email);
+          const passwordEncrypted = encryptionService.encrypt(session.password);
+          await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
+          logger.success(`Saved encrypted credentials for user ${telegramUserId}`);
+        } catch (saveErr) {
+          logger.error('Failed to save credentials (login still successful):', saveErr);
+          // Continue anyway - login was successful
         }
-      }
-      await this.safeSendMessage(
-        chatId,
-        '✅ Logged in successfully!\n\n' +
-        '💾 Your credentials have been saved for automatic login next time.'
-      );
 
-    } catch (err) {
-      logger.error('Login error:', err);
+        // Clear credentials from memory
+        sessionManager.clearCredentials(chatId);
 
-      // Clear credentials on error
-      sessionManager.clearCredentials(chatId);
+        // Update session state
+        sessionManager.updateState(chatId, 'logged_in');
 
-      await this.safeSendMessage(
-        chatId,
-        '❌ Login failed. Please check your credentials and try again.',
-        {
-          reply_markup: {
-            inline_keyboard: [[{ text: '🔐 Login', callback_data: 'login' }]]
+        // Delete loading message and show success
+        if (logginMessage) {
+          try {
+            await this.bot.deleteMessage(chatId, logginMessage.message_id);
+          } catch (delErr) {
+            logger.warn('Could not delete loading message');
           }
         }
-      );
+        await this.safeSendMessage(
+          chatId,
+          '✅ Logged in successfully!\n\n' +
+          '💾 Your credentials have been saved for automatic login next time.'
+        );
 
-      // Reset session state and close browser
-      sessionManager.updateState(chatId, 'idle');
-      const browserManager = require('../services/BrowserManager');
-      await browserManager.closeBrowser(telegramUserId);
+      } catch (err) {
+        logger.error('Login error:', err);
+
+        // Clear credentials on error
+        sessionManager.clearCredentials(chatId);
+
+        await this.safeSendMessage(
+          chatId,
+          '❌ Login failed. Please check your credentials and try again.',
+          {
+            reply_markup: {
+              inline_keyboard: [[{ text: '🔐 Login', callback_data: 'login' }]]
+            }
+          }
+        );
+
+        // Reset session state and close browser
+        sessionManager.updateState(chatId, 'idle');
+        const browserManager = require('../services/BrowserManager');
+        await browserManager.closeBrowser(telegramUserId);
+      }
+    } finally {
+      // Always remove user from logging-in set
+      this.usersLoggingIn.delete(telegramUserId);
     }
   }
 
@@ -835,6 +1167,14 @@ class TelegramBotController {
       await this.bot.stopPolling();
       logger.bot('Telegram bot stopped');
     }
+  }
+
+  /**
+   * Get the bot instance
+   * @returns {TelegramBot} Bot instance
+   */
+  getBot() {
+    return this.bot;
   }
 }
 

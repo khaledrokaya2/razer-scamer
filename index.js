@@ -19,6 +19,10 @@ const logger = require('./src/utils/logger');
 // Import services and controllers
 const authService = require('./src/services/AuthorizationService');
 const botController = require('./src/controllers/TelegramBotController');
+const getScheduledOrderService = require('./src/services/ScheduledOrderService');
+
+// Global scheduled order service instance
+let scheduledOrderService = null;
 
 /**
  * Get environment-specific configuration
@@ -93,6 +97,12 @@ async function initializeServices(config) {
   logger.bot(`Starting ${botType} bot...`);
   botController.initialize(config.botToken);
 
+  // Initialize and start scheduled order service (singleton pattern)
+  const bot = botController.getBot();
+  scheduledOrderService = getScheduledOrderService(bot);
+  scheduledOrderService.start();
+  logger.success('Scheduled order service started');
+
   logger.success('All services initialized');
 }
 
@@ -131,6 +141,12 @@ async function handleShutdown() {
   logger.system('Shutting down gracefully...');
 
   try {
+    // Stop scheduled order service
+    if (scheduledOrderService) {
+      scheduledOrderService.stop();
+      logger.success('Scheduled order service stopped');
+    }
+
     // Stop the bot
     await botController.stop();
 

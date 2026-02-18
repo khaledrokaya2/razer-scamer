@@ -348,15 +348,16 @@ class DatabaseService {
 
   /**
    * Create purchase record with encrypted PIN and game/card info
-   * @param {Object} purchaseData - {orderId, transactionId, cardNumber, status, pinCode, gameName, cardValue}
+   * @param {Object} purchaseData - {orderId, transactionId, cardNumber, status, pinCode, serialNumber, gameName, cardValue}
    * @returns {Promise<Purchase>} Created purchase
    */
-  async createPurchaseWithEncryptedPin({ orderId, transactionId, cardNumber, status = 'pending', pinCode, gameName, cardValue }) {
+  async createPurchaseWithEncryptedPin({ orderId, transactionId, cardNumber, status = 'pending', pinCode, serialNumber, gameName, cardValue }) {
     try {
       await this.connect();
 
-      // Encrypt PIN if provided
+      // Encrypt PIN and serial number if provided
       const encryptedPin = pinCode ? encryptionService.encrypt(pinCode) : null;
+      const encryptedSerial = serialNumber ? encryptionService.encrypt(serialNumber) : null;
 
       const result = await this.pool.request()
         .input('order_id', sql.Int, orderId)
@@ -364,12 +365,13 @@ class DatabaseService {
         .input('card_number', sql.Int, cardNumber)
         .input('status', sql.NVarChar(20), status)
         .input('pin_encrypted', sql.NVarChar(500), encryptedPin)
+        .input('serial_number_encrypted', sql.NVarChar(500), encryptedSerial)
         .input('game_name', sql.NVarChar(100), gameName)
         .input('card_value', sql.NVarChar(100), cardValue)
         .query(`
-          INSERT INTO purchases (order_id, razer_transaction_id, card_number, status, pin_encrypted, game_name, card_value, purchased_at)
+          INSERT INTO purchases (order_id, razer_transaction_id, card_number, status, pin_encrypted, serial_number_encrypted, game_name, card_value, purchased_at)
           OUTPUT INSERTED.*
-          VALUES (@order_id, @razer_transaction_id, @card_number, @status, @pin_encrypted, @game_name, @card_value, SYSUTCDATETIME())
+          VALUES (@order_id, @razer_transaction_id, @card_number, @status, @pin_encrypted, @serial_number_encrypted, @game_name, @card_value, SYSUTCDATETIME())
         `);
 
       return new Purchase(result.recordset[0]);
@@ -431,6 +433,59 @@ class DatabaseService {
   }
 
   /**
+   * Get decrypted user credentials for auto-relogin
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<{email: string, password: string}|null>} Decrypted credentials or null
+   */
+  async getUserCredentials(telegramUserId) {
+    try {
+      const user = await this.getUserByTelegramId(telegramUserId);
+      if (!user) return null;
+
+      const encryption = require('../utils/encryption');
+
+      return {
+        email: user.email_encrypted ? encryption.decrypt(user.email_encrypted) : null,
+        password: user.password_encrypted ? encryption.decrypt(user.password_encrypted) : null
+      };
+    } catch (err) {
+      logger.error('Error getting user credentials:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Ensure user account exists, create if not
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<void>}
+   */
+  async ensureUserExists(telegramUserId) {
+    try {
+      await this.connect();
+
+      // Check if user exists
+      const existing = await this.getUserByTelegramId(telegramUserId);
+      if (existing) return;
+
+      // Create user account with username based on telegram_user_id
+      const username = `user_${telegramUserId}`;
+
+      await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .input('username', sql.NVarChar(50), username)
+        .query(`
+          INSERT INTO user_accounts (telegram_user_id, username, created_at)
+          VALUES (@telegram_user_id, @username, GETDATE())
+        `);
+
+      logger.info(`Created user account for telegram_user_id: ${telegramUserId}`);
+    } catch (err) {
+      logger.error('Error ensuring user exists:', err);
+      throw err;
+    }
+  }
+
+  /**
    * Create or update user with encrypted credentials
    * @param {string} telegramUserId - Telegram user ID
    * @param {string} emailEncrypted - Encrypted email
@@ -461,8 +516,23 @@ class DatabaseService {
 
         return new User(result.recordset[0]);
       } else {
-        // User doesn't exist - this shouldn't happen as users should be created via authorization
-        throw new Error('User account not found. Please contact administrator.');
+        // Create user account first
+        await this.ensureUserExists(telegramUserId);
+
+        // Now update with credentials
+        const result = await this.pool.request()
+          .input('telegram_user_id', sql.BigInt, telegramUserId)
+          .input('email_encrypted', sql.NVarChar(500), emailEncrypted)
+          .input('password_encrypted', sql.NVarChar(500), passwordEncrypted)
+          .query(`
+            UPDATE user_accounts 
+            SET email_encrypted = @email_encrypted, 
+                password_encrypted = @password_encrypted
+            OUTPUT INSERTED.*
+            WHERE telegram_user_id = @telegram_user_id
+          `);
+
+        return new User(result.recordset[0]);
       }
     } catch (err) {
       logger.error('Error saving user credentials:', err);
@@ -493,6 +563,317 @@ class DatabaseService {
       throw err;
     }
   }
+
+  // ============================================================================
+  // BACKUP CODE OPERATIONS
+  // ============================================================================
+
+  /**
+   * Save multiple backup codes for a user
+   * @param {string} telegramUserId - Telegram user ID
+   * @param {Array<string>} codes - Array of backup codes (unencrypted)
+   * @returns {Promise<number>} Number of codes saved
+   */
+  async saveBackupCodes(telegramUserId, codes) {
+    try {
+      await this.connect();
+
+      // Ensure user account exists
+      await this.ensureUserExists(telegramUserId);
+
+      // First, mark all existing codes as expired
+      await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query(`
+          UPDATE backup_codes 
+          SET status = 'expired' 
+          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+        `);
+
+      // Insert new codes as active
+      for (const code of codes) {
+        const codeEncrypted = encryptionService.encrypt(code);
+
+        await this.pool.request()
+          .input('telegram_user_id', sql.BigInt, telegramUserId)
+          .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
+          .query(`
+            INSERT INTO backup_codes (telegram_user_id, code_encrypted, status)
+            VALUES (@telegram_user_id, @code_encrypted, 'active')
+          `);
+      }
+
+      logger.database(`Saved ${codes.length} backup codes for user ${telegramUserId}`);
+      return codes.length;
+    } catch (err) {
+      logger.error('Error saving backup codes:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Get next available backup code for a user
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<string|null>} Decrypted backup code or null if none available
+   */
+  async getNextBackupCode(telegramUserId) {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query(`
+          SELECT TOP 1 id, code_encrypted 
+          FROM backup_codes 
+          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+          ORDER BY id ASC
+        `);
+
+      if (result.recordset.length === 0) {
+        return null;
+      }
+
+      const codeEncrypted = result.recordset[0].code_encrypted;
+      return encryptionService.decrypt(codeEncrypted);
+    } catch (err) {
+      logger.error('Error getting backup code:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Mark a backup code as used
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<boolean>} True if marked
+   */
+  async markBackupCodeAsUsed(telegramUserId) {
+    try {
+      await this.connect();
+
+      // Mark the oldest active code as used
+      const result = await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query(`
+          UPDATE TOP (1) backup_codes
+          SET status = 'used', used_at = SYSUTCDATETIME()
+          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+        `);
+
+      return result.rowsAffected[0] > 0;
+    } catch (err) {
+      logger.error('Error marking backup code as used:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Get count of active backup codes
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<number>} Count of active codes
+   */
+  async getActiveBackupCodeCount(telegramUserId) {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query(`
+          SELECT COUNT(*) as count 
+          FROM backup_codes 
+          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+        `);
+
+      return result.recordset[0].count;
+    } catch (err) {
+      logger.error('Error getting backup code count:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Delete all backup codes for a user
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<boolean>} True if deleted
+   */
+  async deleteAllBackupCodes(telegramUserId) {
+    try {
+      await this.connect();
+
+      await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query(`
+          DELETE FROM backup_codes 
+          WHERE telegram_user_id = @telegram_user_id
+        `);
+
+      return true;
+    } catch (err) {
+      logger.error('Error deleting backup codes:', err);
+      throw err;
+    }
+  }
+
+  // ============================================================================
+  // SCHEDULED ORDER OPERATIONS
+  // ============================================================================
+
+  /**
+   * Create a scheduled order
+   * @param {Object} orderData - Order data
+   * @returns {Promise<number>} Scheduled order ID
+   */
+  async createScheduledOrder(orderData) {
+    try {
+      await this.connect();
+
+      // Ensure user account exists
+      await this.ensureUserExists(orderData.telegramUserId);
+
+      const result = await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, orderData.telegramUserId)
+        .input('chat_id', sql.BigInt, orderData.chatId)
+        .input('game_name', sql.NVarChar(100), orderData.gameName)
+        .input('game_url', sql.NVarChar(500), orderData.gameUrl)
+        .input('card_name', sql.NVarChar(100), orderData.cardName)
+        .input('card_value', sql.NVarChar(100), orderData.cardValue)
+        .input('card_index', sql.Int, orderData.cardIndex)
+        .input('quantity', sql.Int, orderData.quantity)
+        .input('scheduled_time', sql.DateTime2, orderData.scheduledTime)
+        .query(`
+          INSERT INTO scheduled_orders 
+          (telegram_user_id, chat_id, game_name, game_url, card_name, card_value, card_index, quantity, scheduled_time)
+          OUTPUT INSERTED.id
+          VALUES (@telegram_user_id, @chat_id, @game_name, @game_url, @card_name, @card_value, @card_index, @quantity, @scheduled_time)
+        `);
+
+      return result.recordset[0].id;
+    } catch (err) {
+      logger.error('Error creating scheduled order:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Get pending scheduled orders that should be executed now
+   * @returns {Promise<Array>} Array of scheduled orders
+   */
+  async getPendingScheduledOrders() {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .query(`
+          SELECT * FROM scheduled_orders 
+          WHERE status = 'pending' AND scheduled_time <= SYSUTCDATETIME()
+          ORDER BY scheduled_time ASC
+        `);
+
+      logger.debug(`getPendingScheduledOrders: Found ${result.recordset.length} pending orders`);
+      if (result.recordset.length > 0) {
+        result.recordset.forEach(order => {
+          logger.debug(`  Order #${order.id}: scheduled for ${order.scheduled_time}, status: ${order.status}`);
+        });
+      }
+
+      return result.recordset;
+    } catch (err) {
+      logger.error('Error getting pending scheduled orders:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Update scheduled order status
+   * @param {number} scheduledOrderId - Scheduled order ID
+   * @param {string} status - New status
+   * @param {number} orderId - Order ID (optional)
+   * @param {string} errorMessage - Error message (optional)
+   * @returns {Promise<boolean>} True if updated
+   */
+  async updateScheduledOrderStatus(scheduledOrderId, status, orderId = null, errorMessage = null) {
+    try {
+      await this.connect();
+
+      const request = this.pool.request()
+        .input('id', sql.Int, scheduledOrderId)
+        .input('status', sql.NVarChar(20), status);
+
+      let query = 'UPDATE scheduled_orders SET status = @status';
+
+      if (orderId) {
+        request.input('order_id', sql.Int, orderId);
+        query += ', order_id = @order_id';
+      }
+
+      if (errorMessage) {
+        request.input('error_message', sql.NVarChar(sql.MAX), errorMessage);
+        query += ', error_message = @error_message';
+      }
+
+      if (status === 'completed' || status === 'failed') {
+        query += ', executed_at = SYSUTCDATETIME()';
+      }
+
+      query += ' WHERE id = @id';
+
+      await request.query(query);
+      return true;
+    } catch (err) {
+      logger.error('Error updating scheduled order status:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Get user's scheduled orders
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<Array>} Array of scheduled orders
+   */
+  async getUserScheduledOrders(telegramUserId) {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query(`
+          SELECT * FROM scheduled_orders 
+          WHERE telegram_user_id = @telegram_user_id 
+          ORDER BY scheduled_time DESC
+        `);
+
+      return result.recordset;
+    } catch (err) {
+      logger.error('Error getting user scheduled orders:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Cancel a scheduled order
+   * @param {number} scheduledOrderId - Scheduled order ID
+   * @param {string} telegramUserId - Telegram user ID (for authorization)
+   * @returns {Promise<boolean>} True if cancelled
+   */
+  async cancelScheduledOrder(scheduledOrderId, telegramUserId) {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .input('id', sql.Int, scheduledOrderId)
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query(`
+          UPDATE scheduled_orders 
+          SET status = 'cancelled' 
+          WHERE id = @id AND telegram_user_id = @telegram_user_id AND status = 'pending'
+        `);
+
+      return result.rowsAffected[0] > 0;
+    } catch (err) {
+      logger.error('Error cancelling scheduled order:', err);
+      throw err;
+    }
+  }
+
   /**
    * Close database connection pool
    */

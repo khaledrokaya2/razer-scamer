@@ -315,6 +315,9 @@ class OrderFlowHandler {
       keyboard.push(row);
     }
 
+    // Add "Others" button for custom URL
+    keyboard.push([{ text: '🔗 Others (Custom URL)', callback_data: 'order_game_custom' }]);
+
     // UX FIX #15: Add cancel button
     keyboard.push([{ text: '❌ Cancel Order', callback_data: 'order_cancel' }]);
 
@@ -331,6 +334,186 @@ class OrderFlowHandler {
       this.gameMenuMessages.set(chatId, gameMenuMsg.message_id);
     } catch (err) {
       logger.error('Error showing game selection:', err);
+    }
+  }
+
+  /**
+   * Handle custom game URL selection
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   */
+  async handleCustomGameUrl(bot, chatId) {
+    // Delete game menu message
+    const gameMenuMsgId = this.gameMenuMessages.get(chatId);
+    if (gameMenuMsgId) {
+      try {
+        await bot.deleteMessage(chatId, gameMenuMsgId);
+        this.gameMenuMessages.delete(chatId);
+      } catch (delErr) {
+        logger.debug('Could not delete game menu message');
+      }
+    }
+
+    // Update session to expect custom URL
+    this.updateSession(chatId, {
+      step: 'enter_custom_url'
+    });
+
+    await bot.sendMessage(chatId,
+      `🔗 *CUSTOM GAME URL*\n\n` +
+      `Enter the Razer Gold game URL:\n\n` +
+      `✅ *Example:*\n` +
+      `https://gold.razer.com/global/en/gold/catalog/game-name\n\n` +
+      `⚠️ *Requirements:*\n` +
+      `- Must be a Razer Gold URL\n` +
+      `- Must start with https://gold.razer.com\n` +
+      `- Must accept Razer Gold as payment\n\n` +
+      `_Type /start to cancel_`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  /**
+   * Handle custom URL input
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   * @param {number} telegramUserId - Telegram user ID
+   * @param {string} url - Game URL
+   */
+  async handleCustomUrlInput(bot, chatId, telegramUserId, url) {
+    const session = this.getSession(chatId);
+    if (!session) return;
+
+    const urlTrimmed = url.trim();
+
+    // Validate URL format
+    if (!urlTrimmed.startsWith('https://gold.razer.com')) {
+      try {
+        await bot.sendMessage(chatId,
+          `❌ *INVALID URL*\n\n` +
+          `The URL must be a Razer Gold link.\n\n` +
+          `✅ *Must start with:*\n` +
+          `https://gold.razer.com\n\n` +
+          `Please try again:`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        logger.error('Error sending invalid URL message:', err);
+      }
+      return;
+    }
+
+    // Validate URL structure
+    try {
+      new URL(urlTrimmed);
+    } catch (err) {
+      try {
+        await bot.sendMessage(chatId,
+          `❌ *INVALID URL FORMAT*\n\n` +
+          `The URL format is incorrect.\n\n` +
+          `Please enter a valid URL:`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (sendErr) {
+        logger.error('Error sending invalid format message:', sendErr);
+      }
+      return;
+    }
+
+    // Extract game name from URL
+    const urlParts = urlTrimmed.split('/');
+    const gameName = urlParts[urlParts.length - 1]
+      .split('?')[0]
+      .replace(/-/g, ' ')
+      .replace(/\b\w/g, c => c.toUpperCase());
+
+    // Update session
+    this.updateSession(chatId, {
+      step: 'select_card',
+      gameId: 'custom',
+      gameName: `🎮 ${gameName}`,
+      gameUrl: urlTrimmed
+    });
+
+    // Show loading message
+    const loadingMsg = await bot.sendMessage(chatId,
+      `╔═══════════════════════╗\n` +
+      `   🔄 *LOADING CARDS*    \n` +
+      `╚═══════════════════════╝\n\n` +
+      `⏳ *${gameName}*\n\n` +
+      `Fetching available cards...\n` +
+      `_Please wait..._`,
+      { parse_mode: 'Markdown' }
+    );
+
+    try {
+      logger.http(`Scraping cards from custom URL: ${urlTrimmed}`);
+
+      // Get available cards from Razer
+      const cards = await purchaseService.getAvailableCards(telegramUserId, urlTrimmed);
+
+      logger.success(`Found ${cards.length} cards`);
+
+      // Delete loading message
+      try {
+        await bot.deleteMessage(chatId, loadingMsg.message_id);
+      } catch (delErr) {
+        logger.debug('Could not delete loading message');
+      }
+
+      // Create keyboard with card options
+      const keyboard = cards.map((card, index) => [
+        {
+          text: card.disabled ? `❌ ${card.name} (Out of Stock)` : `✅ ${card.name}`,
+          callback_data: `order_card_${index}_${card.name.replace(/\s+/g, '_')}`
+        }
+      ]);
+
+      // Add back and cancel buttons
+      keyboard.push([
+        { text: '⬅️ Back to Games', callback_data: 'order_back_to_games' },
+        { text: '❌ Cancel', callback_data: 'order_cancel' }
+      ]);
+
+      const cardMenuMsg = await bot.sendMessage(chatId,
+        `💎 *SELECT CARD VALUE* \n` +
+        `🎮 *Game:* ${gameName}\n\n` +
+        `Choose a card denomination:\n\n` +
+        `_Out of stock cards will be_\n` +
+        `_monitored and auto-purchased_\n` +
+        `_when available._`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: keyboard }
+        }
+      );
+      // Store message ID for later deletion
+      this.cardMenuMessages.set(chatId, cardMenuMsg.message_id);
+
+    } catch (err) {
+      logger.error(`Error loading cards from custom URL:`, err.message);
+
+      // Delete loading message
+      try {
+        await bot.deleteMessage(chatId, loadingMsg.message_id);
+      } catch (delErr) {
+        logger.debug('Could not delete loading message');
+      }
+
+      // Show error message
+      await bot.sendMessage(chatId,
+        `❌ *ERROR LOADING CARDS*\n\n` +
+        `Could not fetch cards from this URL.\n\n` +
+        `Possible reasons:\n` +
+        `• Invalid game URL\n` +
+        `• Game not available in your region\n` +
+        `• Network error\n\n` +
+        `Please try a different URL or\n` +
+        `choose from the game menu.`,
+        { parse_mode: 'Markdown' }
+      );
+
+      this.clearSession(chatId);
     }
   }
 
@@ -658,37 +841,95 @@ class OrderFlowHandler {
       return;
     }
 
-    // Update session
+    // Update session with quantity
     this.updateSession(chatId, {
-      step: 'enter_backup_code',
       quantity: quantity
     });
 
-    // Ask for backup code
+    // Check if user has backup codes in database
+    const db = require('../services/DatabaseService');
+    const telegramUserId = session.telegramUserId || chatId;
+
+    try {
+      const backupCodeCount = await db.getActiveBackupCodeCount(telegramUserId);
+
+      if (backupCodeCount === 0) {
+        await bot.sendMessage(chatId,
+          `⚠️ *NO BACKUP CODES*\n\n` +
+          `You need to add backup codes first.\n\n` +
+          `Go to: ⚙️ Settings → 🔑 Backup Codes\n\n` +
+          `_Use /start to cancel this order_`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      if (backupCodeCount < 5) {
+        await bot.sendMessage(chatId,
+          `⚠️ *LOW BACKUP CODES*\n\n` +
+          `You only have ${backupCodeCount} backup codes.\n` +
+          `For ${quantity} cards, you may need ${Math.ceil(quantity / 15)} codes.\n\n` +
+          `Recommended: At least 5 codes for safety.\n\n` +
+          `Would you like to continue?`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '✅ Continue Anyway', callback_data: 'order_confirm_continue' }],
+                [{ text: '🔑 Add More Codes', callback_data: 'settings_backup_codes' }],
+                [{ text: '❌ Cancel Order', callback_data: 'order_cancel' }]
+              ]
+            }
+          }
+        );
+        return;
+      }
+
+      // Show order confirmation with schedule option
+      await this.showOrderConfirmation(bot, chatId);
+
+    } catch (err) {
+      logger.error('Error checking backup codes:', err);
+      await bot.sendMessage(chatId,
+        `❌ *ERROR*\n\n` +
+        `Failed to check backup codes.\n` +
+        `Please try again or /start to cancel.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+
+  /**
+   * Show order confirmation with Buy Now and Schedule options
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   */
+  async showOrderConfirmation(bot, chatId) {
+    const session = this.getSession(chatId);
+
+    if (!session) return;
+
     await bot.sendMessage(chatId,
-      `🔐 *BACKUP CODES NEEDED* \n` +
-      `✅ *Quantity:* ${quantity} cards\n\n` +
-      `Please enter *5 to 10 backup codes*\n` +
-      `(one per line):\n\n` +
-      `Example:\n` +
-      `12345678\n` +
-      `87654321\n` +
-      `11223344\n` +
-      `44332211\n` +
-      `55667788\n` +
-      `...\n\n` +
-      `⚠️ *Note:* Each backup code is\n` +
-      `single-use. You can provide 5-10\n` +
-      `codes to handle 2FA prompts during\n` +
-      `the purchase process.`,
+      `📋 *ORDER SUMMARY*\n\n` +
+      `🎮 Game: ${session.gameName}\n` +
+      `💳 Card: ${session.cardName}\n` +
+      `🔢 Quantity: ${session.quantity}\n\n` +
+      `When would you like to process this order?`,
       {
         parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🚀 Buy Now', callback_data: 'order_buy_now' }],
+            [{ text: '⏰ Schedule for Later', callback_data: 'order_schedule' }],
+            [{ text: '❌ Cancel', callback_data: 'order_cancel' }]
+          ]
+        }
       }
     );
   }
 
   /**
-   * Handle backup code input
+   * Handle backup code input (DEPRECATED - now uses database)
    * @param {Object} bot - Telegram bot instance
    * @param {number} chatId - Chat ID
    * @param {user} user - User Object
@@ -899,7 +1140,6 @@ class OrderFlowHandler {
         cardName: session.cardName,
         cardIndex: session.cardIndex,
         quantity: session.quantity,
-        backupCodes: session.backupCodes, // Pass array of codes
         onProgress: sendProgressUpdate,  // UX FIX #16
         checkCancellation: () => this.isCancelled(chatId)  // Check if user cancelled
       });
@@ -943,7 +1183,7 @@ class OrderFlowHandler {
 
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 
-        // Always send PINs as TXT file (for all orders)
+        // Send PINs as TXT files in TWO FORMATS
         try {
           const fs = require('fs');
           const path = require('path');
@@ -954,31 +1194,51 @@ class OrderFlowHandler {
             fs.mkdirSync(pinsDir, { recursive: true });
           }
 
-          // Generate file name
-          const fileName = `Order_${result.order.id}_Pins.txt`;
-          const filePath = path.join(pinsDir, fileName);
+          // 1. Generate FIRST file: PIN + Serial Number format
+          const fileName1 = `Order_${result.order.id}_Pins_with_Serial.txt`;
+          const filePath1 = path.join(pinsDir, fileName1);
 
-          // Generate file content - PINs only, one per line
-          let fileContent = '';
+          let fileContent1 = '';
           result.pins.forEach((pin) => {
-            fileContent += `${pin.pinCode}\n`;
+            const serialNum = pin.serialNumber || 'N/A';
+            fileContent1 += `${pin.pinCode}\n${serialNum}\n`;
           });
 
-          // Write file
-          fs.writeFileSync(filePath, fileContent, 'utf8');
+          fs.writeFileSync(filePath1, fileContent1, 'utf8');
 
-          // Send file
-          await bot.sendDocument(chatId, filePath, {
-            caption: `📄 *PIN Codes for Order #${result.order.id}*\n\n` +
-              `All ${result.pins.length} PIN codes are in the attached file.`,
+          // Send first file
+          await bot.sendDocument(chatId, filePath1, {
+            caption: `📄 *PIN Codes + Serial Numbers*\n` +
+              `Order #${result.order.id}\n\n` +
+              `Format: PIN on first line, Serial on second line`,
             parse_mode: 'Markdown'
           });
 
-          // Delete file after sending
-          fs.unlinkSync(filePath);
+          fs.unlinkSync(filePath1);
+
+          // 2. Generate SECOND file: PINs only
+          const fileName2 = `Order_${result.order.id}_Pins_Only.txt`;
+          const filePath2 = path.join(pinsDir, fileName2);
+
+          let fileContent2 = '';
+          result.pins.forEach((pin) => {
+            fileContent2 += `${pin.pinCode}\n`;
+          });
+
+          fs.writeFileSync(filePath2, fileContent2, 'utf8');
+
+          // Send second file
+          await bot.sendDocument(chatId, filePath2, {
+            caption: `📄 *PIN Codes Only*\n` +
+              `Order #${result.order.id}\n\n` +
+              `Format: One PIN per line`,
+            parse_mode: 'Markdown'
+          });
+
+          fs.unlinkSync(filePath2);
 
         } catch (err) {
-          logger.error('Error sending TXT file:', err);
+          logger.error('Error sending TXT files:', err);
           // Fallback to message format
           const plainMessages = orderService.formatPinsPlain(result.pins);
           for (const message of plainMessages) {
@@ -1000,10 +1260,10 @@ class OrderFlowHandler {
       this.orderSummaryMessages.delete(chatId);
 
     } catch (err) {
-      logger.error('Order processing error:', err);
-
-      // Check if it was a user cancellation
+      // Check if it was a user cancellation BEFORE logging as error
       if (err.message && err.message.includes('cancelled by user')) {
+        // Log as info instead of error since it's expected user action
+        logger.info('Order cancelled by user at stage:', err.stage || 'unknown');
         try {
           // Check if there were any completed purchases
           if (err.partialOrder && err.partialOrder.pins && err.partialOrder.pins.length > 0) {
@@ -1052,7 +1312,7 @@ class OrderFlowHandler {
               { parse_mode: 'Markdown' }
             );
 
-            // Send the pins as TXT file
+            // Send the pins as TXT files in TWO FORMATS
             try {
               const fs = require('fs');
               const path = require('path');
@@ -1063,31 +1323,51 @@ class OrderFlowHandler {
                 fs.mkdirSync(pinsDir, { recursive: true });
               }
 
-              // Generate file name
-              const fileName = `Order_${err.partialOrder.order.id}_Pins.txt`;
-              const filePath = path.join(pinsDir, fileName);
+              // 1. Generate FIRST file: PIN + Serial Number format
+              const fileName1 = `Order_${err.partialOrder.order.id}_Pins_with_Serial.txt`;
+              const filePath1 = path.join(pinsDir, fileName1);
 
-              // Generate file content - PINs only, one per line
-              let fileContent = '';
+              let fileContent1 = '';
               err.partialOrder.pins.forEach((pin) => {
-                fileContent += `${pin.pinCode}\n`;
+                const serialNum = pin.serialNumber || 'N/A';
+                fileContent1 += `${pin.pinCode}\n${serialNum}\n`;
               });
 
-              // Write file
-              fs.writeFileSync(filePath, fileContent, 'utf8');
+              fs.writeFileSync(filePath1, fileContent1, 'utf8');
 
-              // Send file
-              await bot.sendDocument(chatId, filePath, {
-                caption: `📄 *PIN Codes for Order #${err.partialOrder.order.id}*\n\n` +
-                  `${err.partialOrder.pins.length} completed PIN codes are in the attached file.`,
+              // Send first file
+              await bot.sendDocument(chatId, filePath1, {
+                caption: `📄 *PIN Codes + Serial Numbers*\n` +
+                  `Order #${err.partialOrder.order.id}\n\n` +
+                  `Format: PIN on first line, Serial on second line`,
                 parse_mode: 'Markdown'
               });
 
-              // Delete file after sending
-              fs.unlinkSync(filePath);
+              fs.unlinkSync(filePath1);
+
+              // 2. Generate SECOND file: PINs only
+              const fileName2 = `Order_${err.partialOrder.order.id}_Pins_Only.txt`;
+              const filePath2 = path.join(pinsDir, fileName2);
+
+              let fileContent2 = '';
+              err.partialOrder.pins.forEach((pin) => {
+                fileContent2 += `${pin.pinCode}\n`;
+              });
+
+              fs.writeFileSync(filePath2, fileContent2, 'utf8');
+
+              // Send second file
+              await bot.sendDocument(chatId, filePath2, {
+                caption: `📄 *PIN Codes Only*\n` +
+                  `Order #${err.partialOrder.order.id}\n\n` +
+                  `Format: One PIN per line`,
+                parse_mode: 'Markdown'
+              });
+
+              fs.unlinkSync(filePath2);
 
             } catch (fileErr) {
-              logger.error('Error sending TXT file:', fileErr);
+              logger.error('Error sending TXT files:', fileErr);
               // Fallback to message format
               const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
               for (const message of plainMessages) {
@@ -1161,6 +1441,9 @@ class OrderFlowHandler {
         this.cancellingMessages.delete(chatId);
         this.orderSummaryMessages.delete(chatId);
         return;
+      } else {
+        // Log actual errors (not user cancellations)
+        logger.error('Order processing error:', err);
       }
 
       // UX FIX #17: Use friendly error messages
@@ -1244,7 +1527,553 @@ class OrderFlowHandler {
     }
   }
 
-}
+  /**
+   * Handle Buy Now - Start order immediately
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   * @param {string} telegramUserId - Telegram user ID
+   */
+  async handleBuyNow(bot, chatId, telegramUserId) {
+    const session = this.getSession(chatId);
+    if (!session) return;
 
+    // Store telegram user ID in session
+    session.telegramUserId = telegramUserId;
+
+    // Start the order processing (this is the existing backup code input handler logic)
+    // We'll call the existing logic from handleBackupCodeInput
+    // But instead of waiting for backup codes from user, we get from database
+
+    const orderService = require('../services/OrderService');
+    const db = require('../services/DatabaseService');
+
+    try {
+      // Update session to processing
+      this.updateSession(chatId, { step: 'processing' });
+
+      // Show processing message with cancel button
+      const processingMsg = await bot.sendMessage(chatId,
+        `⏳ *PROCESSING ORDER...*\n\n` +
+        `🎮 ${session.gameName}\n` +
+        `💳 ${session.cardName}\n` +
+        `🔢 Quantity: ${session.quantity}\n\n` +
+        `⏱️ This may take several minutes.\n` +
+        `Please wait...`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
+            ]]
+          }
+        }
+      );
+
+      this.orderSummaryMessages.set(chatId, processingMsg.message_id);
+
+      // Process order with progress updates and cancellation check
+      const result = await orderService.processOrder({
+        telegramUserId: telegramUserId,
+        gameName: session.gameName,
+        gameUrl: session.gameUrl,
+        cardName: session.cardName,
+        cardIndex: session.cardIndex,
+        quantity: session.quantity,
+        onProgress: async (completed, total) => {
+          try {
+            const progressBar = this.createProgressBar(completed, total);
+            const percentage = Math.round((completed / total) * 100);
+
+            const progressText = `⏳ *PURCHASE PROGRESS*   \n` +
+              `${progressBar}\n\n` +
+              `✅ *Completed:* ${completed} / ${total} cards\n` +
+              `📊 *Progress:* ${percentage}%\n\n` +
+              `_Processing... Please wait_`;
+
+            // Check if we have a previous progress message to edit
+            const existingMessageId = this.progressMessages.get(chatId);
+
+            if (existingMessageId) {
+              // Edit existing message
+              try {
+                await bot.editMessageText(progressText, {
+                  chat_id: chatId,
+                  message_id: existingMessageId,
+                  parse_mode: 'Markdown',
+                  reply_markup: {
+                    inline_keyboard: [[
+                      { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
+                    ]]
+                  }
+                });
+              } catch (editErr) {
+                // If edit fails (message too old or deleted), send new message
+                logger.debug('Could not edit progress message, sending new one');
+                const newMsg = await bot.sendMessage(chatId, progressText, {
+                  parse_mode: 'Markdown',
+                  reply_markup: {
+                    inline_keyboard: [[
+                      { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
+                    ]]
+                  }
+                });
+                this.progressMessages.set(chatId, newMsg.message_id);
+              }
+            } else {
+              // Send new message and store its ID
+              const msg = await bot.sendMessage(chatId, progressText, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
+                  ]]
+                }
+              });
+              this.progressMessages.set(chatId, msg.message_id);
+            }
+          } catch (err) {
+            logger.debug('Could not send progress update:', err.message);
+          }
+        },
+        checkCancellation: () => {
+          return this.isCancelled(chatId);
+        }
+      });
+
+      // Order completed successfully - send results to user
+      const successfulCards = result.order.completed_purchases;
+      const failedCards = result.pins.filter(p => p.pinCode === 'FAILED').length;
+
+      // Delete the progress message and order summary before sending results
+      const progressMsgId = this.progressMessages.get(chatId);
+      if (progressMsgId) {
+        try {
+          await bot.deleteMessage(chatId, progressMsgId);
+          this.progressMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete progress message');
+        }
+      }
+
+      const summaryMsgId = this.orderSummaryMessages.get(chatId);
+      if (summaryMsgId) {
+        try {
+          await bot.deleteMessage(chatId, summaryMsgId);
+          this.orderSummaryMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete order summary message');
+        }
+      }
+
+      try {
+        let statusMessage = `✅ *ORDER COMPLETED*   \n` +
+          `🆔 *Order ID:* #${result.order.id}\n\n` +
+          `📦 *Cards Processed*\n` +
+          `     ${successfulCards} / ${result.order.cards_count} cards\n\n`;
+
+        if (failedCards > 0) {
+          statusMessage += `⚠️ *${failedCards} card(s) marked FAILED*\n\n`;
+        }
+
+        statusMessage += `📊 *Status:* ${result.order.status}\n\n`;
+
+        await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+
+        // Send PINs as TXT files in TWO FORMATS
+        try {
+          const fs = require('fs');
+          const path = require('path');
+
+          // Create pins directory if it doesn't exist
+          const pinsDir = path.join(process.cwd(), 'temp_pins');
+          if (!fs.existsSync(pinsDir)) {
+            fs.mkdirSync(pinsDir, { recursive: true });
+          }
+
+          // 1. Generate FIRST file: PIN only format
+          const fileName1 = `Order_${result.order.id}_Pins_Only.txt`;
+          const filePath1 = path.join(pinsDir, fileName1);
+
+          let fileContent1 = '';
+          result.pins.forEach((pin) => {
+            fileContent1 += `${pin.pinCode}\n`;
+          });
+
+          fs.writeFileSync(filePath1, fileContent1, 'utf8');
+
+          // Send first file (PINs only)
+          await bot.sendDocument(chatId, filePath1, {
+            caption: `📄 *PIN Codes Only*\n` +
+              `Order #${result.order.id}\n\n` +
+              `Format: One PIN per line`,
+            parse_mode: 'Markdown'
+          });
+
+          fs.unlinkSync(filePath1);
+
+          // 2. Generate SECOND file: PIN + Serial Number format
+          const fileName2 = `Order_${result.order.id}_Pins_with_Serial.txt`;
+          const filePath2 = path.join(pinsDir, fileName2);
+
+          let fileContent2 = '';
+          result.pins.forEach((pin) => {
+            const serialNum = pin.serialNumber || 'N/A';
+            fileContent2 += `${pin.pinCode}\n${serialNum}\n`;
+          });
+
+          fs.writeFileSync(filePath2, fileContent2, 'utf8');
+
+          // Send second file (PINs with serial numbers)
+          await bot.sendDocument(chatId, filePath2, {
+            caption: `📄 *PIN Codes + Serial Numbers*\n` +
+              `Order #${result.order.id}\n\n` +
+              `Format: PIN on first line, Serial on second line`,
+            parse_mode: 'Markdown'
+          });
+
+          fs.unlinkSync(filePath2);
+
+        } catch (err) {
+          logger.error('Error sending TXT files:', err);
+          // Fallback to message format
+          const plainMessages = orderService.formatPinsPlain(result.pins);
+          for (const message of plainMessages) {
+            await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+          }
+        }
+
+        // Clear pins from memory after sending
+        orderService.clearOrderPins(result.order.id);
+
+      } catch (err) {
+        logger.error('Error sending order results:', err);
+      }
+
+      this.clearSession(chatId);
+      this.clearCancellation(chatId);
+      this.progressMessages.delete(chatId);
+      this.orderSummaryMessages.delete(chatId);
+
+    } catch (err) {
+      // Check if it was a user cancellation BEFORE logging as error
+      if (err.message && err.message.includes('cancelled by user')) {
+        // Log as info instead of error since it's expected user action
+        logger.info('Order cancelled by user at stage:', err.stage || 'unknown');
+        try {
+          // Check if there were any completed purchases
+          if (err.partialOrder && err.partialOrder.pins && err.partialOrder.pins.length > 0) {
+            const failedCards = err.partialOrder.pins.filter(p => p.pinCode === 'FAILED').length;
+
+            // Delete the progress message before sending results
+            const progressMsgId = this.progressMessages.get(chatId);
+            if (progressMsgId) {
+              try {
+                await bot.deleteMessage(chatId, progressMsgId);
+                this.progressMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete progress message');
+              }
+            }
+
+            // Delete the order summary message before sending results
+            const summaryMsgId = this.orderSummaryMessages.get(chatId);
+            if (summaryMsgId) {
+              try {
+                await bot.deleteMessage(chatId, summaryMsgId);
+                this.orderSummaryMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete order summary message');
+              }
+            }
+
+            await bot.sendMessage(chatId,
+              `🛑 *ORDER CANCELLED*   \n` +
+              `🆔 *Order ID:* #${err.partialOrder.order.id}\n\n` +
+              `✅ ${err.partialOrder.pins.length - failedCards} card(s) completed\n` +
+              (failedCards > 0 ? `❌ ${failedCards} card(s) failed\n` : '') +
+              `⏹️ Remaining cards not processed\n\n` +
+              `Your completed PINs will be sent below.`,
+              { parse_mode: 'Markdown' }
+            );
+
+            // Send TXT files with partial results
+            try {
+              const fs = require('fs');
+              const path = require('path');
+
+              const pinsDir = path.join(process.cwd(), 'temp_pins');
+              if (!fs.existsSync(pinsDir)) {
+                fs.mkdirSync(pinsDir, { recursive: true });
+              }
+
+              // 1. Generate first file: PIN + Serial
+              const fileName1 = `Order_${err.partialOrder.order.id}_Partial_Pins_with_Serial.txt`;
+              const filePath1 = path.join(pinsDir, fileName1);
+
+              let fileContent1 = '';
+              err.partialOrder.pins.forEach((pin) => {
+                const serialNum = pin.serialNumber || 'N/A';
+                fileContent1 += `${pin.pinCode}\n${serialNum}\n`;
+              });
+
+              fs.writeFileSync(filePath1, fileContent1, 'utf8');
+
+              await bot.sendDocument(chatId, filePath1, {
+                caption: `📄 *PIN Codes + Serial Numbers*\n` +
+                  `Order #${err.partialOrder.order.id} (Partial)\n\n` +
+                  `Format: PIN on first line, Serial on second line`,
+                parse_mode: 'Markdown'
+              });
+
+              fs.unlinkSync(filePath1);
+
+              // 2. Generate second file: PINs only
+              const fileName2 = `Order_${err.partialOrder.order.id}_Partial_Pins_Only.txt`;
+              const filePath2 = path.join(pinsDir, fileName2);
+
+              let fileContent2 = '';
+              err.partialOrder.pins.forEach((pin) => {
+                fileContent2 += `${pin.pinCode}\n`;
+              });
+
+              fs.writeFileSync(filePath2, fileContent2, 'utf8');
+
+              await bot.sendDocument(chatId, filePath2, {
+                caption: `📄 *PIN Codes Only*\n` +
+                  `Order #${err.partialOrder.order.id} (Partial)\n\n` +
+                  `Format: One PIN per line`,
+                parse_mode: 'Markdown'
+              });
+
+              fs.unlinkSync(filePath2);
+
+            } catch (fileErr) {
+              logger.error('Error sending TXT files:', fileErr);
+              // Fallback to message format
+              const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
+              for (const message of plainMessages) {
+                await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+              }
+            }
+
+            orderService.clearOrderPins(err.partialOrder.order.id);
+
+            const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
+            if (remaining > 0) {
+              await bot.sendMessage(chatId,
+                `ℹ️ ${remaining} card(s) were not processed.\n\n` +
+                `Use /start to create a new order.`,
+                { parse_mode: 'Markdown' }
+              );
+            }
+          } else {
+            // No purchases completed
+            const progressMsgId = this.progressMessages.get(chatId);
+            if (progressMsgId) {
+              try {
+                await bot.deleteMessage(chatId, progressMsgId);
+                this.progressMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete progress message');
+              }
+            }
+
+            const summaryMsgId = this.orderSummaryMessages.get(chatId);
+            if (summaryMsgId) {
+              try {
+                await bot.deleteMessage(chatId, summaryMsgId);
+                this.orderSummaryMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete order summary message');
+              }
+            }
+
+            await bot.sendMessage(chatId,
+              `🛑 *ORDER CANCELLED*   \n` +
+              `No cards were processed.\n\n` +
+              `Use /start to create a new order.`,
+              { parse_mode: 'Markdown' }
+            );
+          }
+        } catch (sendErr) {
+          logger.error('Error sending cancellation message:', sendErr);
+        }
+
+        this.clearSession(chatId);
+        this.clearCancellation(chatId);
+        this.progressMessages.delete(chatId);
+        this.orderSummaryMessages.delete(chatId);
+        return;
+      }
+
+      // Not a cancellation - log error and send friendly message
+      logger.error('Buy Now error:', err);
+      const friendlyError = this.getUserFriendlyError(err);
+      await bot.sendMessage(chatId, friendlyError, { parse_mode: 'Markdown' });
+      this.clearSession(chatId);
+    }
+  }
+
+  /**
+   * Handle Schedule Order - Ask for date/time
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   */
+  async handleScheduleOrder(bot, chatId) {
+    const session = this.getSession(chatId);
+    if (!session) return;
+
+    this.updateSession(chatId, { step: 'enter_schedule_time' });
+
+    // Show current Egypt time (UTC+2)
+    const nowUTC = new Date();
+    const EGYPT_OFFSET_HOURS = 2;
+    const nowEgypt = new Date(nowUTC.getTime() + (EGYPT_OFFSET_HOURS * 60 * 60 * 1000));
+    const currentEgyptTime = `${nowEgypt.getUTCFullYear()}-${String(nowEgypt.getUTCMonth() + 1).padStart(2, '0')}-${String(nowEgypt.getUTCDate()).padStart(2, '0')} ${String(nowEgypt.getUTCHours()).padStart(2, '0')}:${String(nowEgypt.getUTCMinutes()).padStart(2, '0')}`;
+
+    await bot.sendMessage(chatId,
+      `⏰ *SCHEDULE ORDER*\n\n` +
+      `Enter the date and time when you\n` +
+      `want this order to be processed.\n\n` +
+      `Format: YYYY-MM-DD HH:MM\n` +
+      `Example: 2026-02-20 14:30\n\n` +
+      `📍 Current Egypt time:\n` +
+      `\`${currentEgyptTime}\`\n\n` +
+      `⚠️ Use Egypt time (Cairo timezone)\n` +
+      `_Works on any server location_\n\n` +
+      `_Use /start to cancel_`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  /**
+   * Handle Schedule Time Input
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   * @param {string} telegramUserId - Telegram user ID
+   * @param {string} text - DateTime input
+   */
+  async handleScheduleTimeInput(bot, chatId, telegramUserId, text) {
+    const session = this.getSession(chatId);
+    if (!session || session.step !== 'enter_schedule_time') return;
+
+    const db = require('../services/DatabaseService');
+
+    try {
+      // Parse datetime
+      const dateTimeRegex = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/;
+      const match = text.trim().match(dateTimeRegex);
+
+      if (!match) {
+        await bot.sendMessage(chatId,
+          `❌ *INVALID FORMAT*\n\n` +
+          `Please use: YYYY-MM-DD HH:MM\n` +
+          `Example: 2026-02-20 14:30\n\n` +
+          `⏰ Use Egypt time (Cairo)\n\n` +
+          `_Try again or /start to cancel_`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      // IMPORTANT: User enters Egypt time (UTC+2), convert to UTC for database
+      // This works regardless of where the server is located (Egypt, London, etc.)
+      const year = parseInt(match[1]);
+      const month = parseInt(match[2]) - 1; // JS months are 0-indexed
+      const day = parseInt(match[3]);
+      const hour = parseInt(match[4]);
+      const minute = parseInt(match[5]);
+
+      // Egypt is always UTC+2 (no DST since 2014)
+      const EGYPT_OFFSET_HOURS = 2;
+
+      // Interpret user's input as Egypt time and convert to UTC
+      // Example: User enters "07:21 Egypt" → Store as "05:21 UTC"
+      const egyptTimeAsUTC = Date.UTC(year, month, day, hour, minute, 0);
+      const scheduledTimeUTC = egyptTimeAsUTC - (EGYPT_OFFSET_HOURS * 60 * 60 * 1000);
+      const scheduledTime = new Date(scheduledTimeUTC);
+
+      logger.debug(`User entered: ${match[0]} Egypt time → Storing as: ${scheduledTime.toISOString()} UTC`);
+
+      // Validate not in the past (compare in UTC)
+      const nowUTC = new Date();
+      if (scheduledTime <= nowUTC) {
+        // Show current Egypt time for reference
+        const nowEgyptTime = new Date(nowUTC.getTime() + (EGYPT_OFFSET_HOURS * 60 * 60 * 1000));
+        const displayTime = `${nowEgyptTime.getUTCFullYear()}-${String(nowEgyptTime.getUTCMonth() + 1).padStart(2, '0')}-${String(nowEgyptTime.getUTCDate()).padStart(2, '0')} ${String(nowEgyptTime.getUTCHours()).padStart(2, '0')}:${String(nowEgyptTime.getUTCMinutes()).padStart(2, '0')}`;
+
+        await bot.sendMessage(chatId,
+          `❌ *INVALID TIME*\n\n` +
+          `Scheduled time must be in the future.\n\n` +
+          `Current Egypt time:\n${displayTime}\n\n` +
+          `_Try again or /start to cancel_`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      // Validate not too far in the future (e.g., max 30 days)
+      const maxDays = 30;
+      const maxTime = new Date(Date.now() + maxDays * 24 * 60 * 60 * 1000);
+      if (scheduledTime > maxTime) {
+        await bot.sendMessage(chatId,
+          `❌ *TOO FAR AHEAD*\n\n` +
+          `Maximum scheduling: ${maxDays} days.\n\n` +
+          `_Try again or /start to cancel_`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      // Save to database
+      const scheduledOrderId = await db.createScheduledOrder({
+        telegramUserId,
+        chatId,
+        gameName: session.gameName,
+        gameUrl: session.gameUrl,
+        cardName: session.cardName,
+        cardValue: session.cardName,
+        cardIndex: session.cardIndex,
+        quantity: session.quantity,
+        scheduledTime: scheduledTime
+      });
+
+      logger.info(`Scheduled order #${scheduledOrderId} created for ${scheduledTime.toISOString()} (UTC)`);
+
+      // Convert back to Egypt time for display
+      const egyptDisplayTime = new Date(scheduledTime.getTime() + (EGYPT_OFFSET_HOURS * 60 * 60 * 1000));
+      const egyptTimeStr = `${egyptDisplayTime.getUTCFullYear()}-${String(egyptDisplayTime.getUTCMonth() + 1).padStart(2, '0')}-${String(egyptDisplayTime.getUTCDate()).padStart(2, '0')} ${String(egyptDisplayTime.getUTCHours()).padStart(2, '0')}:${String(egyptDisplayTime.getUTCMinutes()).padStart(2, '0')}`;
+
+      await bot.sendMessage(chatId,
+        `✅ *ORDER SCHEDULED*\n\n` +
+        `Order ID: #${scheduledOrderId}\n` +
+        `Scheduled for:\n` +
+        `📍 ${egyptTimeStr} (Egypt time)\n` +
+        `🌍 ${scheduledTime.toISOString().slice(0, 16).replace('T', ' ')} (UTC)\n\n` +
+        `🎮 ${session.gameName}\n` +
+        `💳 ${session.cardName}\n` +
+        `🔢 Quantity: ${session.quantity}\n\n` +
+        `The order will be automatically\n` +
+        `processed at the scheduled time.\n\n` +
+        `You'll receive notifications when\n` +
+        `it starts and completes.\n\n` +
+        `Use /start to return to menu.`,
+        { parse_mode: 'Markdown' }
+      );
+
+      // Clear session
+      this.clearSession(chatId);
+
+    } catch (err) {
+      logger.error('Schedule time input error:', err);
+      await bot.sendMessage(chatId,
+        `❌ *ERROR*\n\n` +
+        `Failed to schedule order.\n` +
+        `Please try again or /start to cancel.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+}
 // Export singleton instance
 module.exports = new OrderFlowHandler();

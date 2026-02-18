@@ -54,7 +54,7 @@ class Order {
 /**
  * Purchase Model
  * Represents a single card purchase within an order
- * Stores encrypted PIN, game name, card value, and purchase timestamp
+ * Stores encrypted PIN, serial number, game name, card value, and purchase timestamp
  */
 class Purchase {
   constructor(data) {
@@ -64,6 +64,7 @@ class Purchase {
     this.card_number = data.card_number;  // Card number in order (1, 2, 3, etc.)
     this.status = data.status || 'pending';  // pending, success, failed
     this.pin_encrypted = data.pin_encrypted;  // Encrypted PIN code (AES-256)
+    this.serial_number_encrypted = data.serial_number_encrypted;  // Encrypted serial number (AES-256)
     this.game_name = data.game_name;  // Game name
     this.card_value = data.card_value;  // Card value/name
     this.purchased_at = data.purchased_at;  // Purchase timestamp
@@ -95,6 +96,13 @@ class Purchase {
    */
   hasPinData() {
     return this.pin_encrypted && this.pin_encrypted !== null;
+  }
+
+  /**
+   * Check if purchase has encrypted serial number
+   */
+  hasSerialData() {
+    return this.serial_number_encrypted && this.serial_number_encrypted !== null;
   }
 }
 

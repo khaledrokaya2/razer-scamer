@@ -1091,8 +1091,13 @@ class PurchaseService {
       }
 
     } catch (err) {
-      logger.error(`Purchase failed at stage: ${currentStage}`);
-      logger.error(`Error: ${err.message}`);
+      // Log cancellations as info, other errors as error
+      if (err.message && err.message.includes('cancelled by user')) {
+        logger.info(`Purchase cancelled at stage: ${currentStage}`);
+      } else {
+        logger.error(`Purchase failed at stage: ${currentStage}`);
+        logger.error(`Error: ${err.message}`);
+      }
 
       // Add stage information to error (NO DB SAVE - will be handled upstream)
       err.stage = currentStage;
@@ -1113,7 +1118,7 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters
    * @returns {Promise<Array>} Array of purchase results (including failed ones)
    */
-  async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, backupCodes, onProgress, onCardCompleted, checkCancellation }) {
+  async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, onProgress, onCardCompleted, checkCancellation }) {
     // Get user's existing browser session (using telegram user ID)
     const page = browserManager.getPage(telegramUserId);
 
@@ -1124,14 +1129,13 @@ class PurchaseService {
     // Mark browser as in-use to prevent cleanup during purchase
     browserManager.markInUse(telegramUserId);
 
+    const db = require('./DatabaseService');
     const purchases = [];
     let successCount = 0;
     let failedCount = 0;
-    let backupCodeIndex = 0; // Track which backup code to use next
 
     logger.purchase(`\n${'='.repeat(60)}`);
     logger.purchase(`Starting bulk purchase: ${quantity} x ${cardName}`);
-    logger.debug(`   Backup Codes Available: ${backupCodes.length} codes`);
     logger.purchase(`${'='.repeat(60)}\n`);
 
     try {
@@ -1145,16 +1149,18 @@ class PurchaseService {
           throw error;
         }
 
-        // Check if we have backup codes available (in case more than 10 cards ordered)
-        if (backupCodeIndex >= backupCodes.length) {
-          logger.error(`No more backup codes available (used ${backupCodeIndex}/${backupCodes.length})`);
-          const codeError = new Error('All backup codes have been used. Cannot process remaining cards.');
+        // Get next backup code from database
+        const backupCode = await db.getNextBackupCode(telegramUserId);
+
+        if (!backupCode) {
+          logger.error(`No more backup codes available in database`);
+          const codeError = new Error('No more backup codes available. Please add more codes in Settings → Backup Codes.');
           codeError.purchases = purchases;
           throw codeError;
         }
 
         logger.purchase(`\n--- Processing Card ${i}/${quantity} ---`);
-        logger.debug(`   Using backup code ${backupCodeIndex + 1}/${backupCodes.length}`);
+        logger.debug(`   Using backup code from database`);
 
         try {
           const result = await this.completePurchase({
@@ -1162,16 +1168,16 @@ class PurchaseService {
             page,
             gameUrl,
             cardIndex,
-            backupCode: backupCodes[backupCodeIndex], // Use current backup code from array
+            backupCode: backupCode, // Use backup code from database
             checkCancellation,
             cardNumber: i,  // Pass card number (1, 2, 3...)
             gameName,       // For later DB save
             cardName        // For later DB save
           });
 
-          // Increment backup code index after successful purchase (code was used)
-          backupCodeIndex++;
-          logger.debug(`   Backup code used successfully (${backupCodeIndex}/${backupCodes.length} used)`);
+          // Mark backup code as used in database after successful purchase
+          await db.markBackupCodeAsUsed(telegramUserId);
+          logger.debug(`   Backup code marked as used in database`);
 
           purchases.push(result);
 
@@ -1208,20 +1214,26 @@ class PurchaseService {
 
         } catch (err) {
           failedCount++;
-          logger.error(`Card ${i}/${quantity} failed at stage: ${err.stage || 'unknown'}`);
-          logger.error(`   Error: ${err.message}`);
 
-          // Only increment backup code if it was actually used (invalid code error)
+          // Log cancellations as info, other errors as error
+          if (err.message && err.message.includes('cancelled by user')) {
+            logger.info(`Card ${i}/${quantity} cancelled at stage: ${err.stage || 'unknown'}`);
+          } else {
+            logger.error(`Card ${i}/${quantity} failed at stage: ${err.stage || 'unknown'}`);
+            logger.error(`   Error: ${err.message}`);
+          }
+
+          // Mark backup code as used if it was actually used (invalid code error)
           if (err instanceof InvalidBackupCodeError) {
-            backupCodeIndex++;
-            logger.debug(`   Backup code was used but invalid (${backupCodeIndex}/${backupCodes.length} used)`);
+            await db.markBackupCodeAsUsed(telegramUserId);
+            logger.debug(`   Backup code marked as used (was invalid)`);
           } else {
             logger.debug(`   Backup code NOT consumed - error occurred before 2FA`);
           }
 
           // Check if this is a cancellation error
           if (err.message && err.message.includes('cancelled by user')) {
-            logger.warn('Cancelling remaining cards...');
+            logger.info('Cancelling remaining cards...');
             err.purchases = purchases;  // Include what we have so far
             throw err;
           }
@@ -1271,13 +1283,17 @@ class PurchaseService {
 
       logger.purchase(`\n${'='.repeat(60)}`);
       logger.success(`All cards processed! Success: ${successCount}, Failed: ${failedCount}, Total: ${quantity}`);
-      logger.debug(`   Backup codes used: ${backupCodeIndex}/${backupCodes.length}`);
       logger.purchase(`${'='.repeat(60)}\n`);
 
       return purchases;
 
     } catch (err) {
-      logger.error('Bulk purchase process stopped:', err.message);
+      // Log cancellations as info, other errors as error
+      if (err.message && err.message.includes('cancelled by user')) {
+        logger.info('Bulk purchase process cancelled:', err.message);
+      } else {
+        logger.error('Bulk purchase process stopped:', err.message);
+      }
 
       // Always return what we have so far (even on error)
       if (err.purchases) {

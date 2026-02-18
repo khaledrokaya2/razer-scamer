@@ -116,6 +116,19 @@ class BrowserManager {
         timeout: 30000
       });
 
+      // Check if session is still valid (not redirected to login)
+      const isSessionValid = await this.checkSessionValid(page);
+      if (!isSessionValid) {
+        logger.warn(`Session expired for user ${userId}, attempting auto-relogin...`);
+        await this.autoRelogin(userId, page);
+
+        // Navigate to original URL after relogin
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
+        });
+      }
+
       // Update activity after successful navigation
       this.updateActivity(userId);
 
@@ -132,6 +145,100 @@ class BrowserManager {
 
       this.updateActivity(userId);
       return page;
+    }
+  }
+
+  /**
+   * Check if Razer session is still valid
+   * @param {Page} page - Puppeteer page instance
+   * @returns {Promise<boolean>} True if session is valid
+   */
+  async checkSessionValid(page) {
+    try {
+      const currentUrl = page.url();
+
+      // If URL contains 'login' or 'signin', session is expired
+      if (currentUrl.includes('login') || currentUrl.includes('signin') || currentUrl.includes('authentication')) {
+        return false;
+      }
+
+      // Check if page has login form elements
+      const hasLoginForm = await page.evaluate(() => {
+        return !!(
+          document.querySelector('input[type="email"]') &&
+          document.querySelector('input[type="password"]')
+        );
+      });
+
+      return !hasLoginForm;
+    } catch (err) {
+      logger.error('Error checking session validity:', err.message);
+      return true; // Assume valid if check fails, let purchase flow handle it
+    }
+  }
+
+  /**
+   * Auto-relogin using stored credentials
+   * @param {number} userId - Telegram user ID
+   * @param {Page} page - Puppeteer page instance
+   * @returns {Promise<void>}
+   */
+  async autoRelogin(userId, page) {
+    try {
+      // Get user credentials from database
+      const db = require('./DatabaseService');
+      const credentials = await db.getUserCredentials(userId);
+
+      if (!credentials || !credentials.email || !credentials.password) {
+        throw new Error('No credentials found for auto-relogin');
+      }
+
+      logger.system(`Auto-relogin for user ${userId}...`);
+
+      // Navigate to Razer login page
+      await page.goto('https://razerid.razer.com/account/login', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+
+      // Wait for login form
+      await page.waitForSelector('input[type="email"]', { timeout: 10000 });
+
+      // Enter email
+      await page.type('input[type="email"]', credentials.email, { delay: 50 });
+
+      // Enter password
+      await page.type('input[type="password"]', credentials.password, { delay: 50 });
+
+      // Click login button
+      await page.click('button[type="submit"]');
+
+      // Wait for navigation after login
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+
+      logger.success(`Auto-relogin successful for user ${userId}`);
+    } catch (err) {
+      logger.error(`Auto-relogin failed for user ${userId}:`, err.message);
+      throw new Error('Session expired and auto-relogin failed. Please update credentials.');
+    }
+  }
+
+  /**
+   * Ensure session is alive and re-login if needed
+   * Call this before critical operations
+   * @param {number} userId - Telegram user ID
+   * @returns {Promise<void>}
+   */
+  async ensureSessionAlive(userId) {
+    const page = this.getPage(userId);
+    if (!page) {
+      throw new Error('No active browser session');
+    }
+
+    const isValid = await this.checkSessionValid(page);
+    if (!isValid) {
+      logger.warn(`Session check failed for user ${userId}, attempting auto-relogin...`);
+      await this.autoRelogin(userId, page);
     }
   }
 
