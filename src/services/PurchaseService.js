@@ -490,8 +490,8 @@ class PurchaseService {
         cardSelected = true;
       }
 
-      // Mini wait for selection to register
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Wait for selection to register and page to update
+      await new Promise(resolve => setTimeout(resolve, 300));
 
       logger.success(`Card ${cardIndex} selected successfully`);
 
@@ -504,11 +504,14 @@ class PurchaseService {
       currentStage = this.STAGES.SELECTING_PAYMENT;
       logger.debug(`Stage: ${currentStage}`);
 
-      // Wait for payment methods section to load
+      // Wait for payment methods section to load and become interactive
       await page.waitForSelector("#webshop_step_payment_channels", {
         visible: true,
-        timeout: 4000
+        timeout: 6000
       });
+
+      // Additional wait to ensure payment section is fully interactive
+      await new Promise(resolve => setTimeout(resolve, 200));
 
       // Select Razer Gold as payment method
       logger.purchase('Selecting Razer Gold payment...');
@@ -516,50 +519,134 @@ class PurchaseService {
       // Wait for payment methods container to load
       await page.waitForSelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']", {
         visible: true,
-        timeout: 4000
+        timeout: 6000
       });
 
-      // Find the Razer Gold payment method specifically
-      const razerGoldContainer = await page.$("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
+      // Scroll the payment section into view
+      await page.evaluate(() => {
+        const paymentSection = document.querySelector("#webshop_step_payment_channels");
+        if (paymentSection) {
+          paymentSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      });
 
-      if (!razerGoldContainer) {
-        throw new Error('❌ Could not find Razer Gold payment container');
-      }
+      // Wait after scroll
+      await new Promise(resolve => setTimeout(resolve, 300));
 
-      logger.success('Found Razer Gold payment container');
+      logger.debug('Looking for Razer Gold payment method...');
 
-      // Try clicking the label first (most reliable method based on HTML structure)
+      // Try multiple selection methods with JavaScript clicks for reliability
+      let paymentSelected = false;
+
+      // Method 1: Direct JavaScript click on radio input (most reliable)
       try {
-        logger.debug('Trying to click the label...');
-        const label = await razerGoldContainer.$('label');
-        if (label) {
-          await label.click();
-          logger.success('Clicked Razer Gold label');
-        } else {
-          throw new Error('Label not found');
+        logger.debug('Method 1: Trying JavaScript click on radio input...');
+        paymentSelected = await page.evaluate(() => {
+          const container = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
+          if (!container) return false;
+          
+          const radioInput = container.querySelector('input[type="radio"][name="paymentChannelItem"]');
+          if (radioInput) {
+            radioInput.click();
+            radioInput.checked = true;
+            // Trigger change event
+            const event = new Event('change', { bubbles: true });
+            radioInput.dispatchEvent(event);
+            return radioInput.checked;
+          }
+          return false;
+        });
+
+        if (paymentSelected) {
+          logger.success('✓ Razer Gold radio input clicked via JavaScript');
         }
       } catch (err) {
-        logger.debug('Label click failed, trying radio input...');
+        logger.debug('Method 1 failed:', err.message);
+      }
 
-        // Fallback: click the radio input directly
+      // Method 2: JavaScript click on label
+      if (!paymentSelected) {
         try {
-          const radioInput = await razerGoldContainer.$('input[type="radio"][name="paymentChannelItem"]');
-          if (radioInput) {
-            await radioInput.click();
-            logger.success('Clicked Razer Gold radio input');
-          } else {
-            throw new Error('Radio input not found');
-          }
-        } catch (radioErr) {
-          logger.debug('Radio input click failed, trying container...');
+          logger.debug('Method 2: Trying JavaScript click on label...');
+          paymentSelected = await page.evaluate(() => {
+            const container = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
+            if (!container) return false;
+            
+            const label = container.querySelector('label');
+            if (label) {
+              label.click();
+              // Check if radio is now selected
+              const radioInput = container.querySelector('input[type="radio"][name="paymentChannelItem"]');
+              return radioInput ? radioInput.checked : false;
+            }
+            return false;
+          });
 
-          // Final fallback: click the container itself
-          await razerGoldContainer.click();
-          logger.success('Clicked Razer Gold container');
+          if (paymentSelected) {
+            logger.success('✓ Razer Gold label clicked via JavaScript');
+          }
+        } catch (err) {
+          logger.debug('Method 2 failed:', err.message);
         }
       }
 
-      // Mini wait for selection to register
+      // Method 3: Puppeteer click on label
+      if (!paymentSelected) {
+        try {
+          logger.debug('Method 3: Trying Puppeteer click on label...');
+          const container = await page.$("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
+          if (container) {
+            const label = await container.$('label');
+            if (label) {
+              await label.click();
+              // Verify selection
+              paymentSelected = await page.evaluate(() => {
+                const radioInput = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet'] input[type='radio']");
+                return radioInput ? radioInput.checked : false;
+              });
+              
+              if (paymentSelected) {
+                logger.success('✓ Razer Gold label clicked via Puppeteer');
+              }
+            }
+          }
+        } catch (err) {
+          logger.debug('Method 3 failed:', err.message);
+        }
+      }
+
+      // Method 4: Puppeteer click on radio input
+      if (!paymentSelected) {
+        try {
+          logger.debug('Method 4: Trying Puppeteer click on radio input...');
+          const container = await page.$("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
+          if (container) {
+            const radioInput = await container.$('input[type="radio"][name="paymentChannelItem"]');
+            if (radioInput) {
+              await radioInput.click();
+              // Verify selection
+              paymentSelected = await page.evaluate(() => {
+                const radioInput = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet'] input[type='radio']");
+                return radioInput ? radioInput.checked : false;
+              });
+              
+              if (paymentSelected) {
+                logger.success('✓ Razer Gold radio input clicked via Puppeteer');
+              }
+            }
+          }
+        } catch (err) {
+          logger.debug('Method 4 failed:', err.message);
+        }
+      }
+
+      if (!paymentSelected) {
+        throw new Error('❌ Failed to select Razer Gold payment method - all methods failed');
+      }
+
+      logger.success('✅ Razer Gold payment method selected successfully');
+
+      // Wait for selection to register
       await new Promise(resolve => setTimeout(resolve, 100));
 
       logger.success('Razer Gold payment method selected successfully');
@@ -826,147 +913,10 @@ class PurchaseService {
         }
       }
 
-      // Handle reload page redirect
-      if (checkoutResult.type === 'reload') {
-        logger.error('Redirected to reload page - insufficient balance');
-        throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
-      }
-
-      // Handle direct transaction (no 2FA required)
-      if (checkoutResult.type === 'direct') {
-        logger.success('No 2FA required - proceeding directly to transaction page');
-        // Skip 2FA section and go directly to transaction handling
-      }
-      // Handle 2FA flow
-      else if (checkoutResult.type === '2fa') {
-        logger.debug('2FA modal detected - processing backup code...');
-
-        // Step 2: Wait for any OTP iframe (first one)
-        await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 8000 });
-        let frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
-        let frame = await frameHandle.contentFrame();
-
-        // Step 3: Click “Choose another method” inside iframe
-        logger.debug('Clicking choose another method...');
-        const chooseAnother = await frame.waitForSelector("button[class*='arrowed']", { visible: true, timeout: 20000 });
-        await chooseAnother.click();
-
-        // Step 4: Wait for the new iframe (otp-iframe-4) to appear after clicking
-        await page.waitForFunction(() => {
-          const newIframe = document.querySelector('#purchaseOtpModal iframe[id^="otp-iframe-"]');
-          return newIframe && newIframe.id !== 'otp-iframe-3';
-        }, { polling: 'mutation', timeout: 8000 });
-
-        // Step 5: Switch to the new iframe
-        frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
-        frame = await frameHandle.contentFrame();
-
-        // Step 6: Wait for and click “Backup Codes” button
-        // Try clicking the one with “Backup” in its text
-        logger.debug('Selecting backup code option...');
-        const backupButton = await frame.$$("ul[class*='alt-menu'] button");
-        await backupButton[1].click();
-
-        // Enter backup code (8 digits)
-        logger.debug('Entering backup code...');
-
-        if (!backupCode || backupCode.length !== 8) {
-          throw new Error('Invalid backup code - must be 8 digits');
-        }
-
-        // Wait for iframe and get its frame context
-        await page.waitForSelector('iframe[id^="otp-iframe-"]', { visible: true, timeout: 6000 });
-        const otpFrameElement = await page.$('iframe[id^="otp-iframe-"]');
-        const otpFrame = await otpFrameElement.contentFrame();
-
-        if (!otpFrame) throw new Error('❌ Could not access OTP iframe');
-
-        // Type digits into inputs inside iframe
-        for (let i = 0; i < 8; i++) {
-          const inputSelector = `#otp-input-${i}`;
-          await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 3000 });
-          await otpFrame.type(inputSelector, backupCode[i]);
-        }
-
-        // After entering all digits, the form auto-submits and page navigates
-        // We need to wait for navigation without trying to access the detached frame
-        logger.debug('Backup code entered, waiting for validation...');
-
-        // CRITICAL FIX: Check for error popup on main page (not inside iframe)
-        // The error appears as: <div id="main-alert" class="show error notification">
-        try {
-          // Quick check for error alert popup (3 seconds max)
-          logger.debug('Checking for error alert popup...');
-          await page.waitForFunction(() => {
-            const errorAlert = document.querySelector('#main-alert.show.error');
-            if (errorAlert) {
-              const dialogText = errorAlert.textContent || '';
-              if (dialogText.includes('Invalid code') || dialogText.includes('invalid') || dialogText.includes('incorrect')) {
-                return true;
-              }
-            }
-            return false;
-          }, { timeout: 3000, polling: 300 });
-
-          // If we reach here, error alert was found
-          logger.error('Invalid backup code - error alert detected');
-          throw new InvalidBackupCodeError('The backup code you entered is incorrect or expired. Please enter another valid backup code.');
-        } catch (errorCheckErr) {
-          // No error alert found within 3 seconds - this is GOOD
-          if (errorCheckErr.name === 'TimeoutError') {
-            logger.success('No error alert detected - waiting for navigation...');
-
-            // Now wait for navigation (give it up to 45 seconds for slow networks)
-            try {
-              await page.waitForFunction(
-                (gameUrl) => {
-                  const currentUrl = window.location.href;
-                  // Success: Navigated away from game page
-                  return !currentUrl.includes(gameUrl);
-                },
-                { timeout: 45000, polling: 300 },
-                gameUrl
-              );
-
-              logger.success('Navigation detected - backup code accepted');
-            } catch (navErr) {
-              // Navigation timeout - check where we are
-              logger.debug('Navigation timeout - checking current URL...');
-              const currentUrl = page.url();
-
-              if (currentUrl.includes('/transaction/')) {
-                logger.success('Already on transaction page - backup code accepted');
-              } else if (currentUrl.includes(gameUrl)) {
-                logger.error('Still on game page after 45 seconds - backup code likely invalid');
-                throw new InvalidBackupCodeError('The backup code validation timed out. The code may be incorrect or expired. Please enter another valid backup code.');
-              } else {
-                logger.info('Navigated to unknown page - continuing...');
-              }
-            }
-          } else {
-            // This was the InvalidBackupCodeError we threw above
-            throw errorCheckErr;
-          }
-        }
-      }
-      else if (checkoutResult.type === 'direct') {
-        // No 2FA required - already on transaction page
-        logger.success('Skipping 2FA - already redirected to transaction page');
-      }
-      else {
-        // Unknown state - check current URL
-        logger.warn('Unknown state after checkout, checking current URL...');
-        const currentCheckUrl = page.url();
-
-        if (!currentCheckUrl.includes('/transaction/') && !currentCheckUrl.includes(gameUrl)) {
-          throw new Error(`Unexpected state after checkout. URL: ${currentCheckUrl}`);
-        }
-      }
-
       // Navigation successful - check where we landed
       logger.success('Proceeding to check transaction result');
 
-      const currentUrl = page.url();
+      currentUrl = page.url();
       logger.debug('Current URL:', currentUrl);
 
       // Check if redirected to reload page (insufficient balance)

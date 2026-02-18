@@ -1183,19 +1183,20 @@ class OrderFlowHandler {
 
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 
-        // Send PINs as TXT files in TWO FORMATS
-        try {
-          const fs = require('fs');
-          const path = require('path');
+        // Send PINs as TXT files in TWO FORMATS (only if there are successful purchases)
+        if (result.pins && result.pins.length > 0) {
+          try {
+            const fs = require('fs');
+            const path = require('path');
 
-          // Create pins directory if it doesn't exist
-          const pinsDir = path.join(process.cwd(), 'temp_pins');
-          if (!fs.existsSync(pinsDir)) {
-            fs.mkdirSync(pinsDir, { recursive: true });
-          }
+            // Create pins directory if it doesn't exist
+            const pinsDir = path.join(process.cwd(), 'temp_pins');
+            if (!fs.existsSync(pinsDir)) {
+              fs.mkdirSync(pinsDir, { recursive: true });
+            }
 
-          // 1. Generate FIRST file: PIN + Serial Number format
-          const fileName1 = `Order_${result.order.id}_Pins_with_Serial.txt`;
+            // 1. Generate FIRST file: PIN + Serial Number format
+            const fileName1 = `Order_${result.order.id}_Pins_with_Serial.txt`;
           const filePath1 = path.join(pinsDir, fileName1);
 
           let fileContent1 = '';
@@ -1239,17 +1240,18 @@ class OrderFlowHandler {
 
           fs.unlinkSync(filePath2);
 
-        } catch (err) {
-          logger.error('Error sending TXT files:', err);
-          // Fallback to message format
-          const plainMessages = orderService.formatPinsPlain(result.pins);
-          for (const message of plainMessages) {
-            await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+          } catch (err) {
+            logger.error('Error sending TXT files:', err);
+            // Fallback to message format
+            const plainMessages = orderService.formatPinsPlain(result.pins);
+            for (const message of plainMessages) {
+              await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+            }
           }
-        }
 
-        // Clear pins from memory after sending
-        orderService.clearOrderPins(result.order.id);
+          // Clear pins from memory after sending
+          orderService.clearOrderPins(result.order.id);
+        }
 
       } catch (err) {
         logger.error('Error sending order results:', err);
@@ -1314,18 +1316,19 @@ class OrderFlowHandler {
               { parse_mode: 'Markdown' }
             );
 
-            // Send the pins as TXT files in TWO FORMATS
-            try {
-              const fs = require('fs');
-              const path = require('path');
+            // Send the pins as TXT files in TWO FORMATS (only if there are successful purchases)
+            if (err.partialOrder.pins && err.partialOrder.pins.length > 0) {
+              try {
+                const fs = require('fs');
+                const path = require('path');
 
-              // Create pins directory if it doesn't exist
-              const pinsDir = path.join(process.cwd(), 'temp_pins');
-              if (!fs.existsSync(pinsDir)) {
-                fs.mkdirSync(pinsDir, { recursive: true });
-              }
+                // Create pins directory if it doesn't exist
+                const pinsDir = path.join(process.cwd(), 'temp_pins');
+                if (!fs.existsSync(pinsDir)) {
+                  fs.mkdirSync(pinsDir, { recursive: true });
+                }
 
-              // 1. Generate FIRST file: PIN + Serial Number format
+                // 1. Generate FIRST file: PIN + Serial Number format
               const fileName1 = `Order_${err.partialOrder.order.id}_Pins_with_Serial.txt`;
               const filePath1 = path.join(pinsDir, fileName1);
 
@@ -1370,17 +1373,18 @@ class OrderFlowHandler {
 
               fs.unlinkSync(filePath2);
 
-            } catch (fileErr) {
-              logger.error('Error sending TXT files:', fileErr);
-              // Fallback to message format
-              const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
-              for (const message of plainMessages) {
-                await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+              } catch (fileErr) {
+                logger.error('Error sending TXT files:', fileErr);
+                // Fallback to message format
+                const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
+                for (const message of plainMessages) {
+                  await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+                }
               }
-            }
 
-            // Clear pins from memory after sending
-            orderService.clearOrderPins(err.partialOrder.order.id);
+              // Clear pins from memory after sending
+              orderService.clearOrderPins(err.partialOrder.order.id);
+            }
 
             // Send final message
             const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
@@ -1683,19 +1687,20 @@ class OrderFlowHandler {
 
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 
-        // Send PINs as TXT files in TWO FORMATS
-        try {
-          const fs = require('fs');
-          const path = require('path');
+        // Send PINs as TXT files in TWO FORMATS (only if there are successful purchases)
+        if (result.pins && result.pins.length > 0) {
+          try {
+            const fs = require('fs');
+            const path = require('path');
 
-          // Create pins directory if it doesn't exist
-          const pinsDir = path.join(process.cwd(), 'temp_pins');
-          if (!fs.existsSync(pinsDir)) {
-            fs.mkdirSync(pinsDir, { recursive: true });
-          }
+            // Create pins directory if it doesn't exist
+            const pinsDir = path.join(process.cwd(), 'temp_pins');
+            if (!fs.existsSync(pinsDir)) {
+              fs.mkdirSync(pinsDir, { recursive: true });
+            }
 
-          // 1. Generate FIRST file: PIN only format
-          const fileName1 = `Order_${result.order.id}_Pins_Only.txt`;
+            // 1. Generate FIRST file: PIN only format
+            const fileName1 = `Order_${result.order.id}_Pins_Only.txt`;
           const filePath1 = path.join(pinsDir, fileName1);
 
           let fileContent1 = '';
@@ -1739,20 +1744,21 @@ class OrderFlowHandler {
 
           fs.unlinkSync(filePath2);
 
-        } catch (err) {
-          logger.error('Error sending TXT files:', err);
-          // Fallback to message format
-          const plainMessages = orderService.formatPinsPlain(result.pins);
-          for (const message of plainMessages) {
-            await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+          } catch (err) {
+            logger.error('Error sending TXT files:', err);
+            // Fallback to message format
+            const plainMessages = orderService.formatPinsPlain(result.pins);
+            for (const message of plainMessages) {
+              await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+            }
           }
+
+          // Clear pins from memory after sending
+          orderService.clearOrderPins(result.order.id);
         }
 
-        // Clear pins from memory after sending
-        orderService.clearOrderPins(result.order.id);
-
       } catch (err) {
-        logger.error('Error sending order results:', err);
+        logger.error('Error sending scheduled order results:', err);
       }
 
       this.clearSession(chatId);
@@ -1802,17 +1808,18 @@ class OrderFlowHandler {
               { parse_mode: 'Markdown' }
             );
 
-            // Send TXT files with partial results
-            try {
-              const fs = require('fs');
-              const path = require('path');
+            // Send TXT files with partial results (only if there are successful purchases)
+            if (err.partialOrder.pins && err.partialOrder.pins.length > 0) {
+              try {
+                const fs = require('fs');
+                const path = require('path');
 
-              const pinsDir = path.join(process.cwd(), 'temp_pins');
-              if (!fs.existsSync(pinsDir)) {
-                fs.mkdirSync(pinsDir, { recursive: true });
-              }
+                const pinsDir = path.join(process.cwd(), 'temp_pins');
+                if (!fs.existsSync(pinsDir)) {
+                  fs.mkdirSync(pinsDir, { recursive: true });
+                }
 
-              // 1. Generate first file: PIN + Serial
+                // 1. Generate first file: PIN + Serial
               const fileName1 = `Order_${err.partialOrder.order.id}_Partial_Pins_with_Serial.txt`;
               const filePath1 = path.join(pinsDir, fileName1);
 
@@ -1855,16 +1862,17 @@ class OrderFlowHandler {
 
               fs.unlinkSync(filePath2);
 
-            } catch (fileErr) {
-              logger.error('Error sending TXT files:', fileErr);
-              // Fallback to message format
-              const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
-              for (const message of plainMessages) {
-                await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+              } catch (fileErr) {
+                logger.error('Error sending TXT files:', fileErr);
+                // Fallback to message format
+                const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
+                for (const message of plainMessages) {
+                  await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+                }
               }
-            }
 
-            orderService.clearOrderPins(err.partialOrder.order.id);
+              orderService.clearOrderPins(err.partialOrder.order.id);
+            }
 
             const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
             if (remaining > 0) {
