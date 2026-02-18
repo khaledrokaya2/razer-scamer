@@ -49,8 +49,28 @@ class BrowserManager {
     // Set user agent to avoid detection
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-    // Enable cookies and session persistence
-    await page.setRequestInterception(false);
+    // Enable request interception to block heavy resources for slow networks
+    await page.setRequestInterception(true);
+    
+    // Block images, fonts, media, and other unnecessary resources to reduce data transfer
+    // Keeping stylesheets for cookie consent visibility
+    page.on('request', (request) => {
+      const resourceType = request.resourceType();
+      const blockedTypes = [
+        'image',        // Images (largest bandwidth consumer)
+        'font',         // Custom fonts
+        'media',        // Audio/video files
+        'manifest',     // PWA manifest files (not needed)
+        'texttrack',    // Video subtitles (not used)
+        'eventsource'   // Server-sent events (rarely used)
+      ];
+      
+      if (blockedTypes.includes(resourceType)) {
+        request.abort();
+      } else {
+        request.continue();
+      }
+    });
 
     // Store in map
     this.userBrowsers.set(userId, {
@@ -88,10 +108,11 @@ class BrowserManager {
         '--metrics-recording-only',
         '--no-first-run',
         '--mute-audio',
-        '--aggressive-cache-discard',
-        '--disable-cache',
-        '--disable-application-cache',
-        '--disable-offline-load-stale-cache'
+        // Network optimizations for slow connections
+        '--enable-features=NetworkService,NetworkServiceInProcess',
+        '--disable-features=VizDisplayCompositor',
+        '--force-prefers-reduced-motion',
+        '--blink-settings=imagesEnabled=false' // Disable images at browser level
       ]
     });
 
@@ -197,7 +218,7 @@ class BrowserManager {
 
       // Navigate to Razer login page
       await page.goto('https://razerid.razer.com/account/login', {
-        waitUntil: 'networkidle2',
+        waitUntil: 'domcontentloaded',
         timeout: 30000
       });
 
@@ -214,7 +235,7 @@ class BrowserManager {
       await page.click('button[type="submit"]');
 
       // Wait for navigation after login
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 });
 
       logger.success(`Auto-relogin successful for user ${userId}`);
     } catch (err) {

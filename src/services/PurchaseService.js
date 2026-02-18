@@ -370,7 +370,7 @@ class PurchaseService {
       await new Promise(resolve => setTimeout(resolve, this.RELOAD_CHECK_INTERVAL));
 
       // Reload page
-      await page.reload({ waitUntil: 'networkidle2' });
+      await page.reload({ waitUntil: 'domcontentloaded' });
 
       attempts++;
     }
