@@ -647,11 +647,11 @@ class OrderFlowHandler {
 
     const quantity = parseInt(text);
 
-    if (isNaN(quantity) || quantity < 1 || quantity > 100) {
+    if (isNaN(quantity) || quantity < 1 || quantity > 500) {
       await bot.sendMessage(chatId,
         `⚠️ *INVALID INPUT*    \n` +
         `Please enter a valid number\n` +
-        `between *1* and *100*.\n\n` +
+        `between *1* and *500*.\n\n` +
         `_Try again or /start to cancel_`,
         { parse_mode: 'Markdown' }
       );
