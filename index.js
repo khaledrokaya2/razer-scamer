@@ -13,10 +13,22 @@
 // Load environment variables from .env file
 require('dotenv').config();
 
+// CRITICAL FIX: Set environment-specific DB connection BEFORE loading services
+// This ensures DatabaseService uses the correct connection string from its constructor
+const env = process.env.NODE_ENV || 'development';
+const isDevelopment = env === 'development';
+
+if (isDevelopment && process.env.TEST_DB_CONNECTION_STRING) {
+  process.env.DB_CONNECTION_STRING = process.env.TEST_DB_CONNECTION_STRING;
+  console.log('🔧 Using TEST database (db40738)');
+} else {
+  console.log('🔧 Using PRODUCTION database (db29926)');
+}
+
 // Import logger
 const logger = require('./src/utils/logger');
 
-// Import services and controllers
+// Import services and controllers (DatabaseService will now read the correct connection string)
 const authService = require('./src/services/AuthorizationService');
 const botController = require('./src/controllers/TelegramBotController');
 const getScheduledOrderService = require('./src/services/ScheduledOrderService');
@@ -95,6 +107,19 @@ async function initializeServices(config) {
   // Initialize Telegram bot controller with environment-specific bot token
   const botType = config.isDevelopment ? 'TEST' : 'PRODUCTION';
   logger.bot(`Starting ${botType} bot...`);
+  
+  // Debug: Show configuration details
+  console.log('='.repeat(80));
+  console.log('🔍 CONFIGURATION DEBUG:');
+  console.log(`   NODE_ENV: ${config.environment}`);
+  console.log(`   isDevelopment: ${config.isDevelopment}`);
+  console.log(`   Bot Type: ${botType}`);
+  console.log(`   Bot Token (first 15 chars): ${config.botToken.substring(0, 15)}...`);
+  console.log(`   Database: ${config.dbConnectionString ? config.dbConnectionString.substring(0, 50) + '...' : 'NOT SET'}`);
+  console.log(`   Is TEST DB (db40738): ${config.dbConnectionString && config.dbConnectionString.includes('db40738')}`);
+  console.log(`   Is PROD DB (db29926): ${config.dbConnectionString && config.dbConnectionString.includes('db29926')}`);
+  console.log('='.repeat(80));
+  
   botController.initialize(config.botToken);
 
   // Initialize and start scheduled order service (singleton pattern)
@@ -115,7 +140,8 @@ async function startApplication() {
   // Validate environment configuration and get config
   const config = validateEnvironment();
 
-  // Set database environment config for DatabaseService
+  // Note: DB_CONNECTION_STRING is already set at top of file before services loaded
+  // This redundant setting is kept for backwards compatibility
   process.env.DB_CONNECTION_STRING = config.dbConnectionString;
   process.env.DB_SERVER = config.dbServer;
   process.env.DB_NAME = config.dbName;
