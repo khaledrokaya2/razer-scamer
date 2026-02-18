@@ -71,6 +71,10 @@ class PurchaseService {
       // Check if page loaded successfully and user is logged in
       await page.waitForSelector('body', { timeout: 5000 });
 
+      // Give page time to execute JavaScript and render dynamic content
+      logger.debug('Waiting for dynamic content to load...');
+      await new Promise(resolve => setTimeout(resolve, 1500));
+
       // Check for access denied or login required (improved logic)
       const pageStatus = await page.evaluate(() => {
         const title = document.title.toLowerCase();
@@ -109,22 +113,20 @@ class PurchaseService {
       logger.info(`Page loaded: ${pageStatus.title}`);
       logger.debug(`Quick scan: ${pageStatus.cardCount} cards, ${pageStatus.paymentCount} payment methods`);
 
-      // OPTIMIZED: Wait for cards to load with minimal timeout
+      // Wait for cards to load with extended timeout for first-time loading
       logger.http('Waiting for cards to load...');
 
-      // Wait for any card-related selector to appear (2 second timeout)
+      // Wait for any card-related selector to appear (up to 8 seconds)
       try {
-        await Promise.race([
-          // Try to wait for known card containers
-          page.waitForSelector('#webshop_step_sku .selection-tile, div[class*="selection-tile"], input[name="paymentAmountItem"]',
-            { timeout: 5000 }
-          ),
-          // Or wait 2 seconds maximum
-          new Promise((resolve) => setTimeout(resolve, 2000))
-        ]);
+        await page.waitForSelector(
+          '#webshop_step_sku .selection-tile, div[class*="selection-tile"], input[name="paymentAmountItem"]',
+          { timeout: 8000 }
+        );
         logger.success('Card elements detected on page');
       } catch (waitErr) {
-        logger.warn('Card elements not found within 2 seconds, will try extraction anyway...');
+        logger.warn('Card elements not found within timeout, will try extraction anyway...');
+        // Give it one more second for slower connections
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
       // OPTIMIZED: Try ALL 3 detection methods in ONE evaluation
