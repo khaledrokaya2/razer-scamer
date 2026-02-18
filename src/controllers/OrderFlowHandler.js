@@ -14,6 +14,11 @@ const purchaseService = require('../services/PurchaseService');
 const orderService = require('../services/OrderService');
 const logger = require('../utils/logger');
 
+// SOLID Principle: Single Responsibility - Use shared utilities
+const fileGenerator = require('../utils/FileGenerator');
+const messageFormatter = require('../utils/MessageFormatter');
+const errorHandler = require('../utils/ErrorHandler');
+
 class OrderFlowHandler {
   constructor() {
     // Session data for order creation flow
@@ -119,116 +124,11 @@ class OrderFlowHandler {
   }
 
   /**
-   * Map technical errors to user-friendly messages (UX FIX #17)
+   * Map technical errors to user-friendly messages
+   * SOLID Principle: Delegates to ErrorHandler utility for consistent error handling
    */
   getUserFriendlyError(error) {
-    const errorMessage = error.message || '';
-
-    // Log full error details for debugging
-    logger.error('🔍 Full error details for debugging:');
-    logger.error('Error name:', error.name);
-    logger.error('Error message:', errorMessage);
-    logger.error('Error stack:', error.stack);
-    if (error.code) logger.error('Error code:', error.code);
-    if (error.number) logger.error('SQL Error number:', error.number);
-
-    if (errorMessage.includes('Invalid backup code') || errorMessage.includes('incorrect')) {
-      return `❌ *ERROR*     \n` +
-        `*Invalid Backup Code*\n\n` +
-        `The backup code you entered\n` +
-        `is incorrect.\n\n` +
-        `🔑 Please start a new order\n` +
-        `   and enter a valid 8-digit\n` +
-        `   backup code from your\n` +
-        `   Razer account.\n\n` +
-        `Use /start to try again.`;
-    }
-
-    if (errorMessage.includes('Insufficient Razer Gold balance')) {
-      return `❌ *ERROR*     \n` +
-        `*Insufficient Balance*\n\n` +
-        `Your Razer Gold balance\n` +
-        `is too low for this purchase.\n\n` +
-        `💰 Please reload your Razer\n` +
-        `   Gold account and try again.\n\n` +
-        `Use /start to create a new order.`;
-    }
-
-    if (errorMessage.includes('out of stock') && errorMessage.includes('retrying')) {
-      return `⏳ *AUTO-RETRY*    \n` +
-        `Card went out of stock\n` +
-        `during purchase.\n\n` +
-        `🔄 The bot is monitoring\n` +
-        `   stock and will automatically\n` +
-        `   retry when available.\n\n` +
-        `_Please wait..._`;
-    }
-
-    if (errorMessage.includes('out of stock')) {
-      return `⚠️ *OUT OF STOCK*   \n` +
-        `This card is currently\n` +
-        `unavailable.\n\n` +
-        `⏱️ The bot will automatically\n` +
-        `   wait and purchase when it\n` +
-        `   becomes available.\n\n` +
-        `_Monitoring stock..._`;
-    }
-
-    if (errorMessage.includes('No active browser session')) {
-      return `⚠️ *SESSION EXPIRED* \n` +
-        `Your login session has\n` +
-        `timed out.\n\n` +
-        `🔐 Please login again using\n` +
-        `   the /start command.`;
-    }
-
-    if (errorMessage.includes('Too many consecutive failures')) {
-      return `❌ *ERROR*     \n` +
-        `*Multiple Failures*\n\n` +
-        `The purchase process failed\n` +
-        `multiple times in a row.\n\n` +
-        `🔄 Please try again later or\n` +
-        `   contact support if the issue\n` +
-        `   persists.\n\n` +
-        `Use /start to try again.`;
-    }
-
-    // Database errors (CHECK constraint, connection errors, etc.)
-    if (errorMessage.includes('CHECK constraint') ||
-      errorMessage.includes('FOREIGN KEY') ||
-      errorMessage.includes('database') ||
-      errorMessage.includes('RequestError') ||
-      errorMessage.includes('SQL')) {
-      return `❌ *SYSTEM ERROR*   \n` +
-        `A technical issue occurred\n` +
-        `while processing your order.\n\n` +
-        `🔧 Our team has been notified.\n\n` +
-        `Please try again in a few moments.\n` +
-        `If the issue persists, contact support.\n\n` +
-        `Use /start to try again.`;
-    }
-
-    // Network/timeout errors
-    if (errorMessage.includes('timeout') ||
-      errorMessage.includes('ETIMEDOUT') ||
-      errorMessage.includes('ECONNREFUSED') ||
-      errorMessage.includes('network')) {
-      return `❌ *CONNECTION ERROR* \n` +
-        `Network connection issue\n` +
-        `occurred during processing.\n\n` +
-        `🌐 Please check your internet\n` +
-        `   connection and try again.\n\n` +
-        `Use /start to try again.`;
-    }
-
-    // Generic user-friendly error (hide all technical details)
-    return `❌ *ERROR*     \n` +
-      `*Something went wrong*\n\n` +
-      `We encountered an issue while\n` +
-      `processing your order.\n\n` +
-      `Please try again or contact\n` +
-      `support if the issue continues.\n\n` +
-      `Use /start to try again.`;
+    return errorHandler.getUserFriendlyError(error);
   }
 
   /**
@@ -1170,86 +1070,16 @@ class OrderFlowHandler {
       }
 
       try {
-        let statusMessage = `✅ *ORDER COMPLETED*   \n` +
-          `🆔 *Order ID:* #${result.order.id}\n\n` +
-          `📦 *Cards Processed*\n` +
-          `     ${successfulCards} / ${result.order.cards_count} cards\n\n`;
-
-        if (failedCards > 0) {
-          statusMessage += `⚠️ *${failedCards} card(s) marked FAILED*\n\n`;
-        }
-
-        statusMessage += `📊 *Status:* ${result.order.status}\n\n`;
-
+        // Use MessageFormatter for consistent formatting (SOLID principle)
+        const validPinCount = fileGenerator.getValidPinCount(result.pins);
+        const statusMessage = messageFormatter.formatOrderComplete(result.order, validPinCount);
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 
-        // Send PINs as TXT files in TWO FORMATS (only if there are successful purchases)
+        // Use FileGenerator for consistent file sending (SOLID principle)
         if (result.pins && result.pins.length > 0) {
-          try {
-            const fs = require('fs');
-            const path = require('path');
-
-            // Create pins directory if it doesn't exist
-            const pinsDir = path.join(process.cwd(), 'temp_pins');
-            if (!fs.existsSync(pinsDir)) {
-              fs.mkdirSync(pinsDir, { recursive: true });
-            }
-
-            // 1. Generate FIRST file: PIN + Serial Number format
-            const fileName1 = `Order_${result.order.id}_Pins_with_Serial.txt`;
-          const filePath1 = path.join(pinsDir, fileName1);
-
-          let fileContent1 = '';
-          result.pins.forEach((pin) => {
-            const serialNum = pin.serialNumber || 'N/A';
-            fileContent1 += `${pin.pinCode}\n${serialNum}\n`;
+          await fileGenerator.sendPinFiles(bot, chatId, result.order.id, result.pins, {
+            formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
           });
-
-          fs.writeFileSync(filePath1, fileContent1, 'utf8');
-
-          // Send first file
-          await bot.sendDocument(chatId, filePath1, {
-            caption: `📄 *PIN Codes + Serial Numbers*\n` +
-              `Order #${result.order.id}\n\n` +
-              `Format: PIN on first line, Serial on second line`,
-            parse_mode: 'Markdown',
-            contentType: 'text/plain'
-          });
-
-          fs.unlinkSync(filePath1);
-
-          // 2. Generate SECOND file: PINs only
-          const fileName2 = `Order_${result.order.id}_Pins_Only.txt`;
-          const filePath2 = path.join(pinsDir, fileName2);
-
-          let fileContent2 = '';
-          result.pins.forEach((pin) => {
-            fileContent2 += `${pin.pinCode}\n`;
-          });
-
-          fs.writeFileSync(filePath2, fileContent2, 'utf8');
-
-          // Send second file
-          await bot.sendDocument(chatId, filePath2, {
-            caption: `📄 *PIN Codes Only*\n` +
-              `Order #${result.order.id}\n\n` +
-              `Format: One PIN per line`,
-            parse_mode: 'Markdown',
-            contentType: 'text/plain'
-          });
-
-          fs.unlinkSync(filePath2);
-
-          } catch (err) {
-            logger.error('Error sending TXT files:', err);
-            // Fallback to message format
-            const plainMessages = orderService.formatPinsPlain(result.pins);
-            for (const message of plainMessages) {
-              await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-            }
-          }
-
-          // Clear pins from memory after sending
           orderService.clearOrderPins(result.order.id);
         }
 
@@ -1307,93 +1137,27 @@ class OrderFlowHandler {
             }
 
             // Send cancellation message with partial results
-            await bot.sendMessage(chatId,
-              `🛑 *ORDER CANCELLED*   \n` +
-              `🆔 *Order ID:* #${err.partialOrder.order.id}\n\n` +
-              `✅ *Completed:* ${err.partialOrder.order.completed_purchases} / ${err.partialOrder.order.cards_count} cards\n` +
-              (failedCards > 0 ? `⚠️ *Failed:* ${failedCards} card(s)\n\n` : '\n') +
-              `📨 *Sending completed cards...*`,
-              { parse_mode: 'Markdown' }
-            );
+            // Calculate successful cards (exclude FAILED)
+            const successfulCards = err.partialOrder.pins.filter(p => p.pinCode !== 'FAILED').length;
+            
+            // Use MessageFormatter for consistent formatting (SOLID principle)
+            const cancelMessage = messageFormatter.formatOrderCancelled(err.partialOrder.order, successfulCards, failedCards);
+            await bot.sendMessage(chatId, cancelMessage, { parse_mode: 'Markdown' });
 
-            // Send the pins as TXT files in TWO FORMATS (only if there are successful purchases)
+            // Use FileGenerator for consistent file sending (SOLID principle)
             if (err.partialOrder.pins && err.partialOrder.pins.length > 0) {
-              try {
-                const fs = require('fs');
-                const path = require('path');
-
-                // Create pins directory if it doesn't exist
-                const pinsDir = path.join(process.cwd(), 'temp_pins');
-                if (!fs.existsSync(pinsDir)) {
-                  fs.mkdirSync(pinsDir, { recursive: true });
-                }
-
-                // 1. Generate FIRST file: PIN + Serial Number format
-              const fileName1 = `Order_${err.partialOrder.order.id}_Pins_with_Serial.txt`;
-              const filePath1 = path.join(pinsDir, fileName1);
-
-              let fileContent1 = '';
-              err.partialOrder.pins.forEach((pin) => {
-                const serialNum = pin.serialNumber || 'N/A';
-                fileContent1 += `${pin.pinCode}\n${serialNum}\n`;
+              await fileGenerator.sendPinFiles(bot, chatId, err.partialOrder.order.id, err.partialOrder.pins, {
+                isPartial: true,
+                formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
               });
-
-              fs.writeFileSync(filePath1, fileContent1, 'utf8');
-
-              // Send first file
-              await bot.sendDocument(chatId, filePath1, {
-                caption: `📄 *PIN Codes + Serial Numbers*\n` +
-                  `Order #${err.partialOrder.order.id}\n\n` +
-                  `Format: PIN on first line, Serial on second line`,
-                parse_mode: 'Markdown',
-                contentType: 'text/plain'
-              });
-
-              fs.unlinkSync(filePath1);
-
-              // 2. Generate SECOND file: PINs only
-              const fileName2 = `Order_${err.partialOrder.order.id}_Pins_Only.txt`;
-              const filePath2 = path.join(pinsDir, fileName2);
-
-              let fileContent2 = '';
-              err.partialOrder.pins.forEach((pin) => {
-                fileContent2 += `${pin.pinCode}\n`;
-              });
-
-              fs.writeFileSync(filePath2, fileContent2, 'utf8');
-
-              // Send second file
-              await bot.sendDocument(chatId, filePath2, {
-                caption: `📄 *PIN Codes Only*\n` +
-                  `Order #${err.partialOrder.order.id}\n\n` +
-                  `Format: One PIN per line`,
-                parse_mode: 'Markdown',
-                contentType: 'text/plain'
-              });
-
-              fs.unlinkSync(filePath2);
-
-              } catch (fileErr) {
-                logger.error('Error sending TXT files:', fileErr);
-                // Fallback to message format
-                const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
-                for (const message of plainMessages) {
-                  await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-                }
-              }
-
-              // Clear pins from memory after sending
               orderService.clearOrderPins(err.partialOrder.order.id);
             }
 
-            // Send final message
+            // Send final message using MessageFormatter
             const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
-            if (remaining > 0) {
-              await bot.sendMessage(chatId,
-                `ℹ️ ${remaining} card(s) were not processed.\n\n` +
-                `Use /start to create a new order.`,
-                { parse_mode: 'Markdown' }
-              );
+            const remainingMessage = messageFormatter.formatRemainingCards(remaining);
+            if (remainingMessage) {
+              await bot.sendMessage(chatId, remainingMessage, { parse_mode: 'Markdown' });
             }
           } else {
             // No purchases completed
@@ -1431,12 +1195,9 @@ class OrderFlowHandler {
               }
             }
 
-            await bot.sendMessage(chatId,
-              `🛑 *ORDER CANCELLED*   \n` +
-              `No cards were processed.\n\n` +
-              `Use /start to create a new order.`,
-              { parse_mode: 'Markdown' }
-            );
+            // Use MessageFormatter for consistent formatting (SOLID principle)
+            const cancelledMessage = messageFormatter.formatOrderCancelledNoCards();
+            await bot.sendMessage(chatId, cancelledMessage, { parse_mode: 'Markdown' });
           }
         } catch (sendErr) {
           logger.error('Error sending cancellation message:', sendErr);
@@ -1449,10 +1210,10 @@ class OrderFlowHandler {
         this.cancellingMessages.delete(chatId);
         this.orderSummaryMessages.delete(chatId);
         return;
-      } else {
-        // Log actual errors (not user cancellations)
-        logger.error('Order processing error:', err);
       }
+
+      // Not a cancellation - handle as regular error
+      logger.error('Order processing error:', err);
 
       // UX FIX #17: Use friendly error messages
       const friendlyError = this.getUserFriendlyError(err);
@@ -1674,86 +1435,16 @@ class OrderFlowHandler {
       }
 
       try {
-        let statusMessage = `✅ *ORDER COMPLETED*   \n` +
-          `🆔 *Order ID:* #${result.order.id}\n\n` +
-          `📦 *Cards Processed*\n` +
-          `     ${successfulCards} / ${result.order.cards_count} cards\n\n`;
-
-        if (failedCards > 0) {
-          statusMessage += `⚠️ *${failedCards} card(s) marked FAILED*\n\n`;
-        }
-
-        statusMessage += `📊 *Status:* ${result.order.status}\n\n`;
-
+        // Use MessageFormatter for consistent formatting (SOLID principle)
+        const validPinCount = fileGenerator.getValidPinCount(result.pins);
+        const statusMessage = messageFormatter.formatScheduledOrderComplete(result, validPinCount);
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 
-        // Send PINs as TXT files in TWO FORMATS (only if there are successful purchases)
+        // Use FileGenerator for consistent file sending (SOLID principle)
         if (result.pins && result.pins.length > 0) {
-          try {
-            const fs = require('fs');
-            const path = require('path');
-
-            // Create pins directory if it doesn't exist
-            const pinsDir = path.join(process.cwd(), 'temp_pins');
-            if (!fs.existsSync(pinsDir)) {
-              fs.mkdirSync(pinsDir, { recursive: true });
-            }
-
-            // 1. Generate FIRST file: PIN only format
-            const fileName1 = `Order_${result.order.id}_Pins_Only.txt`;
-          const filePath1 = path.join(pinsDir, fileName1);
-
-          let fileContent1 = '';
-          result.pins.forEach((pin) => {
-            fileContent1 += `${pin.pinCode}\n`;
+          await fileGenerator.sendPinFiles(bot, chatId, result.order.id, result.pins, {
+            formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
           });
-
-          fs.writeFileSync(filePath1, fileContent1, 'utf8');
-
-          // Send first file (PINs only)
-          await bot.sendDocument(chatId, filePath1, {
-            caption: `📄 *PIN Codes Only*\n` +
-              `Order #${result.order.id}\n\n` +
-              `Format: One PIN per line`,
-            parse_mode: 'Markdown',
-            contentType: 'text/plain'
-          });
-
-          fs.unlinkSync(filePath1);
-
-          // 2. Generate SECOND file: PIN + Serial Number format
-          const fileName2 = `Order_${result.order.id}_Pins_with_Serial.txt`;
-          const filePath2 = path.join(pinsDir, fileName2);
-
-          let fileContent2 = '';
-          result.pins.forEach((pin) => {
-            const serialNum = pin.serialNumber || 'N/A';
-            fileContent2 += `${pin.pinCode}\n${serialNum}\n`;
-          });
-
-          fs.writeFileSync(filePath2, fileContent2, 'utf8');
-
-          // Send second file (PINs with serial numbers)
-          await bot.sendDocument(chatId, filePath2, {
-            caption: `📄 *PIN Codes + Serial Numbers*\n` +
-              `Order #${result.order.id}\n\n` +
-              `Format: PIN on first line, Serial on second line`,
-            parse_mode: 'Markdown',
-            contentType: 'text/plain'
-          });
-
-          fs.unlinkSync(filePath2);
-
-          } catch (err) {
-            logger.error('Error sending TXT files:', err);
-            // Fallback to message format
-            const plainMessages = orderService.formatPinsPlain(result.pins);
-            for (const message of plainMessages) {
-              await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-            }
-          }
-
-          // Clear pins from memory after sending
           orderService.clearOrderPins(result.order.id);
         }
 
@@ -1798,89 +1489,27 @@ class OrderFlowHandler {
               }
             }
 
-            await bot.sendMessage(chatId,
-              `🛑 *ORDER CANCELLED*   \n` +
-              `🆔 *Order ID:* #${err.partialOrder.order.id}\n\n` +
-              `✅ ${err.partialOrder.pins.length - failedCards} card(s) completed\n` +
-              (failedCards > 0 ? `❌ ${failedCards} card(s) failed\n` : '') +
-              `⏹️ Remaining cards not processed\n\n` +
-              `Your completed PINs will be sent below.`,
-              { parse_mode: 'Markdown' }
-            );
+            // Calculate successful cards (exclude FAILED)
+            const successfulCards = err.partialOrder.pins.filter(p => p.pinCode !== 'FAILED').length;
+            
+            // Use MessageFormatter for consistent formatting (SOLID principle)
+            const cancelMessage = messageFormatter.formatOrderCancelled(err.partialOrder.order, successfulCards, failedCards);
+            await bot.sendMessage(chatId, cancelMessage, { parse_mode: 'Markdown' });
 
-            // Send TXT files with partial results (only if there are successful purchases)
+            // Use FileGenerator for consistent file sending (SOLID principle)
             if (err.partialOrder.pins && err.partialOrder.pins.length > 0) {
-              try {
-                const fs = require('fs');
-                const path = require('path');
-
-                const pinsDir = path.join(process.cwd(), 'temp_pins');
-                if (!fs.existsSync(pinsDir)) {
-                  fs.mkdirSync(pinsDir, { recursive: true });
-                }
-
-                // 1. Generate first file: PIN + Serial
-              const fileName1 = `Order_${err.partialOrder.order.id}_Partial_Pins_with_Serial.txt`;
-              const filePath1 = path.join(pinsDir, fileName1);
-
-              let fileContent1 = '';
-              err.partialOrder.pins.forEach((pin) => {
-                const serialNum = pin.serialNumber || 'N/A';
-                fileContent1 += `${pin.pinCode}\n${serialNum}\n`;
+              await fileGenerator.sendPinFiles(bot, chatId, err.partialOrder.order.id, err.partialOrder.pins, {
+                isPartial: true,
+                formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
               });
-
-              fs.writeFileSync(filePath1, fileContent1, 'utf8');
-
-              await bot.sendDocument(chatId, filePath1, {
-                caption: `📄 *PIN Codes + Serial Numbers*\n` +
-                  `Order #${err.partialOrder.order.id} (Partial)\n\n` +
-                  `Format: PIN on first line, Serial on second line`,
-                parse_mode: 'Markdown',
-                contentType: 'text/plain'
-              });
-
-              fs.unlinkSync(filePath1);
-
-              // 2. Generate second file: PINs only
-              const fileName2 = `Order_${err.partialOrder.order.id}_Partial_Pins_Only.txt`;
-              const filePath2 = path.join(pinsDir, fileName2);
-
-              let fileContent2 = '';
-              err.partialOrder.pins.forEach((pin) => {
-                fileContent2 += `${pin.pinCode}\n`;
-              });
-
-              fs.writeFileSync(filePath2, fileContent2, 'utf8');
-
-              await bot.sendDocument(chatId, filePath2, {
-                caption: `📄 *PIN Codes Only*\n` +
-                  `Order #${err.partialOrder.order.id} (Partial)\n\n` +
-                  `Format: One PIN per line`,
-                parse_mode: 'Markdown',
-                contentType: 'text/plain'
-              });
-
-              fs.unlinkSync(filePath2);
-
-              } catch (fileErr) {
-                logger.error('Error sending TXT files:', fileErr);
-                // Fallback to message format
-                const plainMessages = orderService.formatPinsPlain(err.partialOrder.pins);
-                for (const message of plainMessages) {
-                  await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-                }
-              }
-
               orderService.clearOrderPins(err.partialOrder.order.id);
             }
 
+            // Send final message using MessageFormatter
             const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
-            if (remaining > 0) {
-              await bot.sendMessage(chatId,
-                `ℹ️ ${remaining} card(s) were not processed.\n\n` +
-                `Use /start to create a new order.`,
-                { parse_mode: 'Markdown' }
-              );
+            const remainingMessage = messageFormatter.formatRemainingCards(remaining);
+            if (remainingMessage) {
+              await bot.sendMessage(chatId, remainingMessage, { parse_mode: 'Markdown' });
             }
           } else {
             // No purchases completed
@@ -1904,12 +1533,9 @@ class OrderFlowHandler {
               }
             }
 
-            await bot.sendMessage(chatId,
-              `🛑 *ORDER CANCELLED*   \n` +
-              `No cards were processed.\n\n` +
-              `Use /start to create a new order.`,
-              { parse_mode: 'Markdown' }
-            );
+            // Use MessageFormatter for consistent formatting (SOLID principle)
+            const cancelledMessage = messageFormatter.formatOrderCancelledNoCards();
+            await bot.sendMessage(chatId, cancelledMessage, { parse_mode: 'Markdown' });
           }
         } catch (sendErr) {
           logger.error('Error sending cancellation message:', sendErr);

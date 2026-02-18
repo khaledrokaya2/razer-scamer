@@ -19,7 +19,8 @@ class BrowserManager {
     this.INACTIVITY_TIMEOUT = 1 * 24 * 60 * 60 * 1000; // 1 day
 
     // Start cleanup interval (check every 2 minutes for faster resource recovery)
-    this.startCleanupInterval();
+    // DISABLED: User wants browsers to stay open indefinitely
+    // this.startCleanupInterval();
   }
 
   /**

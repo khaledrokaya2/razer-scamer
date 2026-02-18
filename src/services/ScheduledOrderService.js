@@ -7,6 +7,11 @@ const logger = require('../utils/logger');
 const db = require('./DatabaseService');
 const orderService = require('./OrderService');
 
+// SOLID Principle: Single Responsibility - Use shared utilities
+const fileGenerator = require('../utils/FileGenerator');
+const messageFormatter = require('../utils/MessageFormatter');
+const errorHandler = require('../utils/ErrorHandler');
+
 class ScheduledOrderService {
   constructor(bot) {
     this.bot = bot;
@@ -268,23 +273,16 @@ class ScheduledOrderService {
       const failedCards = result.pins.filter(p => p.pinCode === 'FAILED').length;
 
       try {
-        let statusMessage = `✅ *SCHEDULED ORDER COMPLETED*\n` +
-          `🆔 *Order ID:* #${result.order.id}\n\n` +
-          `📦 *Cards Processed*\n` +
-          `     ${successfulCards} / ${result.order.cards_count} cards\n\n`;
-
-        if (failedCards > 0) {
-          statusMessage += `⚠️ *${failedCards} card(s) marked FAILED*\n\n`;
-        }
-
-        statusMessage += `📊 *Status:* ${result.order.status}\n\n`;
-
+        // Use MessageFormatter for consistent formatting (SOLID principle)
+        const validPinCount = fileGenerator.getValidPinCount(result.pins);
+        const statusMessage = messageFormatter.formatScheduledOrderComplete(result, validPinCount);
         await this.bot.sendMessage(chat_id, statusMessage, { parse_mode: 'Markdown' });
 
-        // Send PINs as TXT files (two formats)
-        await this.sendPinFiles(chat_id, result.order.id, result.pins);
+        // Use FileGenerator for consistent file sending (SOLID principle)
+        await fileGenerator.sendPinFiles(this.bot, chat_id, result.order.id, result.pins, {
+          formatPinsPlain: this.orderService.formatPinsPlain.bind(this.orderService)
+        });
 
-        // Clear pins from memory after sending
         this.orderService.clearOrderPins(result.order.id);
 
       } catch (sendErr) {
@@ -397,7 +395,8 @@ class ScheduledOrderService {
 
       // Send error notification to user
       try {
-        const friendlyError = this.getUserFriendlyError(err);
+        // Use ErrorHandler for consistent error handling (SOLID principle)
+        const friendlyError = errorHandler.getUserFriendlyError(err);
         await this.bot.sendMessage(chat_id,
           `❌ *SCHEDULED ORDER FAILED*\n\n` +
           friendlyError + `\n\n` +
@@ -413,126 +412,6 @@ class ScheduledOrderService {
       this.processingMessageIds.delete(chat_id);
       this.clearCancellation(chat_id);
     }
-  }
-
-  /**
-   * Send PIN files in two formats
-   * @param {number} chatId - Telegram chat ID
-   * @param {number} orderId - Order ID
-   * @param {Array} pins - Array of pin objects
-   */
-  async sendPinFiles(chatId, orderId, pins) {
-    const fs = require('fs');
-    const path = require('path');
-
-    try {
-      // Create pins directory if it doesn't exist
-      const pinsDir = path.join(process.cwd(), 'temp_pins');
-      if (!fs.existsSync(pinsDir)) {
-        fs.mkdirSync(pinsDir, { recursive: true });
-      }
-
-      // 1. Generate first file: PIN + Serial Number format
-      const fileName1 = `Order_${orderId}_Pins_with_Serial.txt`;
-      const filePath1 = path.join(pinsDir, fileName1);
-
-      let fileContent1 = '';
-      pins.forEach((pin) => {
-        const serialNum = pin.serialNumber || 'N/A';
-        fileContent1 += `${pin.pinCode}\n${serialNum}\n`;
-      });
-
-      fs.writeFileSync(filePath1, fileContent1, 'utf8');
-
-      // Send first file
-      await this.bot.sendDocument(chatId, filePath1, {
-        caption: `📄 *PIN Codes + Serial Numbers*\n` +
-          `Order #${orderId}\n\n` +
-          `Format: PIN on first line, Serial on second line`,
-        parse_mode: 'Markdown',
-        contentType: 'text/plain'
-      });
-
-      // Delete first file after sending
-      fs.unlinkSync(filePath1);
-
-      // 2. Generate second file: PINs only
-      const fileName2 = `Order_${orderId}_Pins_Only.txt`;
-      const filePath2 = path.join(pinsDir, fileName2);
-
-      let fileContent2 = '';
-      pins.forEach((pin) => {
-        fileContent2 += `${pin.pinCode}\n`;
-      });
-
-      fs.writeFileSync(filePath2, fileContent2, 'utf8');
-
-      // Send second file
-      await this.bot.sendDocument(chatId, filePath2, {
-        caption: `📄 *PIN Codes Only*\n` +
-          `Order #${orderId}\n\n` +
-          `Format: One PIN per line`,
-        parse_mode: 'Markdown',
-        contentType: 'text/plain'
-      });
-
-      // Delete second file after sending
-      fs.unlinkSync(filePath2);
-
-    } catch (err) {
-      logger.error('ScheduledOrderService: Error sending PIN files:', err);
-      // Fallback: Send as plain text messages
-      try {
-        const plainMessages = this.orderService.formatPinsPlain(pins);
-        for (const message of plainMessages) {
-          await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-        }
-      } catch (fallbackErr) {
-        logger.error('ScheduledOrderService: Fallback message send failed:', fallbackErr);
-      }
-    }
-  }
-
-  /**
-   * Get user-friendly error message
-   * @param {Error} err - Error object
-   * @returns {string} - Friendly error message
-   */
-  getUserFriendlyError(err) {
-    // Check error name first
-    if (err.name === 'SessionExpiredError') {
-      return `🔐 *SESSION EXPIRED*\n\nYour Razer session has expired.\nPlease update credentials in Settings.`;
-    }
-
-    if (err.name === 'InvalidBackupCodeError') {
-      return `🔐 *BACKUP CODE ERROR*\n\nAll backup codes are invalid or used.\nPlease add new backup codes in Settings.`;
-    }
-
-    if (err.name === 'StockNotAvailableError') {
-      return `📦 *OUT OF STOCK*\n\nThe requested card is currently\nnot available.\n\nPlease try again later.`;
-    }
-
-    if (err.name === 'NetworkError') {
-      return `🌐 *NETWORK ERROR*\n\nCould not connect to Razer.\nPlease check your internet and try again.`;
-    }
-
-    // Check error message patterns
-    const errorMsg = err.message ? err.message.toLowerCase() : '';
-
-    if (errorMsg.includes('timeout') || errorMsg.includes('timed out')) {
-      return `⏱️ *TIMEOUT ERROR*\n\nThe purchase took too long.\nPlease try again.`;
-    }
-
-    if (errorMsg.includes('browser') || errorMsg.includes('page closed')) {
-      return `🖥️ *BROWSER ERROR*\n\nBrowser session interrupted.\nPlease try again.`;
-    }
-
-    if (errorMsg.includes('database')) {
-      return `💾 *DATABASE ERROR*\n\nCould not save order data.\nPlease contact support.`;
-    }
-
-    // Generic error
-    return `❌ *ERROR*\n\nAn unexpected error occurred.\nPlease try again or contact support.\n\n_Error: ${err.message}_`;
   }
 }
 

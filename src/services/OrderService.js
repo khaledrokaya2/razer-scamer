@@ -231,20 +231,9 @@ class OrderService {
         logger.order('Processing cancellation - returning partial order...');
 
         if (order && err.purchases && err.purchases.length > 0) {
-          // NOTE: Successful purchases already saved to database immediately during processing
-          // Just store in memory for sending to user
-          for (const purchase of err.purchases) {
-            const orderData = this.orderPins.get(order.id);
-            if (orderData && orderData.pins) {
-              orderData.pins.push({
-                pinCode: purchase.pinCode,
-                serial: purchase.serial,
-                transactionId: purchase.transactionId,
-                success: purchase.success !== false,
-                requiresManualCheck: purchase.requiresManualCheck || false
-              });
-            }
-          }
+          // NOTE: Successful purchases already saved to database AND already in orderData.pins
+          // from onCardCompleted callback - DO NOT add them again (would create duplicates)
+          // Just use what's already in memory
 
           // Update order status to completed (purchases already in database)
           await databaseService.updateOrderStatus(order.id, 'completed');
