@@ -828,7 +828,7 @@ class PurchaseService {
           if (errorCheckErr.name === 'TimeoutError') {
             logger.success('No error alert detected - waiting for navigation...');
 
-            // Now wait for navigation (give it up to 20 seconds)
+            // Now wait for navigation (give it up to 45 seconds for slow networks)
             try {
               await page.waitForFunction(
                 (gameUrl) => {
@@ -836,7 +836,7 @@ class PurchaseService {
                   // Success: Navigated away from game page
                   return !currentUrl.includes(gameUrl);
                 },
-                { timeout: 15000, polling: 300 },
+                { timeout: 45000, polling: 300 },
                 gameUrl
               );
 
@@ -849,7 +849,7 @@ class PurchaseService {
               if (currentUrl.includes('/transaction/')) {
                 logger.success('Already on transaction page - backup code accepted');
               } else if (currentUrl.includes(gameUrl)) {
-                logger.error('Still on game page after 20 seconds - backup code likely invalid');
+                logger.error('Still on game page after 45 seconds - backup code likely invalid');
                 throw new InvalidBackupCodeError('The backup code validation timed out. The code may be incorrect or expired. Please enter another valid backup code.');
               } else {
                 logger.info('Navigated to unknown page - continuing...');
