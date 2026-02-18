@@ -399,7 +399,7 @@ class PurchaseService {
       currentStage = this.STAGES.NAVIGATING;
       logger.debug(`Stage: ${currentStage}`);
       
-      const currentUrl = page.url();
+      let currentUrl = page.url();
       if (!currentUrl.includes(gameUrl)) {
         logger.debug('Not on game page, navigating...');
         await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
