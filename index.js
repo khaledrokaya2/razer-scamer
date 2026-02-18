@@ -46,7 +46,7 @@ function getEnvironmentConfig() {
       : process.env.DB_SERVER,
     dbName: isDevelopment
       ? process.env.TEST_DB_NAME
-      : process.env.DB_NAME
+      : process.env.DB_NAME,
   };
 }
 
