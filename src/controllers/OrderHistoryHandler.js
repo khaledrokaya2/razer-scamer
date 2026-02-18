@@ -257,7 +257,8 @@ class OrderHistoryHandler {
           `🎮 Game: ${order.game_name}\n` +
           `💎 Card: ${order.card_value}\n` +
           `✅ Total PINs: ${pins.length}`,
-        parse_mode: 'Markdown'
+        parse_mode: 'Markdown',
+        contentType: 'text/plain'
       });
 
       // Delete temporary file after sending

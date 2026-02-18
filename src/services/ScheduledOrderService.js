@@ -449,7 +449,8 @@ class ScheduledOrderService {
         caption: `📄 *PIN Codes + Serial Numbers*\n` +
           `Order #${orderId}\n\n` +
           `Format: PIN on first line, Serial on second line`,
-        parse_mode: 'Markdown'
+        parse_mode: 'Markdown',
+        contentType: 'text/plain'
       });
 
       // Delete first file after sending
@@ -471,7 +472,8 @@ class ScheduledOrderService {
         caption: `📄 *PIN Codes Only*\n` +
           `Order #${orderId}\n\n` +
           `Format: One PIN per line`,
-        parse_mode: 'Markdown'
+        parse_mode: 'Markdown',
+        contentType: 'text/plain'
       });
 
       // Delete second file after sending

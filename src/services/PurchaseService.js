@@ -37,8 +37,8 @@ class InvalidBackupCodeError extends Error {
 class PurchaseService {
   constructor() {
     this.DEFAULT_TIMEOUT = 30000; // 30 seconds
-    this.RELOAD_CHECK_INTERVAL = 2000; // 2 seconds between stock checks
-    this.MAX_RELOAD_ATTEMPTS = 300; // 10 minutes of retrying (300 * 2s)
+    this.RELOAD_CHECK_INTERVAL = 500; // 0.5 seconds between stock checks (faster restocking detection)
+    this.MAX_RELOAD_ATTEMPTS = 600; // 5 minutes of retrying (600 * 0.5s)
 
     // Purchase stages for tracking
     this.STAGES = {
@@ -366,7 +366,7 @@ class PurchaseService {
         return true;
       }
 
-      logger.debug('Out of stock, waiting 2 seconds before retry...');
+      logger.debug('Out of stock, waiting 0.5 seconds before retry...');
       await new Promise(resolve => setTimeout(resolve, this.RELOAD_CHECK_INTERVAL));
 
       // Reload page
@@ -395,15 +395,22 @@ class PurchaseService {
         throw new Error('Order cancelled by user');
       }
 
-      // STAGE 1: Navigate to game page
+      // STAGE 1: Navigate to game page (skip if already there - HUGE speed boost!)
       currentStage = this.STAGES.NAVIGATING;
       logger.debug(`Stage: ${currentStage}`);
-      await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      
+      const currentUrl = page.url();
+      if (!currentUrl.includes(gameUrl)) {
+        logger.debug('Not on game page, navigating...');
+        await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      } else {
+        logger.debug('Already on game page, skipping navigation');
+      }
 
       // Wait for cards with reduced timeout
       await page.waitForSelector("div[class*='selection-tile__text']", {
         visible: true,
-        timeout: 6000
+        timeout: 4000
       });
 
       // Check cancellation
@@ -432,7 +439,7 @@ class PurchaseService {
       // Wait for card containers to be fully loaded and clickable
       await page.waitForSelector('#webshop_step_sku .selection-tile', {
         visible: true,
-        timeout: 6000
+        timeout: 4000
       });
 
       // Get all card containers from the cards section
@@ -483,37 +490,8 @@ class PurchaseService {
         cardSelected = true;
       }
 
-      // Minimal wait for selection to register
-      await new Promise(resolve => setTimeout(resolve, 200));
-
-      // Verify the card was selected by checking the radio input state
-      const isSelected = await page.evaluate((index) => {
-        const cardContainers = document.querySelectorAll('#webshop_step_sku .selection-tile');
-        if (cardContainers[index]) {
-          const radioInput = cardContainers[index].querySelector('input[type="radio"][name="paymentAmountItem"]');
-          return radioInput ? radioInput.checked : false;
-        }
-        return false;
-      }, cardIndex);
-
-      if (!isSelected) {
-        logger.debug('Card not selected, trying JavaScript selection...');
-        // Final fallback: use JavaScript to directly select the radio button
-        await page.evaluate((index) => {
-          const cardContainers = document.querySelectorAll('#webshop_step_sku .selection-tile');
-          if (cardContainers[index]) {
-            const radioInput = cardContainers[index].querySelector('input[type="radio"][name="paymentAmountItem"]');
-            if (radioInput) {
-              radioInput.checked = true;
-              radioInput.click();
-
-              // Trigger change event
-              const event = new Event('change', { bubbles: true });
-              radioInput.dispatchEvent(event);
-            }
-          }
-        }, cardIndex);
-      }
+      // Mini wait for selection to register
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       logger.success(`Card ${cardIndex} selected successfully`);
 
@@ -529,7 +507,7 @@ class PurchaseService {
       // Wait for payment methods section to load
       await page.waitForSelector("#webshop_step_payment_channels", {
         visible: true,
-        timeout: 6000
+        timeout: 4000
       });
 
       // Select Razer Gold as payment method
@@ -538,7 +516,7 @@ class PurchaseService {
       // Wait for payment methods container to load
       await page.waitForSelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']", {
         visible: true,
-        timeout: 6000
+        timeout: 4000
       });
 
       // Find the Razer Gold payment method specifically
@@ -581,41 +559,8 @@ class PurchaseService {
         }
       }
 
-      // Minimal wait for selection to register
-      await new Promise(resolve => setTimeout(resolve, 200));
-
-      // Verify Razer Gold was selected by checking the radio input
-      const isRazerGoldSelected = await page.evaluate(() => {
-        const razerGoldRadio = document.querySelector('div[data-cs-override-id="purchase-paychann-razergoldwallet"] input[type="radio"]');
-        return razerGoldRadio && razerGoldRadio.checked;
-      });
-
-      if (!isRazerGoldSelected) {
-        logger.debug('Razer Gold not selected, trying alternative selection...');
-
-        // Alternative selection method using JavaScript
-        await page.evaluate(() => {
-          const razerGoldRadio = document.querySelector('div[data-cs-override-id="purchase-paychann-razergoldwallet"] input[type="radio"]');
-          if (razerGoldRadio) {
-            razerGoldRadio.checked = true;
-            razerGoldRadio.click();
-
-            // Trigger change event
-            const event = new Event('change', { bubbles: true });
-            razerGoldRadio.dispatchEvent(event);
-          }
-        });
-
-        // Check again
-        const isSelectedNow = await page.evaluate(() => {
-          const razerGoldRadio = document.querySelector('div[data-cs-override-id="purchase-paychann-razergoldwallet"] input[type="radio"]');
-          return razerGoldRadio && razerGoldRadio.checked;
-        });
-
-        if (!isSelectedNow) {
-          throw new Error('❌ Failed to select Razer Gold payment method');
-        }
-      }
+      // Mini wait for selection to register
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       logger.success('Razer Gold payment method selected successfully');
 
@@ -685,8 +630,8 @@ class PurchaseService {
         logger.debug('Navigation timeout - will check URL...');
       });
 
-      // Minimal wait for redirects
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // Quick check for redirects
+      await new Promise(resolve => setTimeout(resolve, 200));
 
       // Check URL after checkout
       const urlAfterCheckout = await page.url();
@@ -715,28 +660,171 @@ class PurchaseService {
       currentStage = this.STAGES.PROCESSING_2FA;
       logger.debug(`Stage: ${currentStage}`);
 
-      // Wait for either 2FA modal OR direct transaction page (two scenarios)
-      logger.debug('Checking if 2FA is required or direct processing...');
+      // OPTIMIZATION: Quick pre-check if already on transaction page (instant, no wait)
+      let quickCheck = page.url();
+      if (quickCheck.includes('/transaction/')) {
+        logger.success('Already on transaction page immediately - no 2FA needed');
+        // Skip to transaction handling
+      } else if (quickCheck.includes('/gold/reload')) {
+        logger.error('Already on reload page - insufficient balance');
+        throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
+      } else {
+        // Wait for either 2FA modal OR direct transaction page (two scenarios)
+        logger.debug('Checking if 2FA is required or direct processing...');
 
-      const checkoutResult = await Promise.race([
-        // Scenario 1: 2FA modal appears (requires backup code)
-        page.waitForFunction(() => {
-          const modal = document.querySelector('#purchaseOtpModal');
-          if (!modal) return false;
-          const style = window.getComputedStyle(modal);
-          return style.display !== 'none' && style.visibility !== 'hidden';
-        }, { polling: 'mutation', timeout: 6000 }).then(() => ({ type: '2fa' })).catch(() => null),
+        const checkoutResult = await Promise.race([
+          // Scenario 1: 2FA modal appears (requires backup code)
+          page.waitForFunction(() => {
+            const modal = document.querySelector('#purchaseOtpModal');
+            if (!modal) return false;
+            const style = window.getComputedStyle(modal);
+            return style.display !== 'none' && style.visibility !== 'hidden';
+          }, { polling: 'mutation', timeout: 4000 }).then(() => ({ type: '2fa' })).catch(() => null),
 
-        // Scenario 2: Direct redirect to transaction page (no 2FA)
-        page.waitForFunction(() => {
-          return window.location.href.includes('/transaction/');
-        }, { polling: 300, timeout: 6000 }).then(() => ({ type: 'direct' })).catch(() => null),
+          // Scenario 2: Direct redirect to transaction page (no 2FA) - FASTER polling for common case!
+          page.waitForFunction(() => {
+            return window.location.href.includes('/transaction/');
+          }, { polling: 100, timeout: 4000 }).then(() => ({ type: 'direct' })).catch(() => null),
 
-        // Scenario 3: Redirect to reload page (insufficient balance)
-        page.waitForFunction(() => {
-          return window.location.href.includes('/gold/reload');
-        }, { polling: 300, timeout: 6000 }).then(() => ({ type: 'reload' })).catch(() => null)
-      ]).then(result => result || { type: 'unknown' });
+          // Scenario 3: Redirect to reload page (insufficient balance)
+          page.waitForFunction(() => {
+            return window.location.href.includes('/gold/reload');
+          }, { polling: 100, timeout: 4000 }).then(() => ({ type: 'reload' })).catch(() => null)
+        ]).then(result => result || { type: 'unknown' });
+
+        // Handle reload page redirect
+        if (checkoutResult.type === 'reload') {
+          logger.error('Redirected to reload page - insufficient balance');
+          throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
+        }
+
+        // Handle direct transaction (no 2FA required) - MOST COMMON after first purchase!
+        if (checkoutResult.type === 'direct') {
+          logger.success('No 2FA required - proceeding directly to transaction page');
+          // Skip 2FA section and go directly to transaction handling
+        }
+        // Handle 2FA flow  
+        else if (checkoutResult.type === '2fa') {
+          logger.debug('2FA modal detected - processing backup code...');
+
+          // Step 2: Wait for any OTP iframe (first one)
+          await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 8000 });
+          let frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
+          let frame = await frameHandle.contentFrame();
+
+          // Step 3: Click "Choose another method" inside iframe
+          logger.debug('Clicking choose another method...');
+          const chooseAnother = await frame.waitForSelector("button[class*='arrowed']", { visible: true, timeout: 20000 });
+          await chooseAnother.click();
+
+          // Step 4: Wait for the new iframe (otp-iframe-4) to appear after clicking
+          await page.waitForFunction(() => {
+            const newIframe = document.querySelector('#purchaseOtpModal iframe[id^="otp-iframe-"]');
+            return newIframe && newIframe.id !== 'otp-iframe-3';
+          }, { polling: 'mutation', timeout: 8000 });
+
+          // Step 5: Switch to the new iframe
+          frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
+          frame = await frameHandle.contentFrame();
+
+          // Step 6: Wait for and click "Backup Codes" button
+          // Try clicking the one with "Backup" in its text
+          logger.debug('Selecting backup code option...');
+          const backupButton = await frame.$$("ul[class*='alt-menu'] button");
+          await backupButton[1].click();
+
+          // Enter backup code (8 digits)
+          logger.debug('Entering backup code...');
+
+          if (!backupCode || backupCode.length !== 8) {
+            throw new Error('Invalid backup code - must be 8 digits');
+          }
+
+          // Wait for iframe and get its frame context
+          await page.waitForSelector('iframe[id^="otp-iframe-"]', { visible: true, timeout: 6000 });
+          const otpFrameElement = await page.$('iframe[id^="otp-iframe-"]');
+          const otpFrame = await otpFrameElement.contentFrame();
+
+          if (!otpFrame) throw new Error('❌ Could not access OTP iframe');
+
+          // Type digits into inputs inside iframe
+          for (let i = 0; i < 8; i++) {
+            const inputSelector = `#otp-input-${i}`;
+            await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 3000 });
+            await otpFrame.type(inputSelector, backupCode[i]);
+          }
+
+          // After entering all digits, the form auto-submits and page navigates
+          // We need to wait for navigation without trying to access the detached frame
+          logger.debug('Backup code entered, waiting for validation...');
+
+          // CRITICAL FIX: Check for error popup on main page (not inside iframe)
+          // The error appears as: <div id="main-alert" class="show error notification">
+          try {
+            // Quick check for error alert popup (3 seconds max)
+            logger.debug('Checking for error alert popup...');
+            await page.waitForFunction(() => {
+              const errorAlert = document.querySelector('#main-alert.show.error');
+              if (errorAlert) {
+                const dialogText = errorAlert.textContent || '';
+                if (dialogText.includes('Invalid code') || dialogText.includes('invalid') || dialogText.includes('incorrect')) {
+                  return true;
+                }
+              }
+              return false;
+            }, { timeout: 3000, polling: 300 });
+
+            // If we reach here, error alert was found
+            logger.error('Invalid backup code - error alert detected');
+            throw new InvalidBackupCodeError('The backup code you entered is incorrect or expired. Please enter another valid backup code.');
+          } catch (errorCheckErr) {
+            // No error alert found within 3 seconds - this is GOOD
+            if (errorCheckErr.name === 'TimeoutError') {
+              logger.success('No error alert detected - waiting for navigation...');
+
+              // Now wait for navigation (give it up to 45 seconds for slow networks)
+              try {
+                await page.waitForFunction(
+                  (gameUrl) => {
+                    const currentUrl = window.location.href;
+                    // Success: Navigated away from game page
+                    return !currentUrl.includes(gameUrl);
+                  },
+                  { timeout: 45000, polling: 300 },
+                  gameUrl
+                );
+
+                logger.success('Navigation detected - backup code accepted');
+              } catch (navErr) {
+                // Navigation timeout - check where we are
+                logger.debug('Navigation timeout - checking current URL...');
+                const currentUrl = page.url();
+
+                if (currentUrl.includes('/transaction/')) {
+                  logger.success('Already on transaction page - backup code accepted');
+                } else if (currentUrl.includes(gameUrl)) {
+                  logger.error('Still on game page after 45 seconds - backup code likely invalid');
+                  throw new InvalidBackupCodeError('The backup code validation timed out. The code may be incorrect or expired. Please enter another valid backup code.');
+                } else {
+                  logger.info('Navigated to unknown page - continuing...');
+                }
+              }
+            } else {
+              // This was the InvalidBackupCodeError we threw above
+              throw errorCheckErr;
+            }
+          }
+        }
+        else {
+          // Unknown state - check current URL
+          logger.warn('Unknown state after checkout, checking current URL...');
+          const currentCheckUrl = page.url();
+
+          if (!currentCheckUrl.includes('/transaction/') && !currentCheckUrl.includes(gameUrl)) {
+            throw new Error(`Unexpected state after checkout. URL: ${currentCheckUrl}`);
+          }
+        }
+      }
 
       // Handle reload page redirect
       if (checkoutResult.type === 'reload') {

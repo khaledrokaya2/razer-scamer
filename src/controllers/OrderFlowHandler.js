@@ -1211,7 +1211,8 @@ class OrderFlowHandler {
             caption: `📄 *PIN Codes + Serial Numbers*\n` +
               `Order #${result.order.id}\n\n` +
               `Format: PIN on first line, Serial on second line`,
-            parse_mode: 'Markdown'
+            parse_mode: 'Markdown',
+            contentType: 'text/plain'
           });
 
           fs.unlinkSync(filePath1);
@@ -1232,7 +1233,8 @@ class OrderFlowHandler {
             caption: `📄 *PIN Codes Only*\n` +
               `Order #${result.order.id}\n\n` +
               `Format: One PIN per line`,
-            parse_mode: 'Markdown'
+            parse_mode: 'Markdown',
+            contentType: 'text/plain'
           });
 
           fs.unlinkSync(filePath2);
@@ -1340,7 +1342,8 @@ class OrderFlowHandler {
                 caption: `📄 *PIN Codes + Serial Numbers*\n` +
                   `Order #${err.partialOrder.order.id}\n\n` +
                   `Format: PIN on first line, Serial on second line`,
-                parse_mode: 'Markdown'
+                parse_mode: 'Markdown',
+                contentType: 'text/plain'
               });
 
               fs.unlinkSync(filePath1);
@@ -1361,7 +1364,8 @@ class OrderFlowHandler {
                 caption: `📄 *PIN Codes Only*\n` +
                   `Order #${err.partialOrder.order.id}\n\n` +
                   `Format: One PIN per line`,
-                parse_mode: 'Markdown'
+                parse_mode: 'Markdown',
+                contentType: 'text/plain'
               });
 
               fs.unlinkSync(filePath2);
@@ -1706,7 +1710,8 @@ class OrderFlowHandler {
             caption: `📄 *PIN Codes Only*\n` +
               `Order #${result.order.id}\n\n` +
               `Format: One PIN per line`,
-            parse_mode: 'Markdown'
+            parse_mode: 'Markdown',
+            contentType: 'text/plain'
           });
 
           fs.unlinkSync(filePath1);
@@ -1728,7 +1733,8 @@ class OrderFlowHandler {
             caption: `📄 *PIN Codes + Serial Numbers*\n` +
               `Order #${result.order.id}\n\n` +
               `Format: PIN on first line, Serial on second line`,
-            parse_mode: 'Markdown'
+            parse_mode: 'Markdown',
+            contentType: 'text/plain'
           });
 
           fs.unlinkSync(filePath2);
@@ -1822,7 +1828,8 @@ class OrderFlowHandler {
                 caption: `📄 *PIN Codes + Serial Numbers*\n` +
                   `Order #${err.partialOrder.order.id} (Partial)\n\n` +
                   `Format: PIN on first line, Serial on second line`,
-                parse_mode: 'Markdown'
+                parse_mode: 'Markdown',
+                contentType: 'text/plain'
               });
 
               fs.unlinkSync(filePath1);
@@ -1842,7 +1849,8 @@ class OrderFlowHandler {
                 caption: `📄 *PIN Codes Only*\n` +
                   `Order #${err.partialOrder.order.id} (Partial)\n\n` +
                   `Format: One PIN per line`,
-                parse_mode: 'Markdown'
+                parse_mode: 'Markdown',
+                contentType: 'text/plain'
               });
 
               fs.unlinkSync(filePath2);
