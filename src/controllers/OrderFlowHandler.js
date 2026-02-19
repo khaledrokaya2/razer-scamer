@@ -773,6 +773,387 @@ class OrderFlowHandler {
   }
 
   /**
+   * UNIFIED Order Execution Method
+   * Handles order processing for both instant and scheduled orders
+   * @param {Object} params - Parameters
+   * @param {Object} params.bot - Telegram bot instance
+   * @param {number} params.chatId - Chat ID
+   * @param {string} params.telegramUserId - Telegram user ID
+   * @param {string} params.gameName - Game name
+   * @param {string} params.gameUrl - Game URL
+   * @param {string} params.cardName - Card name
+   * @param {number} params.cardIndex - Card index
+   * @param {number} params.quantity - Quantity
+   * @param {boolean} params.isScheduled - If true, this is a scheduled order
+   * @param {number} params.scheduledOrderId - Scheduled order ID (only for scheduled orders)
+   * @returns {Promise<Object>} Order result
+   */
+  async _executeOrder({ bot, chatId, telegramUserId, gameName, gameUrl, cardName, cardIndex, quantity, isScheduled = false, scheduledOrderId = null }) {
+    try {
+      // Show processing message with cancel button
+      const processingMsg = await bot.sendMessage(chatId,
+        `⏳ *${isScheduled ? 'SCHEDULED ORDER' : 'PROCESSING ORDER'}...*\n\n` +
+        `🎮 ${gameName}\n` +
+        `💳 ${cardName}\n` +
+        `🔢 Quantity: ${quantity}\n\n` +
+        `⏱️ This may take several minutes.\n` +
+        `Please wait...`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '🛑 Cancel Order', callback_data: isScheduled ? `scheduled_cancel_${chatId}` : 'order_cancel_processing' }
+            ]]
+          }
+        }
+      );
+
+      this.orderSummaryMessages.set(chatId, processingMsg.message_id);
+
+      // Progress update callback
+      const sendProgressUpdate = async (completed, total) => {
+        try {
+          const progressBar = this.createProgressBar(completed, total);
+          const percentage = Math.round((completed / total) * 100);
+
+          const progressText = `⏳ *Progress*\n${progressBar}\n\n✅ ${completed}/${total} (📊 ${percentage}%)`;
+
+          const existingMessageId = this.progressMessages.get(chatId);
+
+          if (existingMessageId) {
+            try {
+              await bot.editMessageText(progressText, {
+                chat_id: chatId,
+                message_id: existingMessageId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: '🛑 Cancel Order', callback_data: isScheduled ? `scheduled_cancel_${chatId}` : 'order_cancel_processing' }
+                  ]]
+                }
+              });
+            } catch (editErr) {
+              logger.debug('Could not edit progress message, sending new one');
+              const newMsg = await bot.sendMessage(chatId, progressText, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: '🛑 Cancel Order', callback_data: isScheduled ? `scheduled_cancel_${chatId}` : 'order_cancel_processing' }
+                  ]]
+                }
+              });
+              this.progressMessages.set(chatId, newMsg.message_id);
+            }
+          } else {
+            const msg = await bot.sendMessage(chatId, progressText, {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: '🛑 Cancel Order', callback_data: isScheduled ? `scheduled_cancel_${chatId}` : 'order_cancel_processing' }
+                ]]
+              }
+            });
+            this.progressMessages.set(chatId, msg.message_id);
+          }
+        } catch (err) {
+          logger.debug('Could not send progress update:', err.message);
+        }
+      };
+
+      // Process the order
+      const result = await orderService.processOrder({
+        telegramUserId,
+        gameName,
+        gameUrl,
+        cardName,
+        cardIndex,
+        quantity,
+        onProgress: sendProgressUpdate,
+        checkCancellation: () => this.isCancelled(chatId)
+      });
+
+      // Delete progress and processing messages before sending results
+      const progressMsgId = this.progressMessages.get(chatId);
+      if (progressMsgId) {
+        try {
+          await bot.deleteMessage(chatId, progressMsgId);
+          this.progressMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete progress message');
+        }
+      }
+
+      const summaryMsgId = this.orderSummaryMessages.get(chatId);
+      if (summaryMsgId) {
+        try {
+          await bot.deleteMessage(chatId, summaryMsgId);
+          this.orderSummaryMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete order summary message');
+        }
+      }
+
+      // FIX: Delete game and card menu messages (prevents old menus from staying visible)
+      const gameMenuMsgId = this.gameMenuMessages.get(chatId);
+      if (gameMenuMsgId) {
+        try {
+          await bot.deleteMessage(chatId, gameMenuMsgId);
+          this.gameMenuMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete game menu message');
+        }
+      }
+
+      const cardMenuMsgId = this.cardMenuMessages.get(chatId);
+      if (cardMenuMsgId) {
+        try {
+          await bot.deleteMessage(chatId, cardMenuMsgId);
+          this.cardMenuMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete card menu message');
+        }
+      }
+
+      // Send success message with option to start new order
+      const validPinCount = fileGenerator.getValidPinCount(result.pins);
+      const statusMessage = isScheduled
+        ? messageFormatter.formatScheduledOrderComplete(result, validPinCount)
+        : messageFormatter.formatOrderComplete(result.order, validPinCount);
+
+      await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+
+      // Send pin files
+      if (result.pins && result.pins.length > 0) {
+        await fileGenerator.sendPinFiles(bot, chatId, result.order.id, result.pins, {
+          formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
+        });
+        orderService.clearOrderPins(result.order.id);
+      }
+
+      // Cleanup
+      this.clearCancellation(chatId);
+      this.progressMessages.delete(chatId);
+      this.orderSummaryMessages.delete(chatId);
+
+      return result;
+
+    } catch (err) {
+      // Handle cancellation
+      if (err.message && err.message.includes('cancelled by user')) {
+        logger.info(`Order cancelled by user at stage: ${err.stage || 'unknown'}`);
+
+        try {
+          // Check if there were partial results
+          if (err.partialOrder && err.partialOrder.pins && err.partialOrder.pins.length > 0) {
+            const failedCards = err.partialOrder.pins.filter(p => p.pinCode === 'FAILED').length;
+
+            // Delete progress messages
+            const progressMsgId = this.progressMessages.get(chatId);
+            if (progressMsgId) {
+              try {
+                await bot.deleteMessage(chatId, progressMsgId);
+                this.progressMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete progress message');
+              }
+            }
+
+            const cancellingMsgId = this.cancellingMessages.get(chatId);
+            if (cancellingMsgId) {
+              try {
+                await bot.deleteMessage(chatId, cancellingMsgId);
+                this.cancellingMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete cancelling message');
+              }
+            }
+
+            const summaryMsgId = this.orderSummaryMessages.get(chatId);
+            if (summaryMsgId) {
+              try {
+                await bot.deleteMessage(chatId, summaryMsgId);
+                this.orderSummaryMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete order summary message');
+              }
+            }
+
+            // FIX: Delete game and card menu messages
+            const gameMenuMsgId = this.gameMenuMessages.get(chatId);
+            if (gameMenuMsgId) {
+              try {
+                await bot.deleteMessage(chatId, gameMenuMsgId);
+                this.gameMenuMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete game menu message');
+              }
+            }
+
+            const cardMenuMsgId = this.cardMenuMessages.get(chatId);
+            if (cardMenuMsgId) {
+              try {
+                await bot.deleteMessage(chatId, cardMenuMsgId);
+                this.cardMenuMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete card menu message');
+              }
+            }
+
+            const successfulCards = err.partialOrder.pins.filter(p => p.pinCode !== 'FAILED').length;
+            const cancelMessage = messageFormatter.formatOrderCancelled(err.partialOrder.order, successfulCards, failedCards);
+            await bot.sendMessage(chatId, cancelMessage, { parse_mode: 'Markdown' });
+
+            if (err.partialOrder.pins && err.partialOrder.pins.length > 0) {
+              await fileGenerator.sendPinFiles(bot, chatId, err.partialOrder.order.id, err.partialOrder.pins, {
+                isPartial: true,
+                formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
+              });
+              orderService.clearOrderPins(err.partialOrder.order.id);
+            }
+
+            const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
+            const remainingMessage = messageFormatter.formatRemainingCards(remaining);
+            if (remainingMessage) {
+              await bot.sendMessage(chatId, remainingMessage, { parse_mode: 'Markdown' });
+            }
+          } else {
+            // No purchases completed
+            const progressMsgId = this.progressMessages.get(chatId);
+            if (progressMsgId) {
+              try {
+                await bot.deleteMessage(chatId, progressMsgId);
+                this.progressMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete progress message');
+              }
+            }
+
+            const cancellingMsgId = this.cancellingMessages.get(chatId);
+            if (cancellingMsgId) {
+              try {
+                await bot.deleteMessage(chatId, cancellingMsgId);
+                this.cancellingMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete cancelling message');
+              }
+            }
+
+            const summaryMsgId = this.orderSummaryMessages.get(chatId);
+            if (summaryMsgId) {
+              try {
+                await bot.deleteMessage(chatId, summaryMsgId);
+                this.orderSummaryMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete order summary message');
+              }
+            }
+
+            // FIX: Delete game and card menu messages
+            const gameMenuMsgId = this.gameMenuMessages.get(chatId);
+            if (gameMenuMsgId) {
+              try {
+                await bot.deleteMessage(chatId, gameMenuMsgId);
+                this.gameMenuMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete game menu message');
+              }
+            }
+
+            const cardMenuMsgId = this.cardMenuMessages.get(chatId);
+            if (cardMenuMsgId) {
+              try {
+                await bot.deleteMessage(chatId, cardMenuMsgId);
+                this.cardMenuMessages.delete(chatId);
+              } catch (delErr) {
+                logger.debug('Could not delete card menu message');
+              }
+            }
+
+            const cancelledMessage = messageFormatter.formatOrderCancelledNoCards();
+            await bot.sendMessage(chatId, cancelledMessage, { parse_mode: 'Markdown' });
+          }
+        } catch (sendErr) {
+          logger.error('Error sending cancellation message:', sendErr);
+        }
+
+        this.clearCancellation(chatId);
+        this.progressMessages.delete(chatId);
+        this.cancellingMessages.delete(chatId);
+        this.orderSummaryMessages.delete(chatId);
+
+        // Re-throw with partial order data
+        err.partialOrder = err.partialOrder || null;
+        throw err;
+      }
+
+      // Handle regular errors
+      logger.error('Order processing error:', err);
+
+      // Delete messages
+      const progressMsgId = this.progressMessages.get(chatId);
+      if (progressMsgId) {
+        try {
+          await bot.deleteMessage(chatId, progressMsgId);
+          this.progressMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete progress message');
+        }
+      }
+
+      const summaryMsgId = this.orderSummaryMessages.get(chatId);
+      if (summaryMsgId) {
+        try {
+          await bot.deleteMessage(chatId, summaryMsgId);
+          this.orderSummaryMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete order summary message');
+        }
+      }
+
+      const cancellingMsgId = this.cancellingMessages.get(chatId);
+      if (cancellingMsgId) {
+        try {
+          await bot.deleteMessage(chatId, cancellingMsgId);
+          this.cancellingMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete cancelling message');
+        }
+      }
+
+      // FIX: Delete game and card menu messages
+      const gameMenuMsgId = this.gameMenuMessages.get(chatId);
+      if (gameMenuMsgId) {
+        try {
+          await bot.deleteMessage(chatId, gameMenuMsgId);
+          this.gameMenuMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete game menu message');
+        }
+      }
+
+      const cardMenuMsgId = this.cardMenuMessages.get(chatId);
+      if (cardMenuMsgId) {
+        try {
+          await bot.deleteMessage(chatId, cardMenuMsgId);
+          this.cardMenuMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete card menu message');
+        }
+      }
+
+      const friendlyError = this.getUserFriendlyError(err);
+      await bot.sendMessage(chatId, friendlyError, { parse_mode: 'Markdown' });
+
+      this.clearCancellation(chatId);
+      this.progressMessages.delete(chatId);
+      this.orderSummaryMessages.delete(chatId);
+      this.cancellingMessages.delete(chatId);
+
+      throw err;
+    }
+  }
+
+  /**
    * Handle backup code input (DEPRECATED - now uses database)
    * @param {Object} bot - Telegram bot instance
    * @param {number} chatId - Chat ID
@@ -889,289 +1270,26 @@ class OrderFlowHandler {
       logger.error('Error sending order summary:', err);
     }
 
-    // Process order
+    // Process order using unified method (REFACTORED: eliminates duplicate code)
     try {
-      // UX FIX #16: Progress callback for bulk purchases
-      const sendProgressUpdate = async (completed, total) => {
-        try {
-          const progressBar = this.createProgressBar(completed, total);
-          const percentage = Math.round((completed / total) * 100);
-
-          const progressText = `⏳ *Progress*\n${progressBar}\n\n✅ ${completed}/${total} (📊 ${percentage}%)`;
-
-          // Check if we have a previous progress message to edit
-          const existingMessageId = this.progressMessages.get(chatId);
-
-          if (existingMessageId) {
-            // Edit existing message
-            try {
-              await bot.editMessageText(progressText, {
-                chat_id: chatId,
-                message_id: existingMessageId,
-                parse_mode: 'Markdown',
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
-                  ]]
-                }
-              });
-            } catch (editErr) {
-              // If edit fails (message too old or deleted), send new message
-              logger.debug('Could not edit progress message, sending new one');
-              const newMsg = await bot.sendMessage(chatId, progressText, {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
-                  ]]
-                }
-              });
-              this.progressMessages.set(chatId, newMsg.message_id);
-            }
-          } else {
-            // Send new message and store its ID
-            const msg = await bot.sendMessage(chatId, progressText, {
-              parse_mode: 'Markdown',
-              reply_markup: {
-                inline_keyboard: [[
-                  { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
-                ]]
-              }
-            });
-            this.progressMessages.set(chatId, msg.message_id);
-          }
-        } catch (err) {
-          logger.debug('Could not send progress update:', err.message);
-        }
-      };
-
-      // Process the order with progress updates and cancellation check
-      const result = await orderService.processOrder({
-        telegramUserId: telegramUserId,  // Changed from userId to telegramUserId
+      await this._executeOrder({
+        bot,
+        chatId,
+        telegramUserId,
         gameName: session.gameName,
         gameUrl: session.gameUrl,
         cardName: session.cardName,
         cardIndex: session.cardIndex,
         quantity: session.quantity,
-        onProgress: sendProgressUpdate,  // UX FIX #16
-        checkCancellation: () => this.isCancelled(chatId)  // Check if user cancelled
+        isScheduled: false
       });
 
-      // Send success message with details about failed cards
-      const successfulCards = result.order.completed_purchases;
-      const failedCards = result.pins.filter(p => p.pinCode === 'FAILED').length;
-
-      // Delete the progress message and order summary before sending results
-      const progressMsgId = this.progressMessages.get(chatId);
-      if (progressMsgId) {
-        try {
-          await bot.deleteMessage(chatId, progressMsgId);
-          this.progressMessages.delete(chatId);
-        } catch (delErr) {
-          logger.debug('Could not delete progress message');
-        }
-      }
-
-      const summaryMsgId = this.orderSummaryMessages.get(chatId);
-      if (summaryMsgId) {
-        try {
-          await bot.deleteMessage(chatId, summaryMsgId);
-          this.orderSummaryMessages.delete(chatId);
-        } catch (delErr) {
-          logger.debug('Could not delete order summary message');
-        }
-      }
-
-      try {
-        // Use MessageFormatter for consistent formatting (SOLID principle)
-        const validPinCount = fileGenerator.getValidPinCount(result.pins);
-        const statusMessage = messageFormatter.formatOrderComplete(result.order, validPinCount);
-        await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
-
-        // Use FileGenerator for consistent file sending (SOLID principle)
-        if (result.pins && result.pins.length > 0) {
-          await fileGenerator.sendPinFiles(bot, chatId, result.order.id, result.pins, {
-            formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
-          });
-          orderService.clearOrderPins(result.order.id);
-        }
-
-      } catch (err) {
-        logger.error('Error sending order results:', err);
-      }
-
-      // Clear session, cancellation flag, progress message, and order summary
+      // Clear session on success
       this.clearSession(chatId);
-      this.clearCancellation(chatId);
-      this.progressMessages.delete(chatId);
-      this.orderSummaryMessages.delete(chatId);
 
     } catch (err) {
-      // Check if it was a user cancellation BEFORE logging as error
-      if (err.message && err.message.includes('cancelled by user')) {
-        // Log as info instead of error since it's expected user action
-        logger.info('Order cancelled by user at stage:', err.stage || 'unknown');
-        try {
-          // Check if there were any completed purchases
-          if (err.partialOrder && err.partialOrder.pins && err.partialOrder.pins.length > 0) {
-            const failedCards = err.partialOrder.pins.filter(p => p.pinCode === 'FAILED').length;
-
-            // Delete the "CANCELLING ORDER" message before sending results
-            const cancellingMsgId = this.cancellingMessages.get(chatId);
-            if (cancellingMsgId) {
-              try {
-                await bot.deleteMessage(chatId, cancellingMsgId);
-                this.cancellingMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete cancelling message');
-              }
-            }
-
-            // Delete the progress message before sending results
-            const progressMsgId = this.progressMessages.get(chatId);
-            if (progressMsgId) {
-              try {
-                await bot.deleteMessage(chatId, progressMsgId);
-                this.progressMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete progress message');
-              }
-            }
-
-            // Delete the order summary message before sending results
-            const summaryMsgId = this.orderSummaryMessages.get(chatId);
-            if (summaryMsgId) {
-              try {
-                await bot.deleteMessage(chatId, summaryMsgId);
-                this.orderSummaryMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete order summary message');
-              }
-            }
-
-            // Send cancellation message with partial results
-            // Calculate successful cards (exclude FAILED)
-            const successfulCards = err.partialOrder.pins.filter(p => p.pinCode !== 'FAILED').length;
-
-            // Use MessageFormatter for consistent formatting (SOLID principle)
-            const cancelMessage = messageFormatter.formatOrderCancelled(err.partialOrder.order, successfulCards, failedCards);
-            await bot.sendMessage(chatId, cancelMessage, { parse_mode: 'Markdown' });
-
-            // Use FileGenerator for consistent file sending (SOLID principle)
-            if (err.partialOrder.pins && err.partialOrder.pins.length > 0) {
-              await fileGenerator.sendPinFiles(bot, chatId, err.partialOrder.order.id, err.partialOrder.pins, {
-                isPartial: true,
-                formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
-              });
-              orderService.clearOrderPins(err.partialOrder.order.id);
-            }
-
-            // Send final message using MessageFormatter
-            const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
-            const remainingMessage = messageFormatter.formatRemainingCards(remaining);
-            if (remainingMessage) {
-              await bot.sendMessage(chatId, remainingMessage, { parse_mode: 'Markdown' });
-            }
-          } else {
-            // No purchases completed
-
-            // Delete the "CANCELLING ORDER" message before sending results
-            const cancellingMsgId = this.cancellingMessages.get(chatId);
-            if (cancellingMsgId) {
-              try {
-                await bot.deleteMessage(chatId, cancellingMsgId);
-                this.cancellingMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete cancelling message');
-              }
-            }
-
-            // Delete the progress message before sending results
-            const progressMsgId = this.progressMessages.get(chatId);
-            if (progressMsgId) {
-              try {
-                await bot.deleteMessage(chatId, progressMsgId);
-                this.progressMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete progress message');
-              }
-            }
-
-            // Delete the order summary message before sending results
-            const summaryMsgId = this.orderSummaryMessages.get(chatId);
-            if (summaryMsgId) {
-              try {
-                await bot.deleteMessage(chatId, summaryMsgId);
-                this.orderSummaryMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete order summary message');
-              }
-            }
-
-            // Use MessageFormatter for consistent formatting (SOLID principle)
-            const cancelledMessage = messageFormatter.formatOrderCancelledNoCards();
-            await bot.sendMessage(chatId, cancelledMessage, { parse_mode: 'Markdown' });
-          }
-        } catch (sendErr) {
-          logger.error('Error sending cancellation message:', sendErr);
-        }
-
-        // Clear session, cancellation flag, progress message, cancelling message, and order summary
-        this.clearSession(chatId);
-        this.clearCancellation(chatId);
-        this.progressMessages.delete(chatId);
-        this.cancellingMessages.delete(chatId);
-        this.orderSummaryMessages.delete(chatId);
-        return;
-      }
-
-      // Not a cancellation - handle as regular error
-      logger.error('Order processing error:', err);
-
-      // UX FIX #17: Use friendly error messages
-      const friendlyError = this.getUserFriendlyError(err);
-
-      // Delete the order summary message before sending error
-      const summaryMsgId = this.orderSummaryMessages.get(chatId);
-      if (summaryMsgId) {
-        try {
-          await bot.deleteMessage(chatId, summaryMsgId);
-          this.orderSummaryMessages.delete(chatId);
-        } catch (delErr) {
-          logger.debug('Could not delete order summary message');
-        }
-      }
-
-      // Delete the progress message before sending error
-      const progressMsgId = this.progressMessages.get(chatId);
-      if (progressMsgId) {
-        try {
-          await bot.deleteMessage(chatId, progressMsgId);
-          this.progressMessages.delete(chatId);
-        } catch (delErr) {
-          logger.debug('Could not delete progress message');
-        }
-      }
-
-      // Delete the cancelling message if exists
-      const cancellingMsgId = this.cancellingMessages.get(chatId);
-      if (cancellingMsgId) {
-        try {
-          await bot.deleteMessage(chatId, cancellingMsgId);
-          this.cancellingMessages.delete(chatId);
-        } catch (delErr) {
-          logger.debug('Could not delete cancelling message');
-        }
-      }
-
-      try {
-        await bot.sendMessage(chatId, friendlyError, { parse_mode: 'Markdown' });
-      } catch (sendErr) {
-        logger.error('Error sending error message:', sendErr);
-      }
-
-      // CRITICAL FIX #4: Session recovery for recoverable errors
-      // Don't clear session for certain errors - allow user to retry
+      // Unified method handles all error scenarios
+      // Only need to handle special case: InvalidBackupCodeError for retry
       if (err.name === 'InvalidBackupCodeError') {
         // Keep session data, go back to backup code step
         this.updateSession(chatId, {
@@ -1187,21 +1305,11 @@ class OrderFlowHandler {
         } catch (sendErr) {
           logger.error('Error sending retry prompt:', sendErr);
         }
-
-        // Clear cancellation flag and message maps but keep session
-        this.clearCancellation(chatId);
-        this.progressMessages.delete(chatId);
-        this.orderSummaryMessages.delete(chatId);
-        this.cancellingMessages.delete(chatId);
         return;
       }
 
-      // For other errors, clear session, cancellation, and all message maps
+      // For all other errors (including cancellation), clear session
       this.clearSession(chatId);
-      this.clearCancellation(chatId);
-      this.progressMessages.delete(chatId);
-      this.orderSummaryMessages.delete(chatId);
-      this.cancellingMessages.delete(chatId);
     }
   }
 
@@ -1285,256 +1393,38 @@ class OrderFlowHandler {
       }
     }
 
-    // Start the order processing (this is the existing backup code input handler logic)
-    // We'll call the existing logic from handleBackupCodeInput
-    // But instead of waiting for backup codes from user, we get from database
-
-    const orderService = require('../services/OrderService');
-    const db = require('../services/DatabaseService');
-
+    // Process order using unified method (REFACTORED: eliminates duplicate code)
     try {
-      // Update session to processing
       this.updateSession(chatId, { step: 'processing' });
 
-      // Show processing message with cancel button
-      const processingMsg = await bot.sendMessage(chatId,
-        `⏳ *PROCESSING ORDER...*\n\n` +
-        `🎮 ${session.gameName}\n` +
-        `💳 ${session.cardName}\n` +
-        `🔢 Quantity: ${session.quantity}\n\n` +
-        `⏱️ This may take several minutes.\n` +
-        `Please wait...`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[
-              { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
-            ]]
-          }
-        }
-      );
-
-      this.orderSummaryMessages.set(chatId, processingMsg.message_id);
-
-      // Process order with progress updates and cancellation check
-      const result = await orderService.processOrder({
-        telegramUserId: telegramUserId,
+      await this._executeOrder({
+        bot,
+        chatId,
+        telegramUserId,
         gameName: session.gameName,
         gameUrl: session.gameUrl,
         cardName: session.cardName,
         cardIndex: session.cardIndex,
         quantity: session.quantity,
-        onProgress: async (completed, total) => {
-          try {
-            const progressBar = this.createProgressBar(completed, total);
-            const percentage = Math.round((completed / total) * 100);
-
-            const progressText = `⏳ *Progress*\n${progressBar}\n\n✅ ${completed}/${total} (📊 ${percentage}%)`;
-
-            // Check if we have a previous progress message to edit
-            const existingMessageId = this.progressMessages.get(chatId);
-
-            if (existingMessageId) {
-              // Edit existing message
-              try {
-                await bot.editMessageText(progressText, {
-                  chat_id: chatId,
-                  message_id: existingMessageId,
-                  parse_mode: 'Markdown',
-                  reply_markup: {
-                    inline_keyboard: [[
-                      { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
-                    ]]
-                  }
-                });
-              } catch (editErr) {
-                // If edit fails (message too old or deleted), send new message
-                logger.debug('Could not edit progress message, sending new one');
-                const newMsg = await bot.sendMessage(chatId, progressText, {
-                  parse_mode: 'Markdown',
-                  reply_markup: {
-                    inline_keyboard: [[
-                      { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
-                    ]]
-                  }
-                });
-                this.progressMessages.set(chatId, newMsg.message_id);
-              }
-            } else {
-              // Send new message and store its ID
-              const msg = await bot.sendMessage(chatId, progressText, {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
-                  ]]
-                }
-              });
-              this.progressMessages.set(chatId, msg.message_id);
-            }
-          } catch (err) {
-            logger.debug('Could not send progress update:', err.message);
-          }
-        },
-        checkCancellation: () => {
-          return this.isCancelled(chatId);
-        }
+        isScheduled: false
       });
 
-      // Order completed successfully - send results to user
-      const successfulCards = result.order.completed_purchases;
-      const failedCards = result.pins.filter(p => p.pinCode === 'FAILED').length;
-
-      // Delete the progress message and order summary before sending results
-      const progressMsgId = this.progressMessages.get(chatId);
-      if (progressMsgId) {
-        try {
-          await bot.deleteMessage(chatId, progressMsgId);
-          this.progressMessages.delete(chatId);
-        } catch (delErr) {
-          logger.debug('Could not delete progress message');
-        }
-      }
-
-      const summaryMsgId = this.orderSummaryMessages.get(chatId);
-      if (summaryMsgId) {
-        try {
-          await bot.deleteMessage(chatId, summaryMsgId);
-          this.orderSummaryMessages.delete(chatId);
-        } catch (delErr) {
-          logger.debug('Could not delete order summary message');
-        }
-      }
-
-      try {
-        // Use MessageFormatter for consistent formatting (SOLID principle)
-        const validPinCount = fileGenerator.getValidPinCount(result.pins);
-        const statusMessage = messageFormatter.formatScheduledOrderComplete(result, validPinCount);
-        await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
-
-        // Use FileGenerator for consistent file sending (SOLID principle)
-        if (result.pins && result.pins.length > 0) {
-          await fileGenerator.sendPinFiles(bot, chatId, result.order.id, result.pins, {
-            formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
-          });
-          orderService.clearOrderPins(result.order.id);
-        }
-
-      } catch (err) {
-        logger.error('Error sending scheduled order results:', err);
-      }
-
-      this.clearSession(chatId);
-      this.clearCancellation(chatId);
-      this.progressMessages.delete(chatId);
-      this.orderSummaryMessages.delete(chatId);
-
-    } catch (err) {
-      // Check if it was a user cancellation BEFORE logging as error
-      if (err.message && err.message.includes('cancelled by user')) {
-        // Log as info instead of error since it's expected user action
-        logger.info('Order cancelled by user at stage:', err.stage || 'unknown');
-        try {
-          // Check if there were any completed purchases
-          if (err.partialOrder && err.partialOrder.pins && err.partialOrder.pins.length > 0) {
-            const failedCards = err.partialOrder.pins.filter(p => p.pinCode === 'FAILED').length;
-
-            // Delete the progress message before sending results
-            const progressMsgId = this.progressMessages.get(chatId);
-            if (progressMsgId) {
-              try {
-                await bot.deleteMessage(chatId, progressMsgId);
-                this.progressMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete progress message');
-              }
-            }
-
-            // Delete the order summary message before sending results
-            const summaryMsgId = this.orderSummaryMessages.get(chatId);
-            if (summaryMsgId) {
-              try {
-                await bot.deleteMessage(chatId, summaryMsgId);
-                this.orderSummaryMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete order summary message');
-              }
-            }
-
-            // Calculate successful cards (exclude FAILED)
-            const successfulCards = err.partialOrder.pins.filter(p => p.pinCode !== 'FAILED').length;
-
-            // Use MessageFormatter for consistent formatting (SOLID principle)
-            const cancelMessage = messageFormatter.formatOrderCancelled(err.partialOrder.order, successfulCards, failedCards);
-            await bot.sendMessage(chatId, cancelMessage, { parse_mode: 'Markdown' });
-
-            // Use FileGenerator for consistent file sending (SOLID principle)
-            if (err.partialOrder.pins && err.partialOrder.pins.length > 0) {
-              await fileGenerator.sendPinFiles(bot, chatId, err.partialOrder.order.id, err.partialOrder.pins, {
-                isPartial: true,
-                formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
-              });
-              orderService.clearOrderPins(err.partialOrder.order.id);
-            }
-
-            // Send final message using MessageFormatter
-            const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
-            const remainingMessage = messageFormatter.formatRemainingCards(remaining);
-            if (remainingMessage) {
-              await bot.sendMessage(chatId, remainingMessage, { parse_mode: 'Markdown' });
-            }
-          } else {
-            // No purchases completed
-            const progressMsgId = this.progressMessages.get(chatId);
-            if (progressMsgId) {
-              try {
-                await bot.deleteMessage(chatId, progressMsgId);
-                this.progressMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete progress message');
-              }
-            }
-
-            const summaryMsgId = this.orderSummaryMessages.get(chatId);
-            if (summaryMsgId) {
-              try {
-                await bot.deleteMessage(chatId, summaryMsgId);
-                this.orderSummaryMessages.delete(chatId);
-              } catch (delErr) {
-                logger.debug('Could not delete order summary message');
-              }
-            }
-
-            // Use MessageFormatter for consistent formatting (SOLID principle)
-            const cancelledMessage = messageFormatter.formatOrderCancelledNoCards();
-            await bot.sendMessage(chatId, cancelledMessage, { parse_mode: 'Markdown' });
-          }
-        } catch (sendErr) {
-          logger.error('Error sending cancellation message:', sendErr);
-        }
-
-        this.clearSession(chatId);
-        this.clearCancellation(chatId);
-        this.progressMessages.delete(chatId);
-        this.orderSummaryMessages.delete(chatId);
-
-        // Close browser after cancelled purchase
-        const browserManager = require('../services/BrowserManager');
-        await browserManager.closeBrowser(telegramUserId);
-        logger.info(`Browser closed after cancelled purchase for user ${telegramUserId}`);
-        return;
-      }
-
-      // Not a cancellation - log error and send friendly message
-      logger.error('Buy Now error:', err);
-      const friendlyError = this.getUserFriendlyError(err);
-      await bot.sendMessage(chatId, friendlyError, { parse_mode: 'Markdown' });
+      // Clear session on success
       this.clearSession(chatId);
 
-      // Close browser on error
+      // Close browser after successful purchase
       const browserManager = require('../services/BrowserManager');
       await browserManager.closeBrowser(telegramUserId);
-      logger.info(`Browser closed after purchase error for user ${telegramUserId}`);
+      logger.info(`Browser closed after successful purchase for user ${telegramUserId}`);
+
+    } catch (err) {
+      // Unified method handles most error scenarios
+      this.clearSession(chatId);
+
+      // Close browser on ANY error (cancellation or failure)
+      const browserManager = require('../services/BrowserManager');
+      await browserManager.closeBrowser(telegramUserId);
+      logger.info(`Browser closed after order error/cancellation for user ${telegramUserId}`);
     }
   }
 
@@ -1553,12 +1443,12 @@ class OrderFlowHandler {
     const nowUTC = new Date();
     const EGYPT_OFFSET_HOURS = 2;
     const nowEgypt = new Date(nowUTC.getTime() + (EGYPT_OFFSET_HOURS * 60 * 60 * 1000));
-    const currentEgyptTime = `${String(nowEgypt.getUTCDate()).padStart(2, '0')}/${String(nowEgypt.getUTCMonth() + 1).padStart(2, '0')} ${String(nowEgypt.getUTCHours()).padStart(2, '0')}`;
+    const currentEgyptTime = `${String(nowEgypt.getUTCDate()).padStart(2, '0')}/${String(nowEgypt.getUTCMonth() + 1).padStart(2, '0')} ${String(nowEgypt.getUTCHours()).padStart(2, '0')}:${String(nowEgypt.getUTCMinutes()).padStart(2, '0')}`;
 
     await bot.sendMessage(chatId,
       `⏰ *SCHEDULE ORDER*\n\n` +
-      `Format: DD/MM HH\n` +
-      `Example: 20/02 14\n\n` +
+      `Format: DD/MM HH:MM\n` +
+      `Example: 20/02 14:30\n\n` +
       `📍 Current Egypt time: \`${currentEgyptTime}\`\n\n` +
       `_Use /start to cancel_`,
       { parse_mode: 'Markdown' }
@@ -1579,14 +1469,14 @@ class OrderFlowHandler {
     const db = require('../services/DatabaseService');
 
     try {
-      // Parse datetime - Format: DD/MM HH (auto-add current year and 00 minutes)
-      const dateTimeRegex = /^(\d{1,2})\/(\d{1,2})\s+(\d{1,2})$/;
+      // Parse datetime - Format: DD/MM HH:MM (auto-add current year)
+      const dateTimeRegex = /^(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{1,2})$/;
       const match = text.trim().match(dateTimeRegex);
 
       if (!match) {
         await bot.sendMessage(chatId,
           `❌ *INVALID FORMAT*\n\n` +
-          `Use: DD/MM HH (Example: 20/02 14)\n\n` +
+          `Use: DD/MM HH:MM (Example: 20/02 14:30)\n\n` +
           `_Try again or /start to cancel_`,
           { parse_mode: 'Markdown' }
         );
@@ -1602,10 +1492,21 @@ class OrderFlowHandler {
       const day = parseInt(match[1]);
       const month = parseInt(match[2]) - 1; // JS months are 0-indexed
       const hour = parseInt(match[3]);
-      const minute = 0; // Always 00 minutes
+      const minute = parseInt(match[4]);
+
+      // Validate hour and minute ranges
+      if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        await bot.sendMessage(chatId,
+          `❌ *INVALID TIME*\n\n` +
+          `Hour must be 0-23, minute must be 0-59\n\n` +
+          `_Try again or /start to cancel_`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
 
       // Interpret user's input as Egypt time and convert to UTC
-      // Example: User enters "20/02 14" Egypt → Store as "12:00 UTC"
+      // Example: User enters "20/02 14:30" Egypt → Store as "12:30 UTC"
       const egyptTimeAsUTC = Date.UTC(year, month, day, hour, minute, 0);
       const scheduledTimeUTC = egyptTimeAsUTC - (EGYPT_OFFSET_HOURS * 60 * 60 * 1000);
       const scheduledTime = new Date(scheduledTimeUTC);
@@ -1616,7 +1517,7 @@ class OrderFlowHandler {
       if (scheduledTime <= nowUTC) {
         // Show current Egypt time for reference
         const nowEgyptTime = new Date(nowUTC.getTime() + (EGYPT_OFFSET_HOURS * 60 * 60 * 1000));
-        const displayTime = `${String(nowEgyptTime.getUTCDate()).padStart(2, '0')}/${String(nowEgyptTime.getUTCMonth() + 1).padStart(2, '0')} ${String(nowEgyptTime.getUTCHours()).padStart(2, '0')}`;
+        const displayTime = `${String(nowEgyptTime.getUTCDate()).padStart(2, '0')}/${String(nowEgyptTime.getUTCMonth() + 1).padStart(2, '0')} ${String(nowEgyptTime.getUTCHours()).padStart(2, '0')}:${String(nowEgyptTime.getUTCMinutes()).padStart(2, '0')}`;
 
         await bot.sendMessage(chatId,
           `❌ *INVALID TIME*\n\n` +

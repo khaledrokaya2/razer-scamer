@@ -5,7 +5,7 @@
 const cron = require('node-cron');
 const logger = require('../utils/logger');
 const db = require('./DatabaseService');
-const orderService = require('./OrderService');
+const orderFlowHandler = require('../controllers/OrderFlowHandler');
 
 // SOLID Principle: Single Responsibility - Use shared utilities
 const fileGenerator = require('../utils/FileGenerator');
@@ -17,12 +17,9 @@ class ScheduledOrderService {
     this.bot = bot;
     this.cronJob = null;
     this.isMonitoring = false; // Track if monitoring is active
-    this.orderService = orderService; // Use singleton instance
     this.processingOrders = new Set(); // Track currently processing orders to avoid duplicates
 
-    // Track progress and cancellation for scheduled orders
-    this.progressMessages = new Map(); // chatId -> messageId
-    this.cancellationRequests = new Map(); // chatId -> boolean
+    // Track processing message IDs for cleanup (SIMPLIFIED: unified method handles progress)
     this.processingMessageIds = new Map(); // chatId -> messageId (for "SCHEDULED ORDER STARTING" message)
   }
 
@@ -84,47 +81,12 @@ class ScheduledOrderService {
   }
 
   /**
-   * Create visual progress bar
-   * @param {number} completed - Completed items
-   * @param {number} total - Total items
-   * @returns {string} Progress bar string
-   */
-  createProgressBar(completed, total) {
-    const percentage = completed / total;
-    const barLength = 15;
-    const filledLength = Math.round(barLength * percentage);
-    const emptyLength = barLength - filledLength;
-
-    const filledBar = '█'.repeat(filledLength);
-    const emptyBar = '░'.repeat(emptyLength);
-
-    return `[${filledBar}${emptyBar}]`;
-  }
-
-  /**
-   * Check if scheduled order is cancelled
-   * @param {number} chatId - Chat ID
-   * @returns {boolean} True if cancelled
-   */
-  isCancelled(chatId) {
-    return this.cancellationRequests.get(chatId) === true;
-  }
-
-  /**
-   * Cancel a scheduled order
+   * Cancel a scheduled order (delegates to OrderFlowHandler for unified tracking)
    * @param {number} chatId - Chat ID
    */
   cancelScheduledOrder(chatId) {
-    this.cancellationRequests.set(chatId, true);
+    orderFlowHandler.markAsCancelled(chatId);
     logger.info(`Scheduled order cancelled for chat ${chatId}`);
-  }
-
-  /**
-   * Clear cancellation flag
-   * @param {number} chatId - Chat ID
-   */
-  clearCancellation(chatId) {
-    this.cancellationRequests.delete(chatId);
   }
 
   /**
@@ -246,217 +208,65 @@ class ScheduledOrderService {
         }
       }
 
-      // Send notification to user that order is starting (with cancel button)
-      try {
-        const startMsg = await this.bot.sendMessage(chat_id,
-          `⏰ *Scheduled Order*\n🎮 ${game_name}\n💎 ${card_name}\n📦 Qty: ${quantity}\n\n⏳ Processing...`,
-          {
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [[
-                { text: '🛑 Cancel', callback_data: 'scheduled_cancel_' + chat_id }
-              ]]
-            }
-          }
-        );
-        this.processingMessageIds.set(chat_id, startMsg.message_id);
-      } catch (notifyErr) {
-        logger.error(`ScheduledOrderService: Could not send start notification to user ${telegram_user_id}:`, notifyErr);
-      }
-
-      // Process the order with progress updates and cancellation support
-      const result = await this.orderService.processOrder({
-        telegramUserId: telegram_user_id,
-        gameName: game_name,
-        gameUrl: game_url,
-        cardName: card_name,
-        cardIndex: card_index,
-        quantity: quantity,
-        onProgress: async (completed, total) => {
-          try {
-            const progressBar = this.createProgressBar(completed, total);
-            const percentage = Math.round((completed / total) * 100);
-
-            const progressText = `⏳ *Progress*\n${progressBar}\n✅ ${completed}/${total} (📊 ${percentage}%)`;
-
-            // Check if we have a previous progress message to edit
-            const existingMessageId = this.progressMessages.get(chat_id);
-
-            if (existingMessageId) {
-              // Edit existing message
-              try {
-                await this.bot.editMessageText(progressText, {
-                  chat_id: chat_id,
-                  message_id: existingMessageId,
-                  parse_mode: 'Markdown',
-                  reply_markup: {
-                    inline_keyboard: [[
-                      { text: '🛑 Cancel Order', callback_data: 'scheduled_cancel_' + chat_id }
-                    ]]
-                  }
-                });
-              } catch (editErr) {
-                // If edit fails, send new message
-                logger.debug('Could not edit progress message, sending new one');
-                const newMsg = await this.bot.sendMessage(chat_id, progressText, {
-                  parse_mode: 'Markdown',
-                  reply_markup: {
-                    inline_keyboard: [[
-                      { text: '🛑 Cancel Order', callback_data: 'scheduled_cancel_' + chat_id }
-                    ]]
-                  }
-                });
-                this.progressMessages.set(chat_id, newMsg.message_id);
-              }
-            } else {
-              // Send new message and store its ID
-              const msg = await this.bot.sendMessage(chat_id, progressText, {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: '🛑 Cancel Order', callback_data: 'scheduled_cancel_' + chat_id }
-                  ]]
-                }
-              });
-              this.progressMessages.set(chat_id, msg.message_id);
-            }
-          } catch (progressErr) {
-            logger.debug('Could not send progress update:', progressErr.message);
-          }
-        },
-        checkCancellation: () => this.isCancelled(chat_id)
-      });
-
-      // Update status to 'completed' with order_id
-      await db.updateScheduledOrderStatus(id, 'completed', result.order.id);
-
-      // Delete progress and processing messages before sending results
-      const progressMsgId = this.progressMessages.get(chat_id);
-      if (progressMsgId) {
-        try {
-          await this.bot.deleteMessage(chat_id, progressMsgId);
-        } catch (delErr) {
-          logger.debug('Could not delete progress message');
-        }
-      }
-
+      // Delete initial notification if it exists
       const processingMsgId = this.processingMessageIds.get(chat_id);
       if (processingMsgId) {
         try {
           await this.bot.deleteMessage(chat_id, processingMsgId);
+          this.processingMessageIds.delete(chat_id);
         } catch (delErr) {
           logger.debug('Could not delete processing message');
         }
       }
 
-      // Send success notification
-      const successfulCards = result.order.completed_purchases;
-      const failedCards = result.pins.filter(p => p.pinCode === 'FAILED').length;
-
+      // Execute order using unified method (REFACTORED: eliminates duplicate code)
       try {
-        // Use MessageFormatter for consistent formatting (SOLID principle)
-        const validPinCount = fileGenerator.getValidPinCount(result.pins);
-        const statusMessage = messageFormatter.formatScheduledOrderComplete(result, validPinCount);
-        await this.bot.sendMessage(chat_id, statusMessage, { parse_mode: 'Markdown' });
-
-        // Use FileGenerator for consistent file sending (SOLID principle)
-        await fileGenerator.sendPinFiles(this.bot, chat_id, result.order.id, result.pins, {
-          formatPinsPlain: this.orderService.formatPinsPlain.bind(this.orderService)
+        const result = await orderFlowHandler._executeOrder({
+          bot: this.bot,
+          chatId: chat_id,
+          telegramUserId: telegram_user_id,
+          gameName: game_name,
+          gameUrl: game_url,
+          cardName: card_name,
+          cardIndex: card_index,
+          quantity: quantity,
+          isScheduled: true,
+          scheduledOrderId: id
         });
 
-        this.orderService.clearOrderPins(result.order.id);
-
-      } catch (sendErr) {
-        logger.error(`ScheduledOrderService: Error sending results to user ${telegram_user_id}:`, sendErr);
-      }
-
-      logger.info(`ScheduledOrderService: Successfully completed scheduled order ${id}`);
-
-      // Clean up tracking
-      this.progressMessages.delete(chat_id);
-      this.processingMessageIds.delete(chat_id);
-      this.clearCancellation(chat_id);
-
-    } catch (err) {
-      // Check if it was a user cancellation
-      if (err.message && err.message.includes('cancelled by user')) {
-        logger.info(`Scheduled order ${id} cancelled by user at stage:`, err.stage || 'unknown');
-        try {
-          // Check if there were any completed purchases
-          if (err.partialOrder && err.partialOrder.pins && err.partialOrder.pins.length > 0) {
-            const failedCards = err.partialOrder.pins.filter(p => p.pinCode === 'FAILED').length;
-
-            // Delete progress messages
-            const progressMsgId = this.progressMessages.get(chat_id);
-            if (progressMsgId) {
-              try {
-                await this.bot.deleteMessage(chat_id, progressMsgId);
-              } catch (delErr) {
-                logger.debug('Could not delete progress message');
-              }
-            }
-
-            const processingMsgId = this.processingMessageIds.get(chat_id);
-            if (processingMsgId) {
-              try {
-                await this.bot.deleteMessage(chat_id, processingMsgId);
-              } catch (delErr) {
-                logger.debug('Could not delete processing message');
-              }
-            }
-
-            await this.bot.sendMessage(chat_id,
-              `🛑 *Cancelled* #${err.partialOrder.order.id}\n✅ ${err.partialOrder.pins.length - failedCards} done` +
-              (failedCards > 0 ? `\n❌ ${failedCards} failed` : '') +
-              `\n⏹️ Rest not processed`,
-              { parse_mode: 'Markdown' }
-            );
-
-            // Send TXT files with partial results
-            await this.sendPinFiles(chat_id, err.partialOrder.order.id, err.partialOrder.pins);
-            this.orderService.clearOrderPins(err.partialOrder.order.id);
-
-            const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
-            if (remaining > 0) {
-              await this.bot.sendMessage(chat_id, `ℹ️ ${remaining} not processed. Use /start for new order.`);
-            }
-          } else {
-            // No purchases completed
-            const progressMsgId = this.progressMessages.get(chat_id);
-            if (progressMsgId) {
-              try {
-                await this.bot.deleteMessage(chat_id, progressMsgId);
-              } catch (delErr) {
-                logger.debug('Could not delete progress message');
-              }
-            }
-
-            const processingMsgId = this.processingMessageIds.get(chat_id);
-            if (processingMsgId) {
-              try {
-                await this.bot.deleteMessage(chat_id, processingMsgId);
-              } catch (delErr) {
-                logger.debug('Could not delete processing message');
-              }
-            }
-
-            await this.bot.sendMessage(chat_id, '🛑 *Cancelled*\nNo cards processed.');
-          }
-        } catch (sendErr) {
-          logger.error('Error sending cancellation message:', sendErr);
-        }
-
-        // Update scheduled order status
-        await db.updateScheduledOrderStatus(id, 'cancelled', null, 'Cancelled by user');
+        // Update status to 'completed' with order_id
+        await db.updateScheduledOrderStatus(id, 'completed', result.order.id);
+        logger.info(`ScheduledOrderService: Successfully completed scheduled order ${id}`);
 
         // Clean up tracking
-        this.progressMessages.delete(chat_id);
+        orderFlowHandler.clearCancellation(chat_id);
         this.processingMessageIds.delete(chat_id);
-        this.clearCancellation(chat_id);
-        return;
+
+        // Close browser after successful scheduled order (FIX: was missing, causing browser to stay open)
+        await browserManager.closeBrowser(telegram_user_id);
+        logger.info(`Browser closed after successful scheduled order for user ${telegram_user_id}`);
+
+      } catch (err) {
+        // Unified method handles UI/messages - just update database status
+        if (err.message && err.message.includes('cancelled by user')) {
+          await db.updateScheduledOrderStatus(id, 'cancelled', err.partialOrder?.order?.id || null, 'Cancelled by user');
+          logger.info(`ScheduledOrderService: Scheduled order ${id} cancelled by user`);
+        } else {
+          await db.updateScheduledOrderStatus(id, 'failed');
+          logger.error(`ScheduledOrderService: Scheduled order ${id} failed:`, err.message);
+        }
+
+        // Clean up tracking
+        orderFlowHandler.clearCancellation(chat_id);
+        this.processingMessageIds.delete(chat_id);
+
+        // Close browser on error or cancellation (FIX: was missing)
+        await browserManager.closeBrowser(telegram_user_id);
+        logger.info(`Browser closed after scheduled order error/cancellation for user ${telegram_user_id}`);
       }
 
-      // Not a cancellation - actual error
+    } catch (err) {
+      // This outer catch handles auto-login and pre-processing errors
       logger.error(`ScheduledOrderService: Error executing scheduled order ${id}:`, err);
 
       // Update status to 'failed'
@@ -475,9 +285,13 @@ class ScheduledOrderService {
       }
 
       // Clean up tracking
-      this.progressMessages.delete(chat_id);
+      orderFlowHandler.clearCancellation(chat_id);
       this.processingMessageIds.delete(chat_id);
-      this.clearCancellation(chat_id);
+
+      // Close browser on pre-processing errors (FIX: was missing)
+      const browserManager = require('./BrowserManager');
+      await browserManager.closeBrowser(telegram_user_id);
+      logger.info(`Browser closed after scheduled order pre-processing error for user ${telegram_user_id}`);
     }
   }
 }
