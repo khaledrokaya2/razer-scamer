@@ -64,7 +64,7 @@ class PurchaseService {
    */
   async getAvailableCards(telegramUserId, gameUrl, useGlobalBrowser = false) {
     let page;
-    
+
     if (useGlobalBrowser) {
       // Use global browser for anonymous catalog browsing
       page = await browserManager.navigateToUrlGlobal(gameUrl);
@@ -408,7 +408,7 @@ class PurchaseService {
       // STAGE 1: Navigate to game page (skip if already there - HUGE speed boost!)
       currentStage = this.STAGES.NAVIGATING;
       logger.debug(`Stage: ${currentStage}`);
-      
+
       let currentUrl = page.url();
       if (!currentUrl.includes(gameUrl)) {
         logger.debug('Not on game page, navigating...');
@@ -554,7 +554,7 @@ class PurchaseService {
         paymentSelected = await page.evaluate(() => {
           const container = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
           if (!container) return false;
-          
+
           const radioInput = container.querySelector('input[type="radio"][name="paymentChannelItem"]');
           if (radioInput) {
             radioInput.click();
@@ -581,7 +581,7 @@ class PurchaseService {
           paymentSelected = await page.evaluate(() => {
             const container = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
             if (!container) return false;
-            
+
             const label = container.querySelector('label');
             if (label) {
               label.click();
@@ -614,7 +614,7 @@ class PurchaseService {
                 const radioInput = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet'] input[type='radio']");
                 return radioInput ? radioInput.checked : false;
               });
-              
+
               if (paymentSelected) {
                 logger.success('✓ Razer Gold label clicked via Puppeteer');
               }
@@ -639,7 +639,7 @@ class PurchaseService {
                 const radioInput = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet'] input[type='radio']");
                 return radioInput ? radioInput.checked : false;
               });
-              
+
               if (paymentSelected) {
                 logger.success('✓ Razer Gold radio input clicked via Puppeteer');
               }

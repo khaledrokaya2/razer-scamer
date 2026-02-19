@@ -35,7 +35,7 @@ class BrowserManager {
   async initializeGlobalBrowser() {
     try {
       logger.system('Initializing global browser for catalog browsing...');
-      
+
       const browser = await this.launchBrowser();
       const page = await browser.newPage();
 
@@ -114,7 +114,7 @@ class BrowserManager {
 
     // Enable request interception to block heavy resources for slow networks
     await page.setRequestInterception(true);
-    
+
     // Block images, fonts, media, and other unnecessary resources to reduce data transfer
     // Keeping stylesheets for cookie consent visibility
     page.on('request', (request) => {
@@ -127,7 +127,7 @@ class BrowserManager {
         'texttrack',    // Video subtitles (not used)
         'eventsource'   // Server-sent events (rarely used)
       ];
-      
+
       if (blockedTypes.includes(resourceType)) {
         request.abort();
       } else {

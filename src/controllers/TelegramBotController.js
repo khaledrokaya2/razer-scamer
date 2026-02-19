@@ -406,11 +406,11 @@ class TelegramBotController {
       }
 
       const db = require('../services/DatabaseService');
-      
+
       // Get email
       const credentials = await db.getUserCredentials(telegramUserId);
       const email = credentials?.email || 'Not set';
-      
+
       // Get backup code count
       const backupCodeCount = await db.getActiveBackupCodeCount(telegramUserId);
 
@@ -444,38 +444,38 @@ class TelegramBotController {
 
       // Check if there's an active purchase session BEFORE clearing
       const hasActiveSession = orderFlowHandler.getSession(chatId);
-      
+
       // Cancel any ongoing purchases FIRST (before clearing session)
       if (hasActiveSession) {
         // Mark as cancelled to stop purchase flow
         orderFlowHandler.markAsCancelled(chatId);
-        
+
         // Close browser
         const browserManager = require('../services/BrowserManager');
         await browserManager.closeBrowser(telegramUserId);
-        
+
         logger.info(`Cancelled purchase and closed browser for user ${telegramUserId}`);
       }
 
       // Cancel any ongoing balance checks
       if (this.balanceCheckInProgress.has(telegramUserId)) {
         this.balanceCheckInProgress.delete(telegramUserId);
-        
+
         // Close browser if it was opened for balance check (only if no purchase session)
         if (!hasActiveSession) {
           const browserManager = require('../services/BrowserManager');
           await browserManager.closeBrowser(telegramUserId);
         }
-        
+
         logger.info(`Cancelled balance check for user ${telegramUserId}`);
       }
 
       // Clear order flow session
       orderFlowHandler.clearSession(chatId);
-      
+
       // Clear order history pagination
       orderHistoryHandler.reset(chatId);
-      
+
       // Clear session manager state
       sessionManager.updateState(chatId, 'idle');
       sessionManager.clearCredentials(chatId);
@@ -661,12 +661,12 @@ class TelegramBotController {
           } else if (callbackData === 'order_confirm_continue') {
             // User confirmed to continue despite low backup codes
             const session = orderFlowHandler.getSession(chatId);
-            
+
             if (!session) {
               await this.bot.sendMessage(chatId, '⚠️ Session expired. Use /start to begin again.');
               return;
             }
-            
+
             // Check if schedule mode or instant purchase
             if (session.isScheduleMode) {
               // Schedule mode: show confirmation with schedule option
@@ -676,11 +676,11 @@ class TelegramBotController {
               // Auto-login if no browser session exists
               const browserManager = require('../services/BrowserManager');
               const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
-              
+
               if (!hasActiveBrowser) {
                 const db = require('../services/DatabaseService');
                 const credentials = await db.getUserCredentials(telegramUserId);
-                
+
                 if (!credentials || !credentials.email || !credentials.password) {
                   await this.bot.sendMessage(
                     chatId,
@@ -692,14 +692,14 @@ class TelegramBotController {
                   orderFlowHandler.clearSession(chatId);
                   return;
                 }
-                
+
                 // Show login progress
                 const loginMsg = await this.bot.sendMessage(chatId, '⏳ *Logging in...*\\n\\nPreparing browser session...', { parse_mode: 'Markdown' });
-                
+
                 try {
                   logger.info(`Auto-login for purchase: User ${telegramUserId}`);
                   await scraperService.login(telegramUserId, credentials.email, credentials.password);
-                  
+
                   try {
                     await this.bot.deleteMessage(chatId, loginMsg.message_id);
                   } catch (delErr) {
@@ -707,13 +707,13 @@ class TelegramBotController {
                   }
                 } catch (loginErr) {
                   logger.error('Auto-login failed for purchase:', loginErr);
-                  
+
                   try {
                     await this.bot.deleteMessage(chatId, loginMsg.message_id);
                   } catch (delErr) {
                     logger.debug('Could not delete login message');
                   }
-                  
+
                   await this.bot.sendMessage(
                     chatId,
                     '❌ *Login Failed*\\n\\n' +
@@ -725,7 +725,7 @@ class TelegramBotController {
                   return;
                 }
               }
-              
+
               await orderFlowHandler.handleBuyNow(this.bot, chatId, telegramUserId);
             }
 
@@ -733,12 +733,12 @@ class TelegramBotController {
             // Auto-login if no browser session exists
             const browserManager = require('../services/BrowserManager');
             const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
-            
+
             if (!hasActiveBrowser) {
               // Get user credentials
               const db = require('../services/DatabaseService');
               const credentials = await db.getUserCredentials(telegramUserId);
-              
+
               if (!credentials || !credentials.email || !credentials.password) {
                 await this.bot.sendMessage(
                   chatId,
@@ -750,15 +750,15 @@ class TelegramBotController {
                 orderFlowHandler.clearSession(chatId);
                 return;
               }
-              
+
               // Show login progress
               const loginMsg = await this.bot.sendMessage(chatId, '⏳ *Logging in...*\n\nPreparing browser session...', { parse_mode: 'Markdown' });
-              
+
               try {
                 // Auto-login
                 logger.info(`Auto-login for purchase: User ${telegramUserId}`);
                 await scraperService.login(telegramUserId, credentials.email, credentials.password);
-                
+
                 // Delete login message
                 try {
                   await this.bot.deleteMessage(chatId, loginMsg.message_id);
@@ -767,14 +767,14 @@ class TelegramBotController {
                 }
               } catch (loginErr) {
                 logger.error('Auto-login failed for purchase:', loginErr);
-                
+
                 // Delete login message
                 try {
                   await this.bot.deleteMessage(chatId, loginMsg.message_id);
                 } catch (delErr) {
                   logger.debug('Could not delete login message');
                 }
-                
+
                 await this.bot.sendMessage(
                   chatId,
                   '❌ *Login Failed*\n\n' +
@@ -786,7 +786,7 @@ class TelegramBotController {
                 return;
               }
             }
-            
+
             await orderFlowHandler.handleBuyNow(this.bot, chatId, telegramUserId);
 
           } else if (callbackData === 'order_schedule') {
@@ -923,15 +923,15 @@ class TelegramBotController {
       // Auto-login: Create browser session if doesn't exist
       let page;
       const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
-      
+
       if (!hasActiveBrowser) {
         logger.info(`Auto-login for balance check: User ${telegramUserId}`);
-        
+
         // Check if cancelled before login
         if (!this.balanceCheckInProgress.has(telegramUserId)) {
           throw new Error('Balance check cancelled by user');
         }
-        
+
         // Login using scraper service (creates browser automatically)
         const result = await scraperService.login(telegramUserId, credentials.email, credentials.password);
         page = result.page;
@@ -976,7 +976,7 @@ class TelegramBotController {
       );
     } catch (err) {
       logger.error('Balance check error:', err);
-      
+
       // Delete loading message
       try {
         await this.bot.deleteMessage(chatId, loadingMsg.message_id);

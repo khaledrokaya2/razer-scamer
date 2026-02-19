@@ -140,10 +140,10 @@ class ScheduledOrderService {
 
       if (pendingOrders.length === 0) {
         logger.debug('ScheduledOrderService: No orders due right now');
-        
+
         // Check if there are any pending orders at all (including future ones)
         const hasAnyPending = await db.hasAnyPendingScheduledOrders();
-        
+
         if (!hasAnyPending && this.isMonitoring) {
           // No pending orders at all - stop monitoring
           this.stop();

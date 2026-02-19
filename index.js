@@ -111,7 +111,7 @@ async function initializeServices(config) {
   // Initialize Telegram bot controller with environment-specific bot token
   const botType = config.isDevelopment ? 'TEST' : 'PRODUCTION';
   logger.bot(`Starting ${botType} bot...`);
-  
+
   // Debug: Show configuration details
   console.log('='.repeat(80));
   console.log('🔍 CONFIGURATION DEBUG:');
@@ -123,13 +123,13 @@ async function initializeServices(config) {
   console.log(`   Is TEST DB (db40738): ${config.dbConnectionString && config.dbConnectionString.includes('db40738')}`);
   console.log(`   Is PROD DB (db29926): ${config.dbConnectionString && config.dbConnectionString.includes('db29926')}`);
   console.log('='.repeat(80));
-  
+
   botController.initialize(config.botToken);
 
   // Initialize scheduled order service (singleton pattern)
   const bot = botController.getBot();
   scheduledOrderService = getScheduledOrderService(bot);
-  
+
   // Only start monitoring if there are pending scheduled orders
   await scheduledOrderService.ensureMonitoring();
   logger.success('Scheduled order service initialized');

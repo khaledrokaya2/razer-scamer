@@ -819,7 +819,7 @@ class OrderFlowHandler {
 
     // Determine buttons based on schedule mode
     const buttons = [];
-    
+
     if (session.isScheduleMode) {
       // Schedule mode: only show Schedule button
       buttons.push([{ text: '⏰ Schedule for Later', callback_data: 'order_schedule' }]);
@@ -828,7 +828,7 @@ class OrderFlowHandler {
       buttons.push([{ text: '🚀 Buy Now', callback_data: 'order_buy_now' }]);
       buttons.push([{ text: '⏰ Schedule for Later', callback_data: 'order_schedule' }]);
     }
-    
+
     // Always show Cancel button
     buttons.push([{ text: '❌ Cancel', callback_data: 'order_cancel' }]);
 
@@ -1158,7 +1158,7 @@ class OrderFlowHandler {
             // Send cancellation message with partial results
             // Calculate successful cards (exclude FAILED)
             const successfulCards = err.partialOrder.pins.filter(p => p.pinCode !== 'FAILED').length;
-            
+
             // Use MessageFormatter for consistent formatting (SOLID principle)
             const cancelMessage = messageFormatter.formatOrderCancelled(err.partialOrder.order, successfulCards, failedCards);
             await bot.sendMessage(chatId, cancelMessage, { parse_mode: 'Markdown' });
@@ -1331,15 +1331,15 @@ class OrderFlowHandler {
     // Auto-login if no browser session exists
     const browserManager = require('../services/BrowserManager');
     const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
-    
+
     if (!hasActiveBrowser) {
       const db = require('../services/DatabaseService');
       const scraperService = require('../services/RazerScraperService');
       const logger = require('../utils/logger');
-      
+
       // Get user credentials
       const credentials = await db.getUserCredentials(telegramUserId);
-      
+
       if (!credentials || !credentials.email || !credentials.password) {
         await bot.sendMessage(
           chatId,
@@ -1351,14 +1351,14 @@ class OrderFlowHandler {
         this.clearSession(chatId);
         return;
       }
-      
+
       // Show login progress
       const loginMsg = await bot.sendMessage(chatId, '⏳ *Logging in...*\n\nPreparing browser session...', { parse_mode: 'Markdown' });
-      
+
       try {
         logger.info(`Auto-login for purchase: User ${telegramUserId}`);
         await scraperService.login(telegramUserId, credentials.email, credentials.password);
-        
+
         // Delete login message
         try {
           await bot.deleteMessage(chatId, loginMsg.message_id);
@@ -1377,16 +1377,16 @@ class OrderFlowHandler {
           }
           return;
         }
-        
+
         logger.error('Auto-login failed for purchase:', loginErr);
-        
+
         // Delete login message
         try {
           await bot.deleteMessage(chatId, loginMsg.message_id);
         } catch (delErr) {
           logger.debug('Could not delete login message');
         }
-        
+
         await bot.sendMessage(
           chatId,
           '❌ *Login Failed*\n\n' +
@@ -1581,7 +1581,7 @@ class OrderFlowHandler {
 
             // Calculate successful cards (exclude FAILED)
             const successfulCards = err.partialOrder.pins.filter(p => p.pinCode !== 'FAILED').length;
-            
+
             // Use MessageFormatter for consistent formatting (SOLID principle)
             const cancelMessage = messageFormatter.formatOrderCancelled(err.partialOrder.order, successfulCards, failedCards);
             await bot.sendMessage(chatId, cancelMessage, { parse_mode: 'Markdown' });
