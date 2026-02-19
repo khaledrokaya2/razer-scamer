@@ -32,6 +32,7 @@ const logger = require('./src/utils/logger');
 const authService = require('./src/services/AuthorizationService');
 const botController = require('./src/controllers/TelegramBotController');
 const getScheduledOrderService = require('./src/services/ScheduledOrderService');
+const browserManager = require('./src/services/BrowserManager');
 
 // Global scheduled order service instance
 let scheduledOrderService = null;
@@ -101,6 +102,9 @@ function validateEnvironment() {
 async function initializeServices(config) {
   logger.system('Initializing services...');
 
+  // Initialize global browser for catalog browsing (shared by all users)
+  await browserManager.initializeGlobalBrowser();
+
   // Initialize authorization service (whitelist check only - no database)
   await authService.initialize();
 
@@ -122,11 +126,13 @@ async function initializeServices(config) {
   
   botController.initialize(config.botToken);
 
-  // Initialize and start scheduled order service (singleton pattern)
+  // Initialize scheduled order service (singleton pattern)
   const bot = botController.getBot();
   scheduledOrderService = getScheduledOrderService(bot);
-  scheduledOrderService.start();
-  logger.success('Scheduled order service started');
+  
+  // Only start monitoring if there are pending scheduled orders
+  await scheduledOrderService.ensureMonitoring();
+  logger.success('Scheduled order service initialized');
 
   logger.success('All services initialized');
 }

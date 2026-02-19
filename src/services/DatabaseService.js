@@ -783,6 +783,30 @@ class DatabaseService {
   }
 
   /**
+   * Check if there are any pending scheduled orders (regardless of time)
+   * Used to determine if monitoring should be active
+   * @returns {Promise<boolean>} True if there are pending orders
+   */
+  async hasAnyPendingScheduledOrders() {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .query(`
+          SELECT COUNT(*) as count FROM scheduled_orders 
+          WHERE status = 'pending'
+        `);
+
+      const count = result.recordset[0].count;
+      logger.debug(`hasAnyPendingScheduledOrders: Found ${count} pending orders (all times)`);
+      return count > 0;
+    } catch (err) {
+      logger.error('Error checking for any pending scheduled orders:', err);
+      throw err;
+    }
+  }
+
+  /**
    * Update scheduled order status
    * @param {number} scheduledOrderId - Scheduled order ID
    * @param {string} status - New status

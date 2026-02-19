@@ -24,6 +24,8 @@ class TelegramBotController {
     this.processingCallbacks = new Set();
     // Track users currently auto-logging in
     this.usersLoggingIn = new Set();
+    // Track ongoing balance checks for cancellation support
+    this.balanceCheckInProgress = new Set();
     // Cleanup rate limit map periodically
     this.startRateLimitCleanup();
   }
@@ -128,8 +130,14 @@ class TelegramBotController {
    * Register all bot event handlers
    */
   registerHandlers() {
-    // Handle /start command
+    // Handle commands
     this.bot.onText(/\/start/, (msg) => this.handleStartCommand(msg));
+    this.bot.onText(/\/check_balance/, (msg) => this.handleCheckBalanceCommand(msg));
+    this.bot.onText(/\/transactions/, (msg) => this.handleTransactionsCommand(msg));
+    this.bot.onText(/\/settings/, (msg) => this.handleSettingsCommand(msg));
+    this.bot.onText(/\/schedule/, (msg) => this.handleScheduleCommand(msg));
+    this.bot.onText(/\/info/, (msg) => this.handleInfoCommand(msg));
+    this.bot.onText(/\/cancel/, (msg) => this.handleCancelCommand(msg));
 
     // Handle callback queries (button clicks)
     this.bot.on('callback_query', (query) => this.handleCallbackQuery(query));
@@ -139,12 +147,11 @@ class TelegramBotController {
   }
 
   /**
-   * Handle /start command
+   * Handle /start command - Show game menu directly for instant order
    * @param {object} msg - Telegram message object
    */
   async handleStartCommand(msg) {
     const chatId = msg.chat.id.toString();
-
     const telegramUserId = msg.from.id.toString();
 
     try {
@@ -170,11 +177,24 @@ class TelegramBotController {
         );
       }
 
-      // Show main menu
-      await this.showMainMenu(chatId);
+      // Check if user has credentials
+      const db = require('../services/DatabaseService');
+      const credentials = await db.getUserCredentials(telegramUserId);
 
-      // Auto-login if user has credentials
-      await this.autoLoginUser(chatId, telegramUserId);
+      if (!credentials || !credentials.email || !credentials.password) {
+        return this.bot.sendMessage(
+          chatId,
+          '⚠️ *No Credentials Found*\n\n' +
+          'Please add your Razer credentials first.\n\n' +
+          'Use: /settings to add your Razer ID',
+          { parse_mode: 'Markdown' }
+        );
+      }
+
+      // Initialize order flow and show game selection directly
+      // No browser session needed yet - global browser will be used for catalog browsing
+      orderFlowHandler.initSession(chatId);
+      await orderFlowHandler.showGameSelection(this.bot, chatId);
     } catch (err) {
       logger.error('Error in /start command:', err);
       this.bot.sendMessage(
@@ -251,27 +271,227 @@ class TelegramBotController {
   }
 
   /**
-   * Show main menu with 4 options (persistent keyboard buttons)
-   * @param {string} chatId - Chat ID
+   * Handle /check_balance command
+   * @param {object} msg - Telegram message object
    */
-  async showMainMenu(chatId) {
-    const message = `👋 **Welcome!**\n\nChoose an option from the menu below:`;
+  async handleCheckBalanceCommand(msg) {
+    const chatId = msg.chat.id.toString();
+    const telegramUserId = msg.from.id.toString();
 
-    const keyboard = {
-      keyboard: [
-        [{ text: '🛒 Create Order' }],
-        [{ text: '💰 Check Balance' }],
-        [{ text: '📋 Order History' }],
-        [{ text: '⚙️ Settings' }, { text: '🚪 Logout' }]
-      ],
-      resize_keyboard: true,
-      persistent: true
-    };
+    try {
+      // Check authorization
+      const authResult = await authService.checkAuthorization(telegramUserId);
+      if (!authResult.authorized) {
+        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      }
 
-    this.bot.sendMessage(chatId, message, {
-      parse_mode: 'Markdown',
-      reply_markup: keyboard
-    });
+      await this.handleCheckBalanceButton(chatId, telegramUserId);
+    } catch (err) {
+      logger.error('Error in /check_balance command:', err);
+      this.bot.sendMessage(chatId, '❌ Error checking balance.');
+    }
+  }
+
+  /**
+   * Handle /transactions command
+   * @param {object} msg - Telegram message object
+   */
+  async handleTransactionsCommand(msg) {
+    const chatId = msg.chat.id.toString();
+    const telegramUserId = msg.from.id.toString();
+
+    try {
+      // Check authorization
+      const authResult = await authService.checkAuthorization(telegramUserId);
+      if (!authResult.authorized) {
+        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      }
+
+      // Delete previous history message if exists
+      const historyMsgId = orderHistoryHandler.historyMessages.get(chatId);
+      if (historyMsgId) {
+        try {
+          await this.bot.deleteMessage(chatId, historyMsgId);
+          orderHistoryHandler.historyMessages.delete(chatId);
+        } catch (delErr) {
+          logger.debug('Could not delete previous history message');
+        }
+      }
+
+      // Reset to first page (newest order)
+      orderHistoryHandler.setCurrentPage(chatId, 0);
+      await orderHistoryHandler.showOrderHistory(this.bot, chatId, telegramUserId);
+    } catch (err) {
+      logger.error('Error in /transactions command:', err);
+      this.bot.sendMessage(chatId, '❌ Error loading transactions.');
+    }
+  }
+
+  /**
+   * Handle /settings command
+   * @param {object} msg - Telegram message object
+   */
+  async handleSettingsCommand(msg) {
+    const chatId = msg.chat.id.toString();
+    const telegramUserId = msg.from.id.toString();
+
+    try {
+      // Check authorization
+      const authResult = await authService.checkAuthorization(telegramUserId);
+      if (!authResult.authorized) {
+        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      }
+
+      await this.handleSettingsMenu(chatId);
+    } catch (err) {
+      logger.error('Error in /settings command:', err);
+      this.bot.sendMessage(chatId, '❌ Error opening settings.');
+    }
+  }
+
+  /**
+   * Handle /schedule command
+   * @param {object} msg - Telegram message object
+   */
+  async handleScheduleCommand(msg) {
+    const chatId = msg.chat.id.toString();
+    const telegramUserId = msg.from.id.toString();
+
+    try {
+      // Check authorization
+      const authResult = await authService.checkAuthorization(telegramUserId);
+      if (!authResult.authorized) {
+        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      }
+
+      // Check if user has credentials
+      const db = require('../services/DatabaseService');
+      const credentials = await db.getUserCredentials(telegramUserId);
+
+      if (!credentials || !credentials.email || !credentials.password) {
+        return this.bot.sendMessage(
+          chatId,
+          '⚠️ *No Credentials Found*\n\n' +
+          'Please add your Razer credentials first.\n\n' +
+          'Use: /settings to add your Razer ID',
+          { parse_mode: 'Markdown' }
+        );
+      }
+
+      // Initialize order flow and show game selection
+      // No browser session needed yet - global browser will be used for catalog browsing
+      orderFlowHandler.initSession(chatId);
+      // Mark session as schedule mode
+      orderFlowHandler.updateSession(chatId, { isScheduleMode: true });
+      await orderFlowHandler.showGameSelection(this.bot, chatId);
+    } catch (err) {
+      logger.error('Error in /schedule command:', err);
+      this.bot.sendMessage(chatId, '❌ Error starting schedule flow.');
+    }
+  }
+
+  /**
+   * Handle /info command
+   * @param {object} msg - Telegram message object
+   */
+  async handleInfoCommand(msg) {
+    const chatId = msg.chat.id.toString();
+    const telegramUserId = msg.from.id.toString();
+
+    try {
+      // Check authorization
+      const authResult = await authService.checkAuthorization(telegramUserId);
+      if (!authResult.authorized) {
+        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      }
+
+      const db = require('../services/DatabaseService');
+      
+      // Get email
+      const credentials = await db.getUserCredentials(telegramUserId);
+      const email = credentials?.email || 'Not set';
+      
+      // Get backup code count
+      const backupCodeCount = await db.getActiveBackupCodeCount(telegramUserId);
+
+      await this.bot.sendMessage(
+        chatId,
+        `ℹ️ *ACCOUNT INFO*\n\n` +
+        `📧 *Razer Email:*\n\`${email}\`\n\n` +
+        `🔑 *Active Backup Codes:* ${backupCodeCount}/10`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      logger.error('Error in /info command:', err);
+      this.bot.sendMessage(chatId, '❌ Error getting account info.');
+    }
+  }
+
+  /**
+   * Handle /cancel command
+   * @param {object} msg - Telegram message object
+   */
+  async handleCancelCommand(msg) {
+    const chatId = msg.chat.id.toString();
+    const telegramUserId = msg.from.id.toString();
+
+    try {
+      // Check authorization
+      const authResult = await authService.checkAuthorization(telegramUserId);
+      if (!authResult.authorized) {
+        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      }
+
+      // Check if there's an active purchase session BEFORE clearing
+      const hasActiveSession = orderFlowHandler.getSession(chatId);
+      
+      // Cancel any ongoing purchases FIRST (before clearing session)
+      if (hasActiveSession) {
+        // Mark as cancelled to stop purchase flow
+        orderFlowHandler.markAsCancelled(chatId);
+        
+        // Close browser
+        const browserManager = require('../services/BrowserManager');
+        await browserManager.closeBrowser(telegramUserId);
+        
+        logger.info(`Cancelled purchase and closed browser for user ${telegramUserId}`);
+      }
+
+      // Cancel any ongoing balance checks
+      if (this.balanceCheckInProgress.has(telegramUserId)) {
+        this.balanceCheckInProgress.delete(telegramUserId);
+        
+        // Close browser if it was opened for balance check (only if no purchase session)
+        if (!hasActiveSession) {
+          const browserManager = require('../services/BrowserManager');
+          await browserManager.closeBrowser(telegramUserId);
+        }
+        
+        logger.info(`Cancelled balance check for user ${telegramUserId}`);
+      }
+
+      // Clear order flow session
+      orderFlowHandler.clearSession(chatId);
+      
+      // Clear order history pagination
+      orderHistoryHandler.reset(chatId);
+      
+      // Clear session manager state
+      sessionManager.updateState(chatId, 'idle');
+      sessionManager.clearCredentials(chatId);
+
+      await this.bot.sendMessage(
+        chatId,
+        '✅ *Operation Cancelled*\n\n' +
+        'All current operations have been cancelled.\n' +
+        'Bot is ready for new commands.\n\n' +
+        'Use /start to create a new order.',
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      logger.error('Error in /cancel command:', err);
+      this.bot.sendMessage(chatId, '❌ Error cancelling operation.');
+    }
   }
 
   /**
@@ -399,11 +619,6 @@ class TelegramBotController {
           }
           // Handle order flow callbacks
           else if (callbackData.startsWith('order_game_')) {
-            if (!await this.ensureBrowserSession(null, chatId, telegramUserId)) {
-              orderFlowHandler.clearSession(chatId);
-              return;
-            }
-
             const gameId = callbackData.replace('order_game_', '');
 
             // Handle custom game URL
@@ -414,11 +629,6 @@ class TelegramBotController {
             }
 
           } else if (callbackData.startsWith('order_card_')) {
-            if (!await this.ensureBrowserSession(null, chatId, telegramUserId)) {
-              orderFlowHandler.clearSession(chatId);
-              return;
-            }
-
             const parts = callbackData.replace('order_card_', '').split('_');
             const cardIndex = parts[0];
             const cardName = parts.slice(1).join('_');
@@ -449,13 +659,134 @@ class TelegramBotController {
             await orderFlowHandler.handleBack(this.bot, chatId);
 
           } else if (callbackData === 'order_confirm_continue') {
-            await orderFlowHandler.showOrderConfirmation(this.bot, chatId);
-
-          } else if (callbackData === 'order_buy_now') {
-            if (!await this.ensureBrowserSession(null, chatId, telegramUserId)) {
-              orderFlowHandler.clearSession(chatId);
+            // User confirmed to continue despite low backup codes
+            const session = orderFlowHandler.getSession(chatId);
+            
+            if (!session) {
+              await this.bot.sendMessage(chatId, '⚠️ Session expired. Use /start to begin again.');
               return;
             }
+            
+            // Check if schedule mode or instant purchase
+            if (session.isScheduleMode) {
+              // Schedule mode: show confirmation with schedule option
+              await orderFlowHandler.showOrderConfirmation(this.bot, chatId);
+            } else {
+              // Instant purchase mode: start buying immediately
+              // Auto-login if no browser session exists
+              const browserManager = require('../services/BrowserManager');
+              const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
+              
+              if (!hasActiveBrowser) {
+                const db = require('../services/DatabaseService');
+                const credentials = await db.getUserCredentials(telegramUserId);
+                
+                if (!credentials || !credentials.email || !credentials.password) {
+                  await this.bot.sendMessage(
+                    chatId,
+                    '⚠️ *No Credentials Found*\\n\\n' +
+                    'Please add your Razer credentials first.\\n\\n' +
+                    'Use: /settings to add your Razer ID',
+                    { parse_mode: 'Markdown' }
+                  );
+                  orderFlowHandler.clearSession(chatId);
+                  return;
+                }
+                
+                // Show login progress
+                const loginMsg = await this.bot.sendMessage(chatId, '⏳ *Logging in...*\\n\\nPreparing browser session...', { parse_mode: 'Markdown' });
+                
+                try {
+                  logger.info(`Auto-login for purchase: User ${telegramUserId}`);
+                  await scraperService.login(telegramUserId, credentials.email, credentials.password);
+                  
+                  try {
+                    await this.bot.deleteMessage(chatId, loginMsg.message_id);
+                  } catch (delErr) {
+                    logger.debug('Could not delete login message');
+                  }
+                } catch (loginErr) {
+                  logger.error('Auto-login failed for purchase:', loginErr);
+                  
+                  try {
+                    await this.bot.deleteMessage(chatId, loginMsg.message_id);
+                  } catch (delErr) {
+                    logger.debug('Could not delete login message');
+                  }
+                  
+                  await this.bot.sendMessage(
+                    chatId,
+                    '❌ *Login Failed*\\n\\n' +
+                    'Could not login to Razer.\\n\\n' +
+                    'Please check your credentials using /settings',
+                    { parse_mode: 'Markdown' }
+                  );
+                  orderFlowHandler.clearSession(chatId);
+                  return;
+                }
+              }
+              
+              await orderFlowHandler.handleBuyNow(this.bot, chatId, telegramUserId);
+            }
+
+          } else if (callbackData === 'order_buy_now') {
+            // Auto-login if no browser session exists
+            const browserManager = require('../services/BrowserManager');
+            const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
+            
+            if (!hasActiveBrowser) {
+              // Get user credentials
+              const db = require('../services/DatabaseService');
+              const credentials = await db.getUserCredentials(telegramUserId);
+              
+              if (!credentials || !credentials.email || !credentials.password) {
+                await this.bot.sendMessage(
+                  chatId,
+                  '⚠️ *No Credentials Found*\n\n' +
+                  'Please add your Razer credentials first.\n\n' +
+                  'Use: /settings to add your Razer ID',
+                  { parse_mode: 'Markdown' }
+                );
+                orderFlowHandler.clearSession(chatId);
+                return;
+              }
+              
+              // Show login progress
+              const loginMsg = await this.bot.sendMessage(chatId, '⏳ *Logging in...*\n\nPreparing browser session...', { parse_mode: 'Markdown' });
+              
+              try {
+                // Auto-login
+                logger.info(`Auto-login for purchase: User ${telegramUserId}`);
+                await scraperService.login(telegramUserId, credentials.email, credentials.password);
+                
+                // Delete login message
+                try {
+                  await this.bot.deleteMessage(chatId, loginMsg.message_id);
+                } catch (delErr) {
+                  logger.debug('Could not delete login message');
+                }
+              } catch (loginErr) {
+                logger.error('Auto-login failed for purchase:', loginErr);
+                
+                // Delete login message
+                try {
+                  await this.bot.deleteMessage(chatId, loginMsg.message_id);
+                } catch (delErr) {
+                  logger.debug('Could not delete login message');
+                }
+                
+                await this.bot.sendMessage(
+                  chatId,
+                  '❌ *Login Failed*\n\n' +
+                  'Could not login to Razer.\n\n' +
+                  'Please check your credentials using /settings',
+                  { parse_mode: 'Markdown' }
+                );
+                orderFlowHandler.clearSession(chatId);
+                return;
+              }
+            }
+            
             await orderFlowHandler.handleBuyNow(this.bot, chatId, telegramUserId);
 
           } else if (callbackData === 'order_schedule') {
@@ -577,63 +908,102 @@ class TelegramBotController {
         chatId,
         '⚠️ *No Credentials Found*\n\n' +
         'Please add your Razer credentials first.\n\n' +
-        'Go to: ⚙️ Settings → 🔐 Update Razer ID',
+        'Use: /settings to add your Razer ID',
         { parse_mode: 'Markdown' }
       );
     }
 
-    // Verify user has an active browser session
-    if (!browserManager.hasActiveBrowser(telegramUserId)) {
-      const keyboard = {
-        inline_keyboard: [[{ text: '🔐 Login to Razer', callback_data: 'login' }]]
-      };
-
-      return this.bot.sendMessage(
-        chatId,
-        '⚠️ You must login first.',
-        { reply_markup: keyboard }
-      );
-    }
+    // Mark balance check as in progress
+    this.balanceCheckInProgress.add(telegramUserId);
 
     // Show loading message
-    const checkBalanceMessage = this.bot.sendMessage(chatId, '⏳ Checking your balance...');
+    const loadingMsg = await this.bot.sendMessage(chatId, '⏳ *Checking Balance*\n\nLogging in and retrieving data...', { parse_mode: 'Markdown' });
 
     try {
-      // Get page from BrowserManager
-      const page = browserManager.getPage(telegramUserId);
+      // Auto-login: Create browser session if doesn't exist
+      let page;
+      const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
+      
+      if (!hasActiveBrowser) {
+        logger.info(`Auto-login for balance check: User ${telegramUserId}`);
+        
+        // Check if cancelled before login
+        if (!this.balanceCheckInProgress.has(telegramUserId)) {
+          throw new Error('Balance check cancelled by user');
+        }
+        
+        // Login using scraper service (creates browser automatically)
+        const result = await scraperService.login(telegramUserId, credentials.email, credentials.password);
+        page = result.page;
+      } else {
+        // Reuse existing browser session
+        page = browserManager.getPage(telegramUserId);
+      }
 
-      // Call scraper service to get balance
+      // Check if cancelled before getting balance
+      if (!this.balanceCheckInProgress.has(telegramUserId)) {
+        throw new Error('Balance check cancelled by user');
+      }
+
+      // Get balance
       const balance = await scraperService.getBalance(telegramUserId, page);
 
-      // Delete the loading message
-      checkBalanceMessage.then(msg => {
-        this.bot.deleteMessage(chatId, msg.message_id).catch(() => {
-          logger.warn('Could not delete loading message');
-        });
-      });
+      // Check if cancelled before sending result
+      if (!this.balanceCheckInProgress.has(telegramUserId)) {
+        throw new Error('Balance check cancelled by user');
+      }
+
+      // Close browser if we created it just for balance check
+      if (!hasActiveBrowser) {
+        await browserManager.closeBrowser(telegramUserId);
+        logger.info(`Browser closed after balance check for user ${telegramUserId}`);
+      }
+
+      // Delete loading message
+      try {
+        await this.bot.deleteMessage(chatId, loadingMsg.message_id);
+      } catch (delErr) {
+        logger.debug('Could not delete loading message');
+      }
 
       // Send balance information
-      this.bot.sendMessage(
+      await this.bot.sendMessage(
         chatId,
-        `💰 **Your Razer Balance:**\n\n` +
+        `💰 *Your Razer Balance:*\n\n` +
         `🥇 Gold: ${balance.gold}\n` +
         `🥈 Silver: ${balance.silver}`,
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
       logger.error('Balance check error:', err);
-      this.bot.sendMessage(
-        chatId,
-        '❌ Failed to get balance. Please try logging in again.',
-        {
-          reply_markup: {
-            inline_keyboard: [[{ text: '🔐 Login', callback_data: 'login' }]]
-          }
-        }
-      );
+      
+      // Delete loading message
+      try {
+        await this.bot.deleteMessage(chatId, loadingMsg.message_id);
+      } catch (delErr) {
+        logger.debug('Could not delete loading message');
+      }
 
-      // Close browser session on error
+      // Only send error message if not cancelled
+      // If user was removed from balanceCheckInProgress, it means /cancel was used
+      if (this.balanceCheckInProgress.has(telegramUserId)) {
+        await this.bot.sendMessage(
+          chatId,
+          '❌ *Failed to check balance*\n\n' +
+          'Possible reasons:\n' +
+          '• Invalid credentials\n' +
+          '• Network error\n' +
+          '• Razer website issue\n\n' +
+          'Please try again or update your credentials using /settings',
+          { parse_mode: 'Markdown' }
+        );
+      }
+
+      // Close browser on error (if not already closed by cancel)
       await browserManager.closeBrowser(telegramUserId);
+    } finally {
+      // Always remove from in-progress set
+      this.balanceCheckInProgress.delete(telegramUserId);
     }
   }
 
@@ -665,67 +1035,6 @@ class TelegramBotController {
       // Check authorization
       const authResult = await authService.checkAuthorization(telegramUserId);
       if (!authResult.authorized) return;
-
-      // Handle main menu button clicks (from ReplyKeyboard)
-      if (text === '🛒 Create Order') {
-        // Check if user has credentials first
-        const db = require('../services/DatabaseService');
-        const credentials = await db.getUserCredentials(telegramUserId);
-
-        if (!credentials || !credentials.email || !credentials.password) {
-          return this.bot.sendMessage(
-            chatId,
-            '⚠️ *No Credentials Found*\n\n' +
-            'Please add your Razer credentials first.\n\n' +
-            'Go to: ⚙️ Settings → 🔐 Update Razer ID',
-            { parse_mode: 'Markdown' }
-          );
-        }
-
-        // Check if user has active browser session
-        if (!await this.ensureBrowserSession(null, chatId, telegramUserId)) {
-          return;
-        }
-
-        // Initialize order flow
-        orderFlowHandler.initSession(chatId);
-        await orderFlowHandler.showGameSelection(this.bot, chatId);
-        return;
-      }
-
-      if (text === '💰 Check Balance') {
-        await this.handleCheckBalanceButton(chatId, telegramUserId);
-        return;
-      }
-
-      if (text === '📋 Order History') {
-        // Delete previous history message if exists
-        const historyMsgId = orderHistoryHandler.historyMessages.get(chatId);
-        if (historyMsgId) {
-          try {
-            await this.bot.deleteMessage(chatId, historyMsgId);
-            orderHistoryHandler.historyMessages.delete(chatId);
-          } catch (delErr) {
-            logger.debug('Could not delete previous history message');
-          }
-        }
-
-        // Reset to first page (newest order)
-        orderHistoryHandler.setCurrentPage(chatId, 0);
-
-        await orderHistoryHandler.showOrderHistory(this.bot, chatId, telegramUserId);
-        return;
-      }
-
-      if (text === '⚙️ Settings') {
-        await this.handleSettingsMenu(chatId);
-        return;
-      }
-
-      if (text === '🚪 Logout') {
-        await this.handleLogoutButton(chatId, telegramUserId);
-        return;
-      }
 
       const session = sessionManager.getSession(chatId);
 

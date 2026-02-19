@@ -16,6 +16,7 @@ class ScheduledOrderService {
   constructor(bot) {
     this.bot = bot;
     this.cronJob = null;
+    this.isMonitoring = false; // Track if monitoring is active
     this.orderService = orderService; // Use singleton instance
     this.processingOrders = new Set(); // Track currently processing orders to avoid duplicates
 
@@ -30,7 +31,7 @@ class ScheduledOrderService {
    */
   start() {
     if (this.cronJob) {
-      logger.info('ScheduledOrderService: Cron job already running');
+      logger.debug('ScheduledOrderService: Cron job already running');
       return;
     }
 
@@ -40,9 +41,9 @@ class ScheduledOrderService {
       await this.checkAndExecuteScheduledOrders();
     });
 
-    logger.success('✅ Scheduled order cron job started (checks every minute)');
+    this.isMonitoring = true;
+    logger.success('✅ Scheduled order monitoring started (checks every minute)');
     logger.info(`   Current server time: ${new Date().toISOString()}`);
-    logger.info(`   Will check for orders with scheduled_time <= server time`);
   }
 
   /**
@@ -52,7 +53,33 @@ class ScheduledOrderService {
     if (this.cronJob) {
       this.cronJob.stop();
       this.cronJob = null;
-      logger.info('ScheduledOrderService: Cron job stopped');
+      this.isMonitoring = false;
+      logger.info('⏸️ Scheduled order monitoring stopped (no pending orders)');
+    }
+  }
+
+  /**
+   * Ensure monitoring is active if there are pending orders
+   * Called when a new scheduled order is created or on bot startup
+   */
+  async ensureMonitoring() {
+    // If already monitoring, do nothing
+    if (this.isMonitoring) {
+      logger.debug('ScheduledOrderService: Already monitoring');
+      return;
+    }
+
+    // Check if there are any pending orders (regardless of scheduled time)
+    try {
+      const hasPendingOrders = await db.hasAnyPendingScheduledOrders();
+      if (hasPendingOrders) {
+        logger.info(`📋 ScheduledOrderService: Pending order(s) found - starting monitoring`);
+        this.start();
+      } else {
+        logger.info('📋 ScheduledOrderService: No pending orders - monitoring remains idle');
+      }
+    } catch (err) {
+      logger.error('ScheduledOrderService: Error checking for pending orders:', err);
     }
   }
 
@@ -102,20 +129,29 @@ class ScheduledOrderService {
 
   /**
    * Check for pending scheduled orders and execute them
+   * Stops monitoring if no pending orders remain
    */
   async checkAndExecuteScheduledOrders() {
     try {
       logger.debug(`ScheduledOrderService: Checking for pending orders at ${new Date().toISOString()}`);
 
-      // Get all pending scheduled orders whose time has come
+      // Get all pending scheduled orders whose time has come (due now)
       const pendingOrders = await db.getPendingScheduledOrders();
 
       if (pendingOrders.length === 0) {
-        logger.debug('ScheduledOrderService: No pending orders found');
-        return; // No orders to process
+        logger.debug('ScheduledOrderService: No orders due right now');
+        
+        // Check if there are any pending orders at all (including future ones)
+        const hasAnyPending = await db.hasAnyPendingScheduledOrders();
+        
+        if (!hasAnyPending && this.isMonitoring) {
+          // No pending orders at all - stop monitoring
+          this.stop();
+        }
+        return;
       }
 
-      logger.info(`ScheduledOrderService: Found ${pendingOrders.length} pending order(s)`);
+      logger.info(`ScheduledOrderService: Found ${pendingOrders.length} pending order(s) ready to execute`);
 
       // Process each order
       for (const scheduledOrder of pendingOrders) {

@@ -327,12 +327,13 @@ class OrderFlowHandler {
       .replace(/-/g, ' ')
       .replace(/\b\w/g, c => c.toUpperCase());
 
-    // Update session
+    // Update session and store telegramUserId for later use
     this.updateSession(chatId, {
       step: 'select_card',
       gameId: 'custom',
       gameName: `🎮 ${gameName}`,
-      gameUrl: urlTrimmed
+      gameUrl: urlTrimmed,
+      telegramUserId: telegramUserId
     });
 
     // Show loading message
@@ -349,8 +350,8 @@ class OrderFlowHandler {
     try {
       logger.http(`Scraping cards from custom URL: ${urlTrimmed}`);
 
-      // Get available cards from Razer
-      const cards = await purchaseService.getAvailableCards(telegramUserId, urlTrimmed);
+      // Get available cards from Razer using global browser (no login)
+      const cards = await purchaseService.getAvailableCards(null, urlTrimmed, true);
 
       logger.success(`Found ${cards.length} cards`);
 
@@ -556,12 +557,13 @@ class OrderFlowHandler {
 
     logger.info(`Game found: ${game.name}`);
 
-    // Update session
+    // Update session and store telegramUserId for later use
     this.updateSession(chatId, {
       step: 'select_card',
       gameId: game.id,
       gameName: game.name,
-      gameUrl: game.link
+      gameUrl: game.link,
+      telegramUserId: telegramUserId
     });
 
     // Show loading message
@@ -578,8 +580,8 @@ class OrderFlowHandler {
     try {
       logger.http(`Scraping cards from: ${game.link}`);
 
-      // Get available cards from Razer (use telegramUserId)
-      const cards = await purchaseService.getAvailableCards(telegramUserId, game.link);
+      // Get available cards from Razer using global browser (no login)
+      const cards = await purchaseService.getAvailableCards(null, game.link, true);
 
       logger.success(`Found ${cards.length} cards`);
 
@@ -785,8 +787,14 @@ class OrderFlowHandler {
         return;
       }
 
-      // Show order confirmation with schedule option
-      await this.showOrderConfirmation(bot, chatId);
+      // Check if schedule mode or instant purchase
+      if (session.isScheduleMode) {
+        // Schedule mode: go directly to schedule time entry
+        await this.handleScheduleOrder(bot, chatId);
+      } else {
+        // Instant purchase mode: start buying immediately
+        await this.handleBuyNow(bot, chatId, telegramUserId);
+      }
 
     } catch (err) {
       logger.error('Error checking backup codes:', err);
@@ -809,6 +817,21 @@ class OrderFlowHandler {
 
     if (!session) return;
 
+    // Determine buttons based on schedule mode
+    const buttons = [];
+    
+    if (session.isScheduleMode) {
+      // Schedule mode: only show Schedule button
+      buttons.push([{ text: '⏰ Schedule for Later', callback_data: 'order_schedule' }]);
+    } else {
+      // Normal mode: show both Buy Now and Schedule buttons
+      buttons.push([{ text: '🚀 Buy Now', callback_data: 'order_buy_now' }]);
+      buttons.push([{ text: '⏰ Schedule for Later', callback_data: 'order_schedule' }]);
+    }
+    
+    // Always show Cancel button
+    buttons.push([{ text: '❌ Cancel', callback_data: 'order_cancel' }]);
+
     await bot.sendMessage(chatId,
       `📋 *ORDER SUMMARY*\n\n` +
       `🎮 Game: ${session.gameName}\n` +
@@ -818,11 +841,7 @@ class OrderFlowHandler {
       {
         parse_mode: 'Markdown',
         reply_markup: {
-          inline_keyboard: [
-            [{ text: '🚀 Buy Now', callback_data: 'order_buy_now' }],
-            [{ text: '⏰ Schedule for Later', callback_data: 'order_schedule' }],
-            [{ text: '❌ Cancel', callback_data: 'order_cancel' }]
-          ]
+          inline_keyboard: buttons
         }
       }
     );
@@ -1309,6 +1328,77 @@ class OrderFlowHandler {
     // Store telegram user ID in session
     session.telegramUserId = telegramUserId;
 
+    // Auto-login if no browser session exists
+    const browserManager = require('../services/BrowserManager');
+    const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
+    
+    if (!hasActiveBrowser) {
+      const db = require('../services/DatabaseService');
+      const scraperService = require('../services/RazerScraperService');
+      const logger = require('../utils/logger');
+      
+      // Get user credentials
+      const credentials = await db.getUserCredentials(telegramUserId);
+      
+      if (!credentials || !credentials.email || !credentials.password) {
+        await bot.sendMessage(
+          chatId,
+          '⚠️ *No Credentials Found*\n\n' +
+          'Please add your Razer credentials first.\n\n' +
+          'Use: /settings to add your Razer ID',
+          { parse_mode: 'Markdown' }
+        );
+        this.clearSession(chatId);
+        return;
+      }
+      
+      // Show login progress
+      const loginMsg = await bot.sendMessage(chatId, '⏳ *Logging in...*\n\nPreparing browser session...', { parse_mode: 'Markdown' });
+      
+      try {
+        logger.info(`Auto-login for purchase: User ${telegramUserId}`);
+        await scraperService.login(telegramUserId, credentials.email, credentials.password);
+        
+        // Delete login message
+        try {
+          await bot.deleteMessage(chatId, loginMsg.message_id);
+        } catch (delErr) {
+          logger.debug('Could not delete login message');
+        }
+      } catch (loginErr) {
+        // Check if operation was cancelled before showing error
+        if (this.isCancelled(chatId)) {
+          // Operation was cancelled - don't show error, /cancel will handle the message
+          logger.info('Login cancelled by user');
+          try {
+            await bot.deleteMessage(chatId, loginMsg.message_id);
+          } catch (delErr) {
+            logger.debug('Could not delete login message');
+          }
+          return;
+        }
+        
+        logger.error('Auto-login failed for purchase:', loginErr);
+        
+        // Delete login message
+        try {
+          await bot.deleteMessage(chatId, loginMsg.message_id);
+        } catch (delErr) {
+          logger.debug('Could not delete login message');
+        }
+        
+        await bot.sendMessage(
+          chatId,
+          '❌ *Login Failed*\n\n' +
+          'Could not login to Razer.\n\n' +
+          'Please check your credentials using /settings',
+          { parse_mode: 'Markdown' }
+        );
+        this.clearSession(chatId);
+        return;
+      }
+    }
+
     // Start the order processing (this is the existing backup code input handler logic)
     // We'll call the existing logic from handleBackupCodeInput
     // But instead of waiting for backup codes from user, we get from database
@@ -1545,6 +1635,11 @@ class OrderFlowHandler {
         this.clearCancellation(chatId);
         this.progressMessages.delete(chatId);
         this.orderSummaryMessages.delete(chatId);
+
+        // Close browser after cancelled purchase
+        const browserManager = require('../services/BrowserManager');
+        await browserManager.closeBrowser(telegramUserId);
+        logger.info(`Browser closed after cancelled purchase for user ${telegramUserId}`);
         return;
       }
 
@@ -1553,6 +1648,11 @@ class OrderFlowHandler {
       const friendlyError = this.getUserFriendlyError(err);
       await bot.sendMessage(chatId, friendlyError, { parse_mode: 'Markdown' });
       this.clearSession(chatId);
+
+      // Close browser on error
+      const browserManager = require('../services/BrowserManager');
+      await browserManager.closeBrowser(telegramUserId);
+      logger.info(`Browser closed after purchase error for user ${telegramUserId}`);
     }
   }
 
@@ -1571,18 +1671,18 @@ class OrderFlowHandler {
     const nowUTC = new Date();
     const EGYPT_OFFSET_HOURS = 2;
     const nowEgypt = new Date(nowUTC.getTime() + (EGYPT_OFFSET_HOURS * 60 * 60 * 1000));
-    const currentEgyptTime = `${nowEgypt.getUTCFullYear()}-${String(nowEgypt.getUTCMonth() + 1).padStart(2, '0')}-${String(nowEgypt.getUTCDate()).padStart(2, '0')} ${String(nowEgypt.getUTCHours()).padStart(2, '0')}:${String(nowEgypt.getUTCMinutes()).padStart(2, '0')}`;
+    const currentEgyptTime = `${String(nowEgypt.getUTCDate()).padStart(2, '0')}/${String(nowEgypt.getUTCMonth() + 1).padStart(2, '0')} ${String(nowEgypt.getUTCHours()).padStart(2, '0')}`;
 
     await bot.sendMessage(chatId,
       `⏰ *SCHEDULE ORDER*\n\n` +
       `Enter the date and time when you\n` +
       `want this order to be processed.\n\n` +
-      `Format: YYYY-MM-DD HH:MM\n` +
-      `Example: 2026-02-20 14:30\n\n` +
+      `Format: DD/MM HH\n` +
+      `Example: 20/02 14\n\n` +
       `📍 Current Egypt time:\n` +
       `\`${currentEgyptTime}\`\n\n` +
       `⚠️ Use Egypt time (Cairo timezone)\n` +
-      `_Works on any server location_\n\n` +
+      `_Year auto-added (${nowEgypt.getUTCFullYear()})_\n\n` +
       `_Use /start to cancel_`,
       { parse_mode: 'Markdown' }
     );
@@ -1602,15 +1702,15 @@ class OrderFlowHandler {
     const db = require('../services/DatabaseService');
 
     try {
-      // Parse datetime
-      const dateTimeRegex = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/;
+      // Parse datetime - Format: DD/MM HH (auto-add current year and 00 minutes)
+      const dateTimeRegex = /^(\d{1,2})\/(\d{1,2})\s+(\d{1,2})$/;
       const match = text.trim().match(dateTimeRegex);
 
       if (!match) {
         await bot.sendMessage(chatId,
           `❌ *INVALID FORMAT*\n\n` +
-          `Please use: YYYY-MM-DD HH:MM\n` +
-          `Example: 2026-02-20 14:30\n\n` +
+          `Please use: DD/MM HH\n` +
+          `Example: 20/02 14\n\n` +
           `⏰ Use Egypt time (Cairo)\n\n` +
           `_Try again or /start to cancel_`,
           { parse_mode: 'Markdown' }
@@ -1620,17 +1720,17 @@ class OrderFlowHandler {
 
       // IMPORTANT: User enters Egypt time (UTC+2), convert to UTC for database
       // This works regardless of where the server is located (Egypt, London, etc.)
-      const year = parseInt(match[1]);
-      const month = parseInt(match[2]) - 1; // JS months are 0-indexed
-      const day = parseInt(match[3]);
-      const hour = parseInt(match[4]);
-      const minute = parseInt(match[5]);
-
-      // Egypt is always UTC+2 (no DST since 2014)
+      const nowUTC = new Date();
       const EGYPT_OFFSET_HOURS = 2;
+      const nowEgypt = new Date(nowUTC.getTime() + (EGYPT_OFFSET_HOURS * 60 * 60 * 1000));
+      const year = nowEgypt.getUTCFullYear(); // Auto-add current year
+      const day = parseInt(match[1]);
+      const month = parseInt(match[2]) - 1; // JS months are 0-indexed
+      const hour = parseInt(match[3]);
+      const minute = 0; // Always 00 minutes
 
       // Interpret user's input as Egypt time and convert to UTC
-      // Example: User enters "07:21 Egypt" → Store as "05:21 UTC"
+      // Example: User enters "20/02 14" Egypt → Store as "12:00 UTC"
       const egyptTimeAsUTC = Date.UTC(year, month, day, hour, minute, 0);
       const scheduledTimeUTC = egyptTimeAsUTC - (EGYPT_OFFSET_HOURS * 60 * 60 * 1000);
       const scheduledTime = new Date(scheduledTimeUTC);
@@ -1638,11 +1738,10 @@ class OrderFlowHandler {
       logger.debug(`User entered: ${match[0]} Egypt time → Storing as: ${scheduledTime.toISOString()} UTC`);
 
       // Validate not in the past (compare in UTC)
-      const nowUTC = new Date();
       if (scheduledTime <= nowUTC) {
         // Show current Egypt time for reference
         const nowEgyptTime = new Date(nowUTC.getTime() + (EGYPT_OFFSET_HOURS * 60 * 60 * 1000));
-        const displayTime = `${nowEgyptTime.getUTCFullYear()}-${String(nowEgyptTime.getUTCMonth() + 1).padStart(2, '0')}-${String(nowEgyptTime.getUTCDate()).padStart(2, '0')} ${String(nowEgyptTime.getUTCHours()).padStart(2, '0')}:${String(nowEgyptTime.getUTCMinutes()).padStart(2, '0')}`;
+        const displayTime = `${String(nowEgyptTime.getUTCDate()).padStart(2, '0')}/${String(nowEgyptTime.getUTCMonth() + 1).padStart(2, '0')} ${String(nowEgyptTime.getUTCHours()).padStart(2, '0')}`;
 
         await bot.sendMessage(chatId,
           `❌ *INVALID TIME*\n\n` +
@@ -1679,6 +1778,13 @@ class OrderFlowHandler {
         quantity: session.quantity,
         scheduledTime: scheduledTime
       });
+
+      // Ensure scheduled order monitoring is active
+      const getScheduledOrderService = require('../services/ScheduledOrderService');
+      const scheduledOrderService = getScheduledOrderService();
+      if (scheduledOrderService) {
+        await scheduledOrderService.ensureMonitoring();
+      }
 
       logger.info(`Scheduled order #${scheduledOrderId} created for ${scheduledTime.toISOString()} (UTC)`);
 

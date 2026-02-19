@@ -15,12 +15,74 @@ class BrowserManager {
     // Map of userId -> { browser, page, lastActivity, inUse }
     this.userBrowsers = new Map();
 
+    // Global browser for anonymous catalog browsing (shared by all users)
+    this.globalBrowser = null;
+    this.globalPage = null;
+
     // OPTIMIZATION: Keep browser open for 1 day (users don't want to re-login frequently)
     this.INACTIVITY_TIMEOUT = 1 * 24 * 60 * 60 * 1000; // 1 day
 
     // Start cleanup interval (check every 2 minutes for faster resource recovery)
     // DISABLED: User wants browsers to stay open indefinitely
     // this.startCleanupInterval();
+  }
+
+  /**
+   * Initialize global browser for catalog browsing (no login)
+   * Should be called once when bot starts
+   * @returns {Promise<void>}
+   */
+  async initializeGlobalBrowser() {
+    try {
+      logger.system('Initializing global browser for catalog browsing...');
+      
+      const browser = await this.launchBrowser();
+      const page = await browser.newPage();
+
+      // Configure page
+      await page.setDefaultTimeout(30000);
+      await page.setDefaultNavigationTimeout(60000);
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+      // Enable request interception for faster loading
+      await page.setRequestInterception(true);
+      page.on('request', (request) => {
+        const resourceType = request.resourceType();
+        const blockedTypes = ['image', 'font', 'media', 'manifest', 'texttrack', 'eventsource'];
+        if (blockedTypes.includes(resourceType)) {
+          request.abort();
+        } else {
+          request.continue();
+        }
+      });
+
+      this.globalBrowser = browser;
+      this.globalPage = page;
+
+      logger.success('Global browser initialized successfully');
+
+      // Auto-restart if browser crashes
+      browser.on('disconnected', () => {
+        logger.warn('Global browser disconnected, restarting...');
+        setTimeout(() => this.initializeGlobalBrowser(), 2000);
+      });
+
+    } catch (err) {
+      logger.error('Failed to initialize global browser:', err);
+      // Retry after 5 seconds
+      setTimeout(() => this.initializeGlobalBrowser(), 5000);
+    }
+  }
+
+  /**
+   * Get global browser and page (for catalog browsing)
+   * @returns {{browser: Browser, page: Page}} Global browser and page
+   */
+  getGlobalBrowser() {
+    if (!this.globalBrowser || !this.globalBrowser.isConnected()) {
+      throw new Error('Global browser not initialized or disconnected');
+    }
+    return { browser: this.globalBrowser, page: this.globalPage };
   }
 
   /**
@@ -118,6 +180,34 @@ class BrowserManager {
     });
 
     return browser;
+  }
+
+  /**
+   * Navigate to URL using global browser (no login)
+   * @param {string} url - URL to navigate to
+   * @returns {Promise<Page>} Page instance
+   */
+  async navigateToUrlGlobal(url) {
+    const { page } = this.getGlobalBrowser();
+
+    logger.http(`[Global] Navigating to: ${url}`);
+
+    try {
+      await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
+      });
+      return page;
+    } catch (err) {
+      logger.error(`[Global] Navigation failed to ${url}:`, err.message);
+      // Retry once
+      logger.http('[Global] Retrying navigation...');
+      await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 20000
+      });
+      return page;
+    }
   }
 
   /**
@@ -361,6 +451,7 @@ class BrowserManager {
     logger.system('Closing all browser instances...');
     const promises = [];
 
+    // Close all user browsers
     for (const [userId, session] of this.userBrowsers.entries()) {
       promises.push(
         session.browser.close().catch(err =>
@@ -369,8 +460,19 @@ class BrowserManager {
       );
     }
 
+    // Close global browser
+    if (this.globalBrowser && this.globalBrowser.isConnected()) {
+      promises.push(
+        this.globalBrowser.close().catch(err =>
+          logger.error('Error closing global browser:', err.message)
+        )
+      );
+    }
+
     await Promise.all(promises);
     this.userBrowsers.clear();
+    this.globalBrowser = null;
+    this.globalPage = null;
     logger.success('All browsers closed');
   }
 

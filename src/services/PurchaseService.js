@@ -57,12 +57,22 @@ class PurchaseService {
 
   /**
    * Get available cards from game page
-   * @param {number} telegramUserId - Telegram User ID (for browser management)
+   * @param {number|null} telegramUserId - Telegram User ID (for browser management), null to use global browser
    * @param {string} gameUrl - Game catalog URL
+   * @param {boolean} useGlobalBrowser - If true, use global browser for anonymous browsing
    * @returns {Promise<Array>} Array of card options {name, index, disabled}
    */
-  async getAvailableCards(telegramUserId, gameUrl) {
-    const page = await browserManager.navigateToUrl(telegramUserId, gameUrl);
+  async getAvailableCards(telegramUserId, gameUrl, useGlobalBrowser = false) {
+    let page;
+    
+    if (useGlobalBrowser) {
+      // Use global browser for anonymous catalog browsing
+      page = await browserManager.navigateToUrlGlobal(gameUrl);
+      logger.info('[Global Browser] Fetching cards anonymously...');
+    } else {
+      // Use user-specific browser (requires login)
+      page = await browserManager.navigateToUrl(telegramUserId, gameUrl);
+    }
 
     try {
       // Quick page load check - fast loading

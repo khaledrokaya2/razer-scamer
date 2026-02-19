@@ -55,7 +55,7 @@ class RazerScraperService {
       const submitButton = await page.$('button[type="submit"]');
       const innerHTML = await page.evaluate(el => el.innerHTML, submitButton);
       if (innerHTML !== "LOG IN")
-        await page.click('button[type="submit"]');
+        await page.click('button[aria-label="Accept All"]');
       await Promise.all([
         page.click('button[type="submit"]'),
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 })
