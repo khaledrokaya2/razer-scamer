@@ -223,8 +223,7 @@ class OrderFlowHandler {
 
     try {
       const gameMenuMsg = await bot.sendMessage(chatId,
-        `🎮 *SELECT GAME*    \n` +
-        `Choose the game you want:\n`,
+        `🎮 *SELECT GAME*`,
         {
           parse_mode: 'Markdown',
           reply_markup: { inline_keyboard: keyboard }
@@ -260,15 +259,7 @@ class OrderFlowHandler {
     });
 
     await bot.sendMessage(chatId,
-      `🔗 *CUSTOM GAME URL*\n\n` +
-      `Enter the Razer Gold game URL:\n\n` +
-      `✅ *Example:*\n` +
-      `https://gold.razer.com/global/en/gold/catalog/game-name\n\n` +
-      `⚠️ *Requirements:*\n` +
-      `- Must be a Razer Gold URL\n` +
-      `- Must start with https://gold.razer.com\n` +
-      `- Must accept Razer Gold as payment\n\n` +
-      `_Type /start to cancel_`,
+      `🔗 *Enter Razer Gold URL*\n\nExample: https://gold.razer.com/global/en/gold/catalog/game-name\n\n_Type /start to cancel_`,
       { parse_mode: 'Markdown' }
     );
   }
@@ -289,14 +280,7 @@ class OrderFlowHandler {
     // Validate URL format
     if (!urlTrimmed.startsWith('https://gold.razer.com')) {
       try {
-        await bot.sendMessage(chatId,
-          `❌ *INVALID URL*\n\n` +
-          `The URL must be a Razer Gold link.\n\n` +
-          `✅ *Must start with:*\n` +
-          `https://gold.razer.com\n\n` +
-          `Please try again:`,
-          { parse_mode: 'Markdown' }
-        );
+        await bot.sendMessage(chatId, `❌ Invalid URL. Must start with:\nhttps://gold.razer.com`, { parse_mode: 'Markdown' });
       } catch (err) {
         logger.error('Error sending invalid URL message:', err);
       }
@@ -308,12 +292,7 @@ class OrderFlowHandler {
       new URL(urlTrimmed);
     } catch (err) {
       try {
-        await bot.sendMessage(chatId,
-          `❌ *INVALID URL FORMAT*\n\n` +
-          `The URL format is incorrect.\n\n` +
-          `Please enter a valid URL:`,
-          { parse_mode: 'Markdown' }
-        );
+        await bot.sendMessage(chatId, `❌ Invalid URL format.`, { parse_mode: 'Markdown' });
       } catch (sendErr) {
         logger.error('Error sending invalid format message:', sendErr);
       }
@@ -338,12 +317,7 @@ class OrderFlowHandler {
 
     // Show loading message
     const loadingMsg = await bot.sendMessage(chatId,
-      `╔═══════════════════════╗\n` +
-      `   🔄 *LOADING CARDS*    \n` +
-      `╚═══════════════════════╝\n\n` +
-      `⏳ *${gameName}*\n\n` +
-      `Fetching available cards...\n` +
-      `_Please wait..._`,
+      `🔄 *LOADING CARDS*\n🎮 ${gameName}\n\n_Please wait..._`,
       { parse_mode: 'Markdown' }
     );
 
@@ -377,16 +351,8 @@ class OrderFlowHandler {
       ]);
 
       const cardMenuMsg = await bot.sendMessage(chatId,
-        `💎 *SELECT CARD VALUE* \n` +
-        `🎮 *Game:* ${gameName}\n\n` +
-        `Choose a card denomination:\n\n` +
-        `_Out of stock cards will be_\n` +
-        `_monitored and auto-purchased_\n` +
-        `_when available._`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: { inline_keyboard: keyboard }
-        }
+        `💎 *SELECT CARD*\n🎮 ${gameName}\n\n_Out of stock cards will be monitored and auto-purchased when available._`,
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
       );
       // Store message ID for later deletion
       this.cardMenuMessages.set(chatId, cardMenuMsg.message_id);
@@ -402,17 +368,7 @@ class OrderFlowHandler {
       }
 
       // Show error message
-      await bot.sendMessage(chatId,
-        `❌ *ERROR LOADING CARDS*\n\n` +
-        `Could not fetch cards from this URL.\n\n` +
-        `Possible reasons:\n` +
-        `• Invalid game URL\n` +
-        `• Game not available in your region\n` +
-        `• Network error\n\n` +
-        `Please try a different URL or\n` +
-        `choose from the game menu.`,
-        { parse_mode: 'Markdown' }
-      );
+      await bot.sendMessage(chatId, `❌ *Error loading cards*\nInvalid URL or network error\n\nUse /start to retry.`, { parse_mode: 'Markdown' });
 
       this.clearSession(chatId);
     }
@@ -472,9 +428,7 @@ class OrderFlowHandler {
 
     try {
       await bot.sendMessage(chatId,
-        `❌ *ORDER CANCELLED*   \n` +
-        `Your order has been cancelled.\n\n` +
-        `Use /start to create a new order.`
+        `❌ *Order cancelled*\n\nUse /start to create new order`
         , { parse_mode: 'Markdown' });
     } catch (err) {
       logger.error('Error sending cancel message:', err);
@@ -493,11 +447,7 @@ class OrderFlowHandler {
 
     try {
       const cancelMsg = await bot.sendMessage(chatId,
-        `🛑 *CANCELLING ORDER*  \n` +
-        `⏳ Stopping immediately...\n\n` +
-        `_Cards completed so far will be sent_\n` +
-        `_Current card being processed will_\n` +
-        `_finish first for safety_`,
+        `🛑 *Cancelling order...*\n\n_Completed cards will be sent_`,
         { parse_mode: 'Markdown' }
       );
 
@@ -568,12 +518,7 @@ class OrderFlowHandler {
 
     // Show loading message
     const loadingMsg = await bot.sendMessage(chatId,
-      `╔═══════════════════════╗\n` +
-      `   🔄 *LOADING CARDS*    \n` +
-      `╚═══════════════════════╝\n\n` +
-      `⏳ *${game.name}*\n\n` +
-      `Fetching available cards...\n` +
-      `_Please wait..._`,
+      `🔄 *LOADING CARDS*\n🎮 ${game.name}\n\n_Please wait..._`,
       { parse_mode: 'Markdown' }
     );
 
@@ -619,11 +564,8 @@ class OrderFlowHandler {
 
       const cardMenuMsg = await bot.sendMessage(chatId,
         `💎 *SELECT CARD VALUE* \n` +
-        `🎮 *Game:* ${game.name}\n\n` +
-        `Choose a card denomination:\n\n` +
-        `_Out of stock cards will be_\n` +
-        `_monitored and auto-purchased_\n` +
-        `_when available._`,
+        `💎 *SELECT CARD VALUE*\n` +
+        `🎮 ${game.name}`,
         {
           parse_mode: 'Markdown',
           reply_markup: { inline_keyboard: keyboard }
@@ -669,9 +611,7 @@ class OrderFlowHandler {
     if (!session) {
       try {
         await bot.sendMessage(chatId,
-          `⚠️ *SESSION EXPIRED*  \n` +
-          `Your session has timed out.\n\n` +
-          `Use /start to create a new order.`,
+          `⚠️ *SESSION EXPIRED*\n\nUse /start to create new order`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -701,13 +641,9 @@ class OrderFlowHandler {
     // Ask for quantity
     try {
       await bot.sendMessage(chatId,
-        `📦 *ENTER QUANTITY*   \n` +
-        `💎 *Selected Card:*\n` +
-        `     ${cardName.replace(/_/g, ' ')}\n\n` +
-        `How many cards do you want\n` +
-        `to purchase?\n\n` +
-        `📊 *Valid range:* 1 - 100\n\n` +
-        `_Type a number or /start to cancel_`,
+        `📦 *ENTER QUANTITY*\n` +
+        `💎 ${cardName.replace(/_/g, ' ')}\n\n` +
+        `📊 Range: 1-100\n\n_Type number or /start to cancel_`,
         {
           parse_mode: 'Markdown',
         }
@@ -733,13 +669,7 @@ class OrderFlowHandler {
     const quantity = parseInt(text);
 
     if (isNaN(quantity) || quantity < 1 || quantity > 500) {
-      await bot.sendMessage(chatId,
-        `⚠️ *INVALID INPUT*    \n` +
-        `Please enter a valid number\n` +
-        `between *1* and *500*.\n\n` +
-        `_Try again or /start to cancel_`,
-        { parse_mode: 'Markdown' }
-      );
+      await bot.sendMessage(chatId, `⚠️ Invalid. Enter 1-500`, { parse_mode: 'Markdown' });
       return;
     }
 
@@ -757,10 +687,7 @@ class OrderFlowHandler {
 
       if (backupCodeCount === 0) {
         await bot.sendMessage(chatId,
-          `⚠️ *NO BACKUP CODES*\n\n` +
-          `You need to add backup codes first.\n\n` +
-          `Go to: ⚙️ Settings → 🔑 Backup Codes\n\n` +
-          `_Use /start to cancel this order_`,
+          `⚠️ *NO BACKUP CODES*\n\nAdd codes in: ⚙️ Settings → 🔑 Backup Codes\n\n_Use /start to cancel_`,
           { parse_mode: 'Markdown' }
         );
         return;
@@ -769,10 +696,8 @@ class OrderFlowHandler {
       if (backupCodeCount < 5) {
         await bot.sendMessage(chatId,
           `⚠️ *LOW BACKUP CODES*\n\n` +
-          `You only have ${backupCodeCount} backup codes.\n` +
-          `For ${quantity} cards, you may need ${Math.ceil(quantity / 15)} codes.\n\n` +
-          `Recommended: At least 5 codes for safety.\n\n` +
-          `Would you like to continue?`,
+          `You have ${backupCodeCount} codes. For ${quantity} cards, you may need ${Math.ceil(quantity / 15)} codes.\n\n` +
+          `Continue anyway?`,
           {
             parse_mode: 'Markdown',
             reply_markup: {
@@ -833,11 +758,11 @@ class OrderFlowHandler {
     buttons.push([{ text: '❌ Cancel', callback_data: 'order_cancel' }]);
 
     await bot.sendMessage(chatId,
-      `📋 *ORDER SUMMARY*\n\n` +
-      `🎮 Game: ${session.gameName}\n` +
-      `💳 Card: ${session.cardName}\n` +
-      `🔢 Quantity: ${session.quantity}\n\n` +
-      `When would you like to process this order?`,
+      `📋 *ORDER SUMMARY*\n` +
+      `🎮 ${session.gameName}\n` +
+      `💎 ${session.cardName}\n` +
+      `📦 ${session.quantity}\n\n` +
+      `When would you like to process this?`,
       {
         parse_mode: 'Markdown',
         reply_markup: {
@@ -871,17 +796,7 @@ class OrderFlowHandler {
     if (backupCodes.length < 5 || backupCodes.length > 10) {
       try {
         await bot.sendMessage(chatId,
-          `⚠️ *INVALID INPUT*    \n` +
-          `You entered ${backupCodes.length} code(s).\n` +
-          `Please enter between *5 and 10 codes*.\n\n` +
-          `Example:\n` +
-          `12345678\n` +
-          `87654321\n` +
-          `11223344\n` +
-          `44332211\n` +
-          `55667788\n` +
-          `...(up to 10 codes)\n\n` +
-          `Please try again:`,
+          `⚠️ *INVALID INPUT*\n\nEnter 5-10 backup codes (got ${backupCodes.length})\n\nExample:\n12345678\n87654321\n...`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -901,12 +816,7 @@ class OrderFlowHandler {
     if (invalidCodes.length > 0) {
       try {
         await bot.sendMessage(chatId,
-          `⚠️ *INVALID FORMAT*   \n` +
-          `Code(s) at position ${invalidCodes.join(', ')}\n` +
-          `are not valid.\n\n` +
-          `Each backup code must be\n` +
-          `exactly *8 digits*.\n\n` +
-          `Please check and try again:`,
+          `⚠️ *INVALID FORMAT*\n\nCodes at position ${invalidCodes.join(', ')} must be 8 digits\n\nTry again:`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -926,11 +836,7 @@ class OrderFlowHandler {
     if (invalidPatterns.length > 0) {
       try {
         await bot.sendMessage(chatId,
-          `⚠️ *INVALID PATTERN*  \n` +
-          `Code(s) at position ${invalidPatterns.join(', ')}\n` +
-          `have suspicious patterns.\n\n` +
-          `Please enter valid codes\n` +
-          `from your Razer account:`,
+          `⚠️ *INVALID PATTERN*\n\nCodes at position ${invalidPatterns.join(', ')} are invalid patterns\n\nEnter valid codes:`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -944,10 +850,7 @@ class OrderFlowHandler {
     if (uniqueCodes.size !== backupCodes.length) {
       try {
         await bot.sendMessage(chatId,
-          `⚠️ *DUPLICATE CODES*  \n` +
-          `You entered duplicate codes.\n\n` +
-          `Each code must be unique.\n\n` +
-          `Please enter 10 different codes:`,
+          `⚠️ *DUPLICATE CODES*\n\nEach code must be unique\n\nEnter different codes:`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -966,16 +869,11 @@ class OrderFlowHandler {
     // Send ORDER SUMMARY and store message ID for later deletion
     try {
       const summaryMsg = await bot.sendMessage(chatId,
-        `📋 *ORDER SUMMARY*    \n` +
-        `🎮 *Game*\n` +
-        `     ${session.gameName}\n\n` +
-        `💎 *Card Type*\n` +
-        `     ${session.cardName}\n\n` +
-        `📦 *Quantity*\n` +
-        `     ${session.quantity} ${session.quantity === 1 ? 'card' : 'cards'}\n\n` +
-        `⏳ *Processing your order...*\n\n` +
-        `_This may take several minutes_\n` +
-        `_depending on stock availability._`,
+        `📋 *ORDER SUMMARY*\n` +
+        `🎮 ${session.gameName}\n` +
+        `💎 ${session.cardName}\n` +
+        `📦 ${session.quantity} ${session.quantity === 1 ? 'card' : 'cards'}\n\n` +
+        `⏳ *Processing...*`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
@@ -999,11 +897,7 @@ class OrderFlowHandler {
           const progressBar = this.createProgressBar(completed, total);
           const percentage = Math.round((completed / total) * 100);
 
-          const progressText = `⏳ *PURCHASE PROGRESS*   \n` +
-            `${progressBar}\n\n` +
-            `✅ *Completed:* ${completed} / ${total} cards\n` +
-            `📊 *Progress:* ${percentage}%\n\n` +
-            `_Processing... Please wait_`;
+          const progressText = `⏳ *Progress*\n${progressBar}\n\n✅ ${completed}/${total} (📊 ${percentage}%)`;
 
           // Check if we have a previous progress message to edit
           const existingMessageId = this.progressMessages.get(chatId);
@@ -1287,11 +1181,7 @@ class OrderFlowHandler {
 
         try {
           await bot.sendMessage(chatId,
-            `🔐 *RETRY BACKUP CODE* \n` +
-            `The previous backup code\n` +
-            `was invalid or already used.\n\n` +
-            `Please enter a different:\n` +
-            `_Type /start to cancel_`,
+            `🔐 *RETRY BACKUP CODE*\n\nPrevious code invalid. Enter new code.\n\n_Type /start to cancel_`,
             { parse_mode: 'Markdown' }
           );
         } catch (sendErr) {
@@ -1343,9 +1233,7 @@ class OrderFlowHandler {
       if (!credentials || !credentials.email || !credentials.password) {
         await bot.sendMessage(
           chatId,
-          '⚠️ *No Credentials Found*\n\n' +
-          'Please add your Razer credentials first.\n\n' +
-          'Use: /settings to add your Razer ID',
+          '⚠️ *No Credentials*\n\nAdd Razer credentials in /settings',
           { parse_mode: 'Markdown' }
         );
         this.clearSession(chatId);
@@ -1353,7 +1241,7 @@ class OrderFlowHandler {
       }
 
       // Show login progress
-      const loginMsg = await bot.sendMessage(chatId, '⏳ *Logging in...*\n\nPreparing browser session...', { parse_mode: 'Markdown' });
+      const loginMsg = await bot.sendMessage(chatId, '⏳ *Logging in...*', { parse_mode: 'Markdown' });
 
       try {
         logger.info(`Auto-login for purchase: User ${telegramUserId}`);
@@ -1389,9 +1277,7 @@ class OrderFlowHandler {
 
         await bot.sendMessage(
           chatId,
-          '❌ *Login Failed*\n\n' +
-          'Could not login to Razer.\n\n' +
-          'Please check your credentials using /settings',
+          '❌ *Login Failed*\n\nCheck credentials in /settings',
           { parse_mode: 'Markdown' }
         );
         this.clearSession(chatId);
@@ -1443,11 +1329,7 @@ class OrderFlowHandler {
             const progressBar = this.createProgressBar(completed, total);
             const percentage = Math.round((completed / total) * 100);
 
-            const progressText = `⏳ *PURCHASE PROGRESS*   \n` +
-              `${progressBar}\n\n` +
-              `✅ *Completed:* ${completed} / ${total} cards\n` +
-              `📊 *Progress:* ${percentage}%\n\n` +
-              `_Processing... Please wait_`;
+            const progressText = `⏳ *Progress*\n${progressBar}\n\n✅ ${completed}/${total} (📊 ${percentage}%)`;
 
             // Check if we have a previous progress message to edit
             const existingMessageId = this.progressMessages.get(chatId);
@@ -1675,14 +1557,9 @@ class OrderFlowHandler {
 
     await bot.sendMessage(chatId,
       `⏰ *SCHEDULE ORDER*\n\n` +
-      `Enter the date and time when you\n` +
-      `want this order to be processed.\n\n` +
       `Format: DD/MM HH\n` +
       `Example: 20/02 14\n\n` +
-      `📍 Current Egypt time:\n` +
-      `\`${currentEgyptTime}\`\n\n` +
-      `⚠️ Use Egypt time (Cairo timezone)\n` +
-      `_Year auto-added (${nowEgypt.getUTCFullYear()})_\n\n` +
+      `📍 Current Egypt time: \`${currentEgyptTime}\`\n\n` +
       `_Use /start to cancel_`,
       { parse_mode: 'Markdown' }
     );
@@ -1709,9 +1586,7 @@ class OrderFlowHandler {
       if (!match) {
         await bot.sendMessage(chatId,
           `❌ *INVALID FORMAT*\n\n` +
-          `Please use: DD/MM HH\n` +
-          `Example: 20/02 14\n\n` +
-          `⏰ Use Egypt time (Cairo)\n\n` +
+          `Use: DD/MM HH (Example: 20/02 14)\n\n` +
           `_Try again or /start to cancel_`,
           { parse_mode: 'Markdown' }
         );
@@ -1745,8 +1620,7 @@ class OrderFlowHandler {
 
         await bot.sendMessage(chatId,
           `❌ *INVALID TIME*\n\n` +
-          `Scheduled time must be in the future.\n\n` +
-          `Current Egypt time:\n${displayTime}\n\n` +
+          `Must be in future. Current Egypt time: ${displayTime}\n\n` +
           `_Try again or /start to cancel_`,
           { parse_mode: 'Markdown' }
         );
@@ -1758,9 +1632,7 @@ class OrderFlowHandler {
       const maxTime = new Date(Date.now() + maxDays * 24 * 60 * 60 * 1000);
       if (scheduledTime > maxTime) {
         await bot.sendMessage(chatId,
-          `❌ *TOO FAR AHEAD*\n\n` +
-          `Maximum scheduling: ${maxDays} days.\n\n` +
-          `_Try again or /start to cancel_`,
+          `❌ *TOO FAR AHEAD*\n\nMax: ${maxDays} days\n\n_Try again or /start to cancel_`,
           { parse_mode: 'Markdown' }
         );
         return;
@@ -1793,18 +1665,13 @@ class OrderFlowHandler {
       const egyptTimeStr = `${egyptDisplayTime.getUTCFullYear()}-${String(egyptDisplayTime.getUTCMonth() + 1).padStart(2, '0')}-${String(egyptDisplayTime.getUTCDate()).padStart(2, '0')} ${String(egyptDisplayTime.getUTCHours()).padStart(2, '0')}:${String(egyptDisplayTime.getUTCMinutes()).padStart(2, '0')}`;
 
       await bot.sendMessage(chatId,
-        `✅ *ORDER SCHEDULED*\n\n` +
-        `Order ID: #${scheduledOrderId}\n` +
-        `Scheduled for:\n` +
+        `✅ *ORDER SCHEDULED* #${scheduledOrderId}\n\n` +
         `📍 ${egyptTimeStr} (Egypt time)\n` +
         `🌍 ${scheduledTime.toISOString().slice(0, 16).replace('T', ' ')} (UTC)\n\n` +
         `🎮 ${session.gameName}\n` +
-        `💳 ${session.cardName}\n` +
-        `🔢 Quantity: ${session.quantity}\n\n` +
-        `The order will be automatically\n` +
-        `processed at the scheduled time.\n\n` +
-        `You'll receive notifications when\n` +
-        `it starts and completes.\n\n` +
+        `💎 ${session.cardName}\n` +
+        `🔢 ${session.quantity}\n\n` +
+        `You'll be notified when it starts.\n\n` +
         `Use /start to return to menu.`,
         { parse_mode: 'Markdown' }
       );

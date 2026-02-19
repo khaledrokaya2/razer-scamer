@@ -56,9 +56,7 @@ class OrderHistoryHandler {
 
       if (totalOrders === 0) {
         await bot.sendMessage(chatId,
-          `📋 *ORDER HISTORY*    \n\n` +
-          `You have no orders yet.\n\n` +
-          `Use /start to create your first order.`,
+          `📋 *No orders yet*\nUse /start`,
           { parse_mode: 'Markdown' }
         );
         return;
@@ -85,17 +83,14 @@ class OrderHistoryHandler {
 
       // Format order details
       const orderMessage =
-        `📋 *ORDER HISTORY*    \n\n` +
-        `🆔 *Order ID:* #${order.id}\n` +
-        `📅 *Date:* ${new Date(order.created_at).toLocaleString()}\n` +
-        `🎮 *Game:* ${order.game_name}\n` +
-        `💎 *Card:* ${order.card_value}\n\n` +
-        `📦 *Details:*\n` +
-        `   Total Cards: ${order.cards_count}\n` +
-        `   ✅ Success: ${successCount}\n` +
-        `   ❌ Failed: ${failedCount}\n\n` +
-        `📊 *Status:* ${order.status}\n\n` +
-        `Page ${currentPage + 1} of ${totalOrders}`;
+        `📋 *ORDER* #${order.id}\n` +
+        `📅 ${new Date(order.created_at).toLocaleString()}\n` +
+        `🎮 ${order.game_name}\n` +
+        `💎 ${order.card_value}\n` +
+        `📦 ${order.cards_count} cards\n` +
+        `✅ ${successCount} | ❌ ${failedCount}\n` +
+        `📊 ${order.status}\n\n` +
+        `Page ${currentPage + 1}/${totalOrders}`;
 
       // Create navigation buttons
       const buttons = [];
@@ -130,11 +125,7 @@ class OrderHistoryHandler {
 
     } catch (err) {
       logger.error('Error showing order history:', err);
-      await bot.sendMessage(chatId,
-        `❌ Error loading order history.\n\n` +
-        `Please try again later.`,
-        { parse_mode: 'Markdown' }
-      );
+      await bot.sendMessage(chatId, `❌ Error loading history.`, { parse_mode: 'Markdown' });
     }
   }
 
@@ -209,13 +200,10 @@ class OrderHistoryHandler {
 
         if (oldSuccessfulPurchases.length > 0 && successfulPurchases.length === 0) {
           // Old order - PINs were never stored in database
-          await bot.sendMessage(chatId,
-            `⚠️ No successful purchases found for this order.`,
-            { parse_mode: 'Markdown' }
-          );
+          await bot.sendMessage(chatId, `⚠️ No PINs available.`, { parse_mode: 'Markdown' });
         } else {
           // No successful purchases at all
-          await bot.sendMessage(chatId, '⚠️ No successful purchases found for this order.');
+          await bot.sendMessage(chatId, '⚠️ No PINs available.');
         }
         return;
       }
@@ -253,10 +241,10 @@ class OrderHistoryHandler {
       // Send file to user
       await bot.sendDocument(chatId, filepath, {
         caption:
-          `📥 *PINs for Order #${orderId}*\n\n` +
-          `🎮 Game: ${order.game_name}\n` +
-          `💎 Card: ${order.card_value}\n` +
-          `✅ Total PINs: ${pins.length}`,
+          `📥 *Order #${orderId} PINs*\n` +
+          `🎮 ${order.game_name}\n` +
+          `💎 ${order.card_value}\n` +
+          `✅ ${pins.length} PINs`,
         parse_mode: 'Markdown',
         contentType: 'text/plain'
       });
@@ -270,10 +258,7 @@ class OrderHistoryHandler {
 
     } catch (err) {
       logger.error('Error generating PIN file:', err);
-      await bot.sendMessage(chatId,
-        `❌ Error generating PIN file.\n\n` +
-        `Please try again later.`
-      );
+      await bot.sendMessage(chatId, `❌ Error generating file.`);
     }
   }
 

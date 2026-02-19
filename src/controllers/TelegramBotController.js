@@ -157,24 +157,14 @@ class TelegramBotController {
     try {
       // Block if user is currently logging in
       if (this.usersLoggingIn.has(telegramUserId)) {
-        return this.bot.sendMessage(
-          chatId,
-          '⏳ *Please wait...*\n\nLogin in progress. Try again in a moment.',
-          { parse_mode: 'Markdown' }
-        );
+        return this.bot.sendMessage(chatId, '⏳ Login in progress...');
       }
 
       // Check if user is authorized (whitelist check)
       const authResult = await authService.checkAuthorization(chatId);
 
       if (!authResult.authorized) {
-        return this.bot.sendMessage(
-          chatId,
-          '⛔ **Access Denied**\n\n' +
-          'You are not authorized to use this bot.\n' +
-          'Please contact the administrator to request access.',
-          { parse_mode: 'Markdown' }
-        );
+        return this.bot.sendMessage(chatId, '⛔ Access denied. Contact admin.');
       }
 
       // Check if user has credentials
@@ -182,13 +172,7 @@ class TelegramBotController {
       const credentials = await db.getUserCredentials(telegramUserId);
 
       if (!credentials || !credentials.email || !credentials.password) {
-        return this.bot.sendMessage(
-          chatId,
-          '⚠️ *No Credentials Found*\n\n' +
-          'Please add your Razer credentials first.\n\n' +
-          'Use: /settings to add your Razer ID',
-          { parse_mode: 'Markdown' }
-        );
+        return this.bot.sendMessage(chatId, '⚠️ *No credentials*\nUse /settings', { parse_mode: 'Markdown' });
       }
 
       // Initialize order flow and show game selection directly
@@ -197,10 +181,7 @@ class TelegramBotController {
       await orderFlowHandler.showGameSelection(this.bot, chatId);
     } catch (err) {
       logger.error('Error in /start command:', err);
-      this.bot.sendMessage(
-        chatId,
-        '❌ System Error. Please try again later.'
-      );
+      this.bot.sendMessage(chatId, '❌ Error. Try again later.');
     }
   }
 
@@ -239,7 +220,7 @@ class TelegramBotController {
       this.usersLoggingIn.add(telegramUserId);
 
       // Show login message
-      const loginMsg = await this.bot.sendMessage(chatId, '🔐 *Logging you in...*\n\nPlease wait...', { parse_mode: 'Markdown' });
+      const loginMsg = await this.bot.sendMessage(chatId, '🔐 Logging in...');
 
       try {
         // Perform login
@@ -247,7 +228,7 @@ class TelegramBotController {
 
         // Delete login message and show success
         await this.bot.deleteMessage(chatId, loginMsg.message_id).catch(() => { });
-        await this.bot.sendMessage(chatId, '✅ *Logged in successfully!*\n\nYou can now use all features.', { parse_mode: 'Markdown' });
+        await this.bot.sendMessage(chatId, '✅ Logged in successfully!');
 
         logger.success(`Auto-login successful for user ${telegramUserId}`);
       } catch (loginErr) {
@@ -255,12 +236,7 @@ class TelegramBotController {
         await this.bot.deleteMessage(chatId, loginMsg.message_id).catch(() => { });
         logger.error(`Auto-login failed for user ${telegramUserId}:`, loginErr.message);
 
-        await this.bot.sendMessage(chatId,
-          '⚠️ *Auto-login failed*\n\n' +
-          'Please check your credentials in Settings.\n' +
-          'You can update them using: ⚙️ Settings → 🔐 Update Razer ID',
-          { parse_mode: 'Markdown' }
-        );
+        await this.bot.sendMessage(chatId, '⚠️ Login failed. Check credentials in /settings');
       }
     } catch (err) {
       logger.error('Error in auto-login:', err);
@@ -288,7 +264,7 @@ class TelegramBotController {
       await this.handleCheckBalanceButton(chatId, telegramUserId);
     } catch (err) {
       logger.error('Error in /check_balance command:', err);
-      this.bot.sendMessage(chatId, '❌ Error checking balance.');
+      this.bot.sendMessage(chatId, '❌ Error.');
     }
   }
 
@@ -323,7 +299,7 @@ class TelegramBotController {
       await orderHistoryHandler.showOrderHistory(this.bot, chatId, telegramUserId);
     } catch (err) {
       logger.error('Error in /transactions command:', err);
-      this.bot.sendMessage(chatId, '❌ Error loading transactions.');
+      this.bot.sendMessage(chatId, '❌ Error.');
     }
   }
 
@@ -345,7 +321,7 @@ class TelegramBotController {
       await this.handleSettingsMenu(chatId);
     } catch (err) {
       logger.error('Error in /settings command:', err);
-      this.bot.sendMessage(chatId, '❌ Error opening settings.');
+      this.bot.sendMessage(chatId, '❌ Error.');
     }
   }
 
@@ -369,13 +345,7 @@ class TelegramBotController {
       const credentials = await db.getUserCredentials(telegramUserId);
 
       if (!credentials || !credentials.email || !credentials.password) {
-        return this.bot.sendMessage(
-          chatId,
-          '⚠️ *No Credentials Found*\n\n' +
-          'Please add your Razer credentials first.\n\n' +
-          'Use: /settings to add your Razer ID',
-          { parse_mode: 'Markdown' }
-        );
+        return this.bot.sendMessage(chatId, '⚠️ No credentials. Use /settings to add Razer ID.');
       }
 
       // Initialize order flow and show game selection
@@ -386,7 +356,7 @@ class TelegramBotController {
       await orderFlowHandler.showGameSelection(this.bot, chatId);
     } catch (err) {
       logger.error('Error in /schedule command:', err);
-      this.bot.sendMessage(chatId, '❌ Error starting schedule flow.');
+      this.bot.sendMessage(chatId, '❌ Error.');
     }
   }
 
@@ -416,14 +386,12 @@ class TelegramBotController {
 
       await this.bot.sendMessage(
         chatId,
-        `ℹ️ *ACCOUNT INFO*\n\n` +
-        `📧 *Razer Email:*\n\`${email}\`\n\n` +
-        `🔑 *Active Backup Codes:* ${backupCodeCount}/10`,
+        `📝 *ACCOUNT INFO*\n📧 ${email}\n🔑 Codes: ${backupCodeCount}/10`,
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
       logger.error('Error in /info command:', err);
-      this.bot.sendMessage(chatId, '❌ Error getting account info.');
+      this.bot.sendMessage(chatId, '❌ Error.');
     }
   }
 
@@ -482,15 +450,12 @@ class TelegramBotController {
 
       await this.bot.sendMessage(
         chatId,
-        '✅ *Operation Cancelled*\n\n' +
-        'All current operations have been cancelled.\n' +
-        'Bot is ready for new commands.\n\n' +
-        'Use /start to create a new order.',
+        '✅ *Cancelled*\nUse /start for new order.',
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
       logger.error('Error in /cancel command:', err);
-      this.bot.sendMessage(chatId, '❌ Error cancelling operation.');
+      this.bot.sendMessage(chatId, '❌ Error.');
     }
   }
 
@@ -508,9 +473,7 @@ class TelegramBotController {
     if (this.processingCallbacks.has(lockKey)) {
       logger.bot(`Callback already processing: ${lockKey}`);
       try {
-        await this.bot.answerCallbackQuery(query.id, {
-          text: 'Please wait, processing your previous request...'
-        });
+        await this.bot.answerCallbackQuery(query.id, { text: '⏳ Processing...' });
       } catch (err) {
         logger.warn('Could not answer duplicate callback');
       }
@@ -522,10 +485,7 @@ class TelegramBotController {
     try {
       // Rate limiting
       if (!this.checkRateLimit(chatId)) {
-        await this.bot.answerCallbackQuery(query.id, {
-          text: 'Please wait a moment before trying again.',
-          show_alert: false
-        });
+        await this.bot.answerCallbackQuery(query.id, { text: '⏳ Wait a moment.', show_alert: false });
         return;
       }
 
@@ -541,10 +501,7 @@ class TelegramBotController {
 
       // Block all interactions if user is currently logging in
       if (this.usersLoggingIn.has(telegramUserId)) {
-        await this.bot.answerCallbackQuery(query.id, {
-          text: '⏳ Please wait... Login in progress.',
-          show_alert: true
-        });
+        await this.bot.answerCallbackQuery(query.id, { text: '⏳ Login in progress...', show_alert: true });
         return;
       }
 
@@ -682,19 +639,13 @@ class TelegramBotController {
                 const credentials = await db.getUserCredentials(telegramUserId);
 
                 if (!credentials || !credentials.email || !credentials.password) {
-                  await this.bot.sendMessage(
-                    chatId,
-                    '⚠️ *No Credentials Found*\\n\\n' +
-                    'Please add your Razer credentials first.\\n\\n' +
-                    'Use: /settings to add your Razer ID',
-                    { parse_mode: 'Markdown' }
-                  );
+                  await this.bot.sendMessage(chatId, '⚠️ No credentials. Use /settings');
                   orderFlowHandler.clearSession(chatId);
                   return;
                 }
 
                 // Show login progress
-                const loginMsg = await this.bot.sendMessage(chatId, '⏳ *Logging in...*\\n\\nPreparing browser session...', { parse_mode: 'Markdown' });
+                const loginMsg = await this.bot.sendMessage(chatId, '⏳ Logging in...');
 
                 try {
                   logger.info(`Auto-login for purchase: User ${telegramUserId}`);
@@ -714,13 +665,7 @@ class TelegramBotController {
                     logger.debug('Could not delete login message');
                   }
 
-                  await this.bot.sendMessage(
-                    chatId,
-                    '❌ *Login Failed*\\n\\n' +
-                    'Could not login to Razer.\\n\\n' +
-                    'Please check your credentials using /settings',
-                    { parse_mode: 'Markdown' }
-                  );
+                  await this.bot.sendMessage(chatId, '❌ Login failed. Check /settings');
                   orderFlowHandler.clearSession(chatId);
                   return;
                 }
@@ -740,19 +685,13 @@ class TelegramBotController {
               const credentials = await db.getUserCredentials(telegramUserId);
 
               if (!credentials || !credentials.email || !credentials.password) {
-                await this.bot.sendMessage(
-                  chatId,
-                  '⚠️ *No Credentials Found*\n\n' +
-                  'Please add your Razer credentials first.\n\n' +
-                  'Use: /settings to add your Razer ID',
-                  { parse_mode: 'Markdown' }
-                );
+                await this.bot.sendMessage(chatId, '⚠️ No credentials. Use /settings');
                 orderFlowHandler.clearSession(chatId);
                 return;
               }
 
               // Show login progress
-              const loginMsg = await this.bot.sendMessage(chatId, '⏳ *Logging in...*\n\nPreparing browser session...', { parse_mode: 'Markdown' });
+              const loginMsg = await this.bot.sendMessage(chatId, '⏳ Logging in...');
 
               try {
                 // Auto-login
@@ -775,13 +714,7 @@ class TelegramBotController {
                   logger.debug('Could not delete login message');
                 }
 
-                await this.bot.sendMessage(
-                  chatId,
-                  '❌ *Login Failed*\n\n' +
-                  'Could not login to Razer.\n\n' +
-                  'Please check your credentials using /settings',
-                  { parse_mode: 'Markdown' }
-                );
+                await this.bot.sendMessage(chatId, '❌ Login failed. Check /settings');
                 orderFlowHandler.clearSession(chatId);
                 return;
               }
@@ -801,7 +734,7 @@ class TelegramBotController {
       }
     } catch (err) {
       logger.error('Error in user callback:', err);
-      await this.safeSendMessage(chatId, '❌ An error occurred. Please try again.');
+      await this.safeSendMessage(chatId, '❌ Error. Try again.');
     }
   }
 
@@ -825,7 +758,7 @@ class TelegramBotController {
 
         try {
           // Use stored credentials for automatic login
-          const loadingMessage = await this.safeSendMessage(chatId, '⏳ Logging in with stored credentials...\n\nPlease wait...');
+          const loadingMessage = await this.safeSendMessage(chatId, '⏳ Logging in...');
 
           try {
             // Decrypt credentials
@@ -860,11 +793,7 @@ class TelegramBotController {
             }
 
             // Notify user and ask for manual login
-            await this.safeSendMessage(
-              chatId,
-              '⚠️ Automatic login failed. Your stored credentials may be outdated.\n\n' +
-              'Please update your credentials using the ⚙️ Update Credentials menu option.'
-            );
+            await this.safeSendMessage(chatId, '⚠️ Login failed. Update credentials in /settings');
 
             return;
           }
@@ -884,11 +813,11 @@ class TelegramBotController {
       sessionManager.updateState(chatId, 'awaiting_email');
 
       // Ask for email
-      this.bot.sendMessage(chatId, '📧 Please enter your Razer account email:');
+      this.bot.sendMessage(chatId, '📧 Enter your Razer email:');
 
     } catch (err) {
       logger.error('Error in login button handler:', err);
-      await this.safeSendMessage(chatId, '❌ An error occurred. Please try again.');
+      await this.safeSendMessage(chatId, '❌ Error. Try again.');
     }
   }
 
@@ -904,20 +833,14 @@ class TelegramBotController {
     // Check if user has credentials first
     const credentials = await db.getUserCredentials(telegramUserId);
     if (!credentials || !credentials.email || !credentials.password) {
-      return this.bot.sendMessage(
-        chatId,
-        '⚠️ *No Credentials Found*\n\n' +
-        'Please add your Razer credentials first.\n\n' +
-        'Use: /settings to add your Razer ID',
-        { parse_mode: 'Markdown' }
-      );
+      return this.bot.sendMessage(chatId, '⚠️ *No credentials*\nUse /settings', { parse_mode: 'Markdown' });
     }
 
     // Mark balance check as in progress
     this.balanceCheckInProgress.add(telegramUserId);
 
     // Show loading message
-    const loadingMsg = await this.bot.sendMessage(chatId, '⏳ *Checking Balance*\n\nLogging in and retrieving data...', { parse_mode: 'Markdown' });
+    const loadingMsg = await this.bot.sendMessage(chatId, '⏳ Checking balance...');
 
     try {
       // Auto-login: Create browser session if doesn't exist
@@ -969,9 +892,7 @@ class TelegramBotController {
       // Send balance information
       await this.bot.sendMessage(
         chatId,
-        `💰 *Your Razer Balance:*\n\n` +
-        `🥇 Gold: ${balance.gold}\n` +
-        `🥈 Silver: ${balance.silver}`,
+        `💰 *Balance*\n🥇 Gold: ${balance.gold}\n🥈 Silver: ${balance.silver}`,
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
@@ -987,16 +908,7 @@ class TelegramBotController {
       // Only send error message if not cancelled
       // If user was removed from balanceCheckInProgress, it means /cancel was used
       if (this.balanceCheckInProgress.has(telegramUserId)) {
-        await this.bot.sendMessage(
-          chatId,
-          '❌ *Failed to check balance*\n\n' +
-          'Possible reasons:\n' +
-          '• Invalid credentials\n' +
-          '• Network error\n' +
-          '• Razer website issue\n\n' +
-          'Please try again or update your credentials using /settings',
-          { parse_mode: 'Markdown' }
-        );
+        await this.bot.sendMessage(chatId, '❌ Failed to check balance. Try /settings');
       }
 
       // Close browser on error (if not already closed by cancel)
@@ -1024,7 +936,7 @@ class TelegramBotController {
     // Block all interactions if user is currently logging in
     if (this.usersLoggingIn.has(telegramUserId)) {
       try {
-        await this.bot.sendMessage(chatId, '⏳ *Please wait...*\n\nLogin in progress. Try again in a moment.', { parse_mode: 'Markdown' });
+        await this.bot.sendMessage(chatId, '⏳ Login in progress...');
       } catch (err) {
         logger.warn('Could not send login-in-progress message');
       }
@@ -1091,10 +1003,7 @@ class TelegramBotController {
       );
     } catch (err) {
       logger.error('Error during logout:', err);
-      await this.safeSendMessage(
-        chatId,
-        '❌ Error during logout. Please try again.'
-      );
+      await this.safeSendMessage(chatId, '❌ Logout error.');
     }
   }
 
@@ -1113,8 +1022,7 @@ class TelegramBotController {
 
     await this.bot.sendMessage(
       chatId,
-      '⚙️ **SETTINGS MENU**\n\n' +
-      'Choose what you want to update:',
+      '⚙️ *SETTINGS*\nChoose what to update:',
       { parse_mode: 'Markdown', reply_markup: keyboard }
     );
   }
@@ -1133,16 +1041,7 @@ class TelegramBotController {
 
       await this.bot.sendMessage(
         chatId,
-        `🔑 **BACKUP CODES MANAGEMENT**\n\n` +
-        `Current active codes: ${count}/10\n\n` +
-        `Enter your 10 backup codes (one per line).\n` +
-        `This will replace any existing codes.\n\n` +
-        `Example:\n` +
-        `12345678\n` +
-        `87654321\n` +
-        `23456789\n` +
-        `...(7 more)\n\n` +
-        `⚠️ Each code must be exactly 8 digits.`,
+        `🔑 *BACKUP CODES* (${count}/10)\nEnter 10 codes, one per line\nExample: 12345678\n\u26a0️ Must be 8 digits each`,
         { parse_mode: 'Markdown' }
       );
 
@@ -1154,7 +1053,7 @@ class TelegramBotController {
 
     } catch (err) {
       logger.error('Error showing backup codes menu:', err);
-      await this.bot.sendMessage(chatId, '❌ Error accessing backup codes. Please try again.');
+      await this.bot.sendMessage(chatId, '❌ Error. Try again.');
     }
   }
 
@@ -1175,14 +1074,7 @@ class TelegramBotController {
 
       // Validate count
       if (codes.length !== 10) {
-        await this.bot.sendMessage(
-          chatId,
-          `❌ **INVALID INPUT**\n\n` +
-          `You entered ${codes.length} code(s).\n` +
-          `Please enter exactly 10 backup codes.\n\n` +
-          `Try again or /start to cancel.`,
-          { parse_mode: 'Markdown' }
-        );
+        await this.bot.sendMessage(chatId, `❌ Invalid. Need exactly 10 codes (got ${codes.length})`);
         return;
       }
 
@@ -1195,41 +1087,21 @@ class TelegramBotController {
       }
 
       if (invalidCodes.length > 0) {
-        await this.bot.sendMessage(
-          chatId,
-          `❌ **INVALID FORMAT**\n\n` +
-          `Invalid codes found:\n${invalidCodes.join('\n')}\n\n` +
-          `Each code must be exactly 8 digits.\n\n` +
-          `Try again or /start to cancel.`,
-          { parse_mode: 'Markdown' }
-        );
+        await this.bot.sendMessage(chatId, `❌ Invalid format:\n${invalidCodes.join('\n')}\nMust be 8 digits each`);
         return;
       }
 
       // Save to database
       await db.saveBackupCodes(telegramUserId, codes);
 
-      await this.bot.sendMessage(
-        chatId,
-        `✅ **BACKUP CODES SAVED**\n\n` +
-        `Your 10 backup codes have been\n` +
-        `securely encrypted and saved.\n\n` +
-        `They will be used automatically\n` +
-        `during purchases.\n\n` +
-        `Use /start to return to menu.`,
-        { parse_mode: 'Markdown' }
-      );
+      await this.bot.sendMessage(chatId, '✅ *Saved*\nCodes encrypted and ready. Use /start', { parse_mode: 'Markdown' });
 
       // Clear session
       sessionManager.updateState(chatId, 'idle');
 
     } catch (err) {
       logger.error('Error saving backup codes:', err);
-      await this.bot.sendMessage(
-        chatId,
-        '❌ **ERROR**\n\nFailed to save backup codes.\nPlease try again.',
-        { parse_mode: 'Markdown' }
-      );
+      await this.bot.sendMessage(chatId, '❌ Failed to save. Try again.');
     }
   }
 
@@ -1255,9 +1127,7 @@ class TelegramBotController {
 
     this.bot.sendMessage(
       chatId,
-      '⚙️ **Update Credentials**\n\n' +
-      'Please enter your Razer account email:\n\n' +
-      '⚠️ Your credentials will be encrypted and stored securely.',
+      '⚙️ *Update Credentials*\nEnter your Razer email:',
       { parse_mode: 'Markdown', reply_markup: keyboard }
     );
   }
@@ -1281,11 +1151,7 @@ class TelegramBotController {
       ]
     };
 
-    this.bot.sendMessage(
-      chatId,
-      '🔑 Please enter your Razer account password:',
-      { reply_markup: keyboard }
-    );
+    this.bot.sendMessage(chatId, '🔑 Enter your Razer password:', { reply_markup: keyboard });
   }
 
   /**
@@ -1299,12 +1165,7 @@ class TelegramBotController {
     // Reset session state
     sessionManager.updateState(chatId, 'idle');
 
-    await this.safeSendMessage(
-      chatId,
-      '❌ **Credential Update Cancelled**\n\n' +
-      'The credential update process has been cancelled.',
-      { parse_mode: 'Markdown' }
-    );
+    await this.safeSendMessage(chatId, '❌ Cancelled');
   }
 
   /**
@@ -1351,10 +1212,7 @@ class TelegramBotController {
       sessionManager.clearCredentials(chatId);
       sessionManager.updateState(chatId, 'idle');
 
-      await this.safeSendMessage(
-        chatId,
-        '❌ Failed to save credentials. Please try again later.'
-      );
+      await this.safeSendMessage(chatId, '❌ Failed to save credentials.');
     }
   }
 
@@ -1371,7 +1229,7 @@ class TelegramBotController {
     sessionManager.updateState(chatId, 'awaiting_password');
 
     // Ask for password
-    this.bot.sendMessage(chatId, '🔑 Please enter your Razer account password:');
+    this.bot.sendMessage(chatId, '🔑 Enter your Razer password:');
   }
 
   /**
@@ -1393,7 +1251,7 @@ class TelegramBotController {
 
     try {
       // Show loading message
-      const logginMessage = await this.safeSendMessage(chatId, '⏳ Logging in to Razer...\n\nPlease wait...');
+      const logginMessage = await this.safeSendMessage(chatId, '⏳ Logging in...');
 
       try {
         // Attempt login (use telegramUserId as browser session key)
@@ -1428,11 +1286,7 @@ class TelegramBotController {
             logger.warn('Could not delete loading message');
           }
         }
-        await this.safeSendMessage(
-          chatId,
-          '✅ Logged in successfully!\n\n' +
-          '💾 Your credentials have been saved for automatic login next time.'
-        );
+        await this.safeSendMessage(chatId, '✅ Logged in!\n💾 Credentials saved.');
 
       } catch (err) {
         logger.error('Login error:', err);
@@ -1442,12 +1296,8 @@ class TelegramBotController {
 
         await this.safeSendMessage(
           chatId,
-          '❌ Login failed. Please check your credentials and try again.',
-          {
-            reply_markup: {
-              inline_keyboard: [[{ text: '🔐 Login', callback_data: 'login' }]]
-            }
-          }
+          '❌ Login failed. Check credentials.',
+          { reply_markup: { inline_keyboard: [[{ text: '🔐 Login', callback_data: 'login' }]] } }
         );
 
         // Reset session state and close browser

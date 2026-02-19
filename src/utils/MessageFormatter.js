@@ -16,11 +16,7 @@ class MessageFormatter {
    * @returns {string} - Formatted message
    */
   formatOrderComplete(order, validPinCount) {
-    return `✅ *ORDER COMPLETED*\n` +
-           `🆔 *Order ID:* #${order.id}\n\n` +
-           `✅ Successfully purchased: ${validPinCount} card(s)\n` +
-           `📥 Total ordered: ${order.cards_count} card(s)\n\n` +
-           `Your PINs will be sent below.`;
+    return `✅ *Complete* #${order.id}\n✅ ${validPinCount} cards\nPINs below`;
   }
 
   /**
@@ -31,20 +27,14 @@ class MessageFormatter {
    * @returns {string} - Formatted message
    */
   formatOrderCancelled(order, successfulCards, failedCards = 0) {
-    let message = `🛑 *ORDER CANCELLED*\n` +
-                  `🆔 *Order ID:* #${order.id}\n\n` +
-                  `✅ ${successfulCards} card(s) completed\n`;
-    
+    let message = `🛑 *Cancelled* #${order.id}\n✅ ${successfulCards} done`;
+
     if (failedCards > 0) {
-      message += `❌ ${failedCards} card(s) failed\n`;
+      message += `\n❌ ${failedCards} failed`;
     }
-    
-    message += `⏹️ Remaining cards not processed\n\n`;
-    
-    if (successfulCards > 0) {
-      message += `Your completed PINs will be sent below.`;
-    }
-    
+
+    message += `\n⏹️ Rest not processed`;
+
     return message;
   }
 
@@ -53,9 +43,7 @@ class MessageFormatter {
    * @returns {string} - Formatted message
    */
   formatOrderCancelledNoCards() {
-    return `🛑 *ORDER CANCELLED*\n` +
-           `No cards were processed.\n\n` +
-           `Use /start to create a new order.`;
+    return '🛑 *Cancelled*\nNo cards processed.';
   }
 
   /**
@@ -65,9 +53,7 @@ class MessageFormatter {
    */
   formatRemainingCards(remaining) {
     if (remaining <= 0) return null;
-    
-    return `ℹ️ ${remaining} card(s) were not processed.\n\n` +
-           `Use /start to create a new order.`;
+    return `ℹ️ ${remaining} not processed. Use /start`;
   }
 
   /**
@@ -86,12 +72,12 @@ class MessageFormatter {
    */
   formatScheduledOrderStart(order, scheduledTime) {
     return `⏰ *SCHEDULED ORDER EXECUTION*\n\n` +
-           `🆔 Order ID: #${order.id}\n` +
-           `🎮 Game: ${order.game_name}\n` +
-           `💵 Card Value: $${order.card_value}\n` +
-           `🔢 Quantity: ${order.cards_count} card(s)\n` +
-           `⏰ Scheduled: ${scheduledTime}\n\n` +
-           `Starting purchase process...`;
+      `🆔 Order ID: #${order.id}\n` +
+      `🎮 Game: ${order.game_name}\n` +
+      `💵 Card Value: $${order.card_value}\n` +
+      `🔢 Quantity: ${order.cards_count} card(s)\n` +
+      `⏰ Scheduled: ${scheduledTime}\n\n` +
+      `Starting purchase process...`;
   }
 
   /**
@@ -103,11 +89,7 @@ class MessageFormatter {
    * @returns {string} - Formatted message
    */
   formatScheduledOrderComplete(result, validPinCount) {
-    return `✅ *SCHEDULED ORDER COMPLETED*\n` +
-           `🆔 *Order ID:* #${result.order.id}\n\n` +
-           `✅ Successfully purchased: ${validPinCount} card(s)\n` +
-           `📥 Total ordered: ${result.order.cards_count} card(s)\n\n` +
-           `Your PINs will be sent below.`;
+    return `✅ *Scheduled Complete* #${result.order.id}\n✅ ${validPinCount} cards\nPINs below`;
   }
 
   /**
@@ -120,15 +102,15 @@ class MessageFormatter {
   formatProgress(completed, total, status = '') {
     const percentage = Math.round((completed / total) * 100);
     const bar = this.generateProgressBar(percentage);
-    
+
     let message = `⏳ *PROCESSING ORDER*\n\n` +
-                  `${bar} ${percentage}%\n\n` +
-                  `✅ Completed: ${completed}/${total} cards\n`;
-    
+      `${bar} ${percentage}%\n\n` +
+      `✅ Completed: ${completed}/${total} cards\n`;
+
     if (status) {
       message += `📍 Status: ${status}`;
     }
-    
+
     return message;
   }
 
@@ -152,17 +134,17 @@ class MessageFormatter {
    */
   formatOrderSummary(order, action = 'buy_now') {
     let message = `📋 *ORDER SUMMARY*\n\n` +
-                  `🎮 Game: ${order.game_name}\n` +
-                  `💵 Card Value: $${order.card_value}\n` +
-                  `🔢 Quantity: ${order.cards_count} card(s)\n` +
-                  `💰 Total: $${(order.card_value * order.cards_count).toFixed(2)}\n\n`;
-    
+      `🎮 Game: ${order.game_name}\n` +
+      `💵 Card Value: $${order.card_value}\n` +
+      `🔢 Quantity: ${order.cards_count} card(s)\n` +
+      `💰 Total: $${(order.card_value * order.cards_count).toFixed(2)}\n\n`;
+
     if (action === 'schedule') {
       message += `⏰ Type: Scheduled Order\n\n`;
     }
-    
+
     message += `Choose an action:`;
-    
+
     return message;
   }
 
@@ -172,9 +154,9 @@ class MessageFormatter {
    */
   format2FAPrompt() {
     return `🔐 *2FA CODE REQUIRED*\n\n` +
-           `Enter the 6-digit code from\n` +
-           `your authenticator app:\n\n` +
-           `_Use /start to cancel_`;
+      `Enter the 6-digit code from\n` +
+      `your authenticator app:\n\n` +
+      `_Use /start to cancel_`;
   }
 
   /**
@@ -183,8 +165,8 @@ class MessageFormatter {
    */
   formatBackupCodePrompt() {
     return `🔐 *BACKUP CODE REQUIRED*\n\n` +
-           `Enter one of your Razer backup codes:\n\n` +
-           `_Use /start to cancel_`;
+      `Enter one of your Razer backup codes:\n\n` +
+      `_Use /start to cancel_`;
   }
 
   /**
@@ -203,7 +185,7 @@ class MessageFormatter {
       'extracting_pin': '📝 Extracting PIN...',
       'verifying': '✅ Verifying...'
     };
-    
+
     const label = stageLabels[stage] || stage;
     return `Card ${cardNumber}/${total}: ${label}`;
   }
@@ -226,15 +208,15 @@ class MessageFormatter {
    */
   formatScheduleTimePrompt(currentEgyptTime) {
     return `⏰ *SCHEDULE ORDER*\n\n` +
-           `Enter the date and time when you\n` +
-           `want this order to be processed.\n\n` +
-           `Format: YYYY-MM-DD HH:MM\n` +
-           `Example: 2026-02-20 14:30\n\n` +
-           `📍 Current Egypt time:\n` +
-           `\`${currentEgyptTime}\`\n\n` +
-           `⚠️ Use Egypt time (Cairo timezone)\n` +
-           `_Works on any server location_\n\n` +
-           `_Use /start to cancel_`;
+      `Enter the date and time when you\n` +
+      `want this order to be processed.\n\n` +
+      `Format: YYYY-MM-DD HH:MM\n` +
+      `Example: 2026-02-20 14:30\n\n` +
+      `📍 Current Egypt time:\n` +
+      `\`${currentEgyptTime}\`\n\n` +
+      `⚠️ Use Egypt time (Cairo timezone)\n` +
+      `_Works on any server location_\n\n` +
+      `_Use /start to cancel_`;
   }
 
   /**
@@ -245,14 +227,14 @@ class MessageFormatter {
    */
   formatScheduleConfirmation(order, egyptTimeFormatted) {
     return `✅ *ORDER SCHEDULED*\n\n` +
-           `🆔 Order ID: #${order.id}\n` +
-           `🎮 Game: ${order.game_name}\n` +
-           `💵 Card Value: $${order.card_value}\n` +
-           `🔢 Quantity: ${order.cards_count} card(s)\n` +
-           `⏰ Scheduled Time: ${egyptTimeFormatted}\n\n` +
-           `Your order will be processed automatically\n` +
-           `at the scheduled time.\n\n` +
-           `Use /history to view your orders.`;
+      `🆔 Order ID: #${order.id}\n` +
+      `🎮 Game: ${order.game_name}\n` +
+      `💵 Card Value: $${order.card_value}\n` +
+      `🔢 Quantity: ${order.cards_count} card(s)\n` +
+      `⏰ Scheduled Time: ${egyptTimeFormatted}\n\n` +
+      `Your order will be processed automatically\n` +
+      `at the scheduled time.\n\n` +
+      `Use /history to view your orders.`;
   }
 }
 

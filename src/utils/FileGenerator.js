@@ -46,17 +46,17 @@ class FileGenerator {
   generatePinWithSerialContent(pins) {
     const filteredPins = this.filterValidPins(pins);
     let content = '';
-    
+
     filteredPins.forEach((pin, index) => {
       const serialNum = pin.serialNumber || 'N/A';
       content += `${pin.pinCode}\n${serialNum}\n`;
-      
+
       // Add blank line between cards for better separation
       if (index < filteredPins.length - 1) {
         content += '\n';
       }
     });
-    
+
     return content;
   }
 
@@ -95,15 +95,11 @@ class FileGenerator {
    */
   generateCaption(orderId, format, isPartial = false) {
     const partialLabel = isPartial ? ' (Partial)' : '';
-    
+
     if (format === 'with_serial') {
-      return `📄 *PIN Codes + Serial Numbers*\n` +
-             `Order #${orderId}${partialLabel}\n\n` +
-             `Format: PIN on first line, Serial on second line`;
+      return `📄 *PINs + Serials*\nOrder #${orderId}${partialLabel}`;
     } else {
-      return `📄 *PIN Codes Only*\n` +
-             `Order #${orderId}${partialLabel}\n\n` +
-             `Format: One PIN per line`;
+      return `📄 *PINs Only*\nOrder #${orderId}${partialLabel}`;
     }
   }
 
@@ -155,7 +151,7 @@ class FileGenerator {
     try {
       // Filter out FAILED cards
       const filteredPins = this.filterValidPins(pins);
-      
+
       if (filteredPins.length === 0) {
         logger.warn(`FileGenerator: No valid PINs to send for order ${orderId}`);
         return;
@@ -168,33 +164,33 @@ class FileGenerator {
       const fileName1 = this.generateFileName(orderId, 'with_serial', isPartial);
       const content1 = this.generatePinWithSerialContent(filteredPins);
       const filePath1 = this.writeFile(fileName1, content1);
-      
+
       await bot.sendDocument(chatId, filePath1, {
         caption: this.generateCaption(orderId, 'with_serial', isPartial),
         parse_mode: 'Markdown',
         contentType: 'text/plain'
       });
-      
+
       this.deleteFile(filePath1);
 
       // 2. Generate and send PIN-only file
       const fileName2 = this.generateFileName(orderId, 'only', isPartial);
       const content2 = this.generatePinOnlyContent(filteredPins);
       const filePath2 = this.writeFile(fileName2, content2);
-      
+
       await bot.sendDocument(chatId, filePath2, {
         caption: this.generateCaption(orderId, 'only', isPartial),
         parse_mode: 'Markdown',
         contentType: 'text/plain'
       });
-      
+
       this.deleteFile(filePath2);
 
       logger.info(`FileGenerator: Successfully sent PIN files for order ${orderId}`);
 
     } catch (err) {
       logger.error('FileGenerator: Error sending PIN files:', err);
-      
+
       // Fallback to plain text messages if file sending fails
       if (formatPinsPlain && typeof formatPinsPlain === 'function') {
         try {

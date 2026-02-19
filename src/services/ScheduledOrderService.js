@@ -192,20 +192,69 @@ class ScheduledOrderService {
       // Update status to 'processing'
       await db.updateScheduledOrderStatus(id, 'processing');
 
+      // Auto-login if no browser session exists
+      const browserManager = require('./BrowserManager');
+      const hasActiveBrowser = browserManager.hasActiveBrowser(telegram_user_id);
+
+      if (!hasActiveBrowser) {
+        logger.info(`ScheduledOrderService: No active browser session for user ${telegram_user_id}, performing auto-login`);
+
+        // Get user credentials
+        const credentials = await db.getUserCredentials(telegram_user_id);
+
+        if (!credentials || !credentials.email || !credentials.password) {
+          logger.error(`ScheduledOrderService: No credentials found for user ${telegram_user_id}`);
+
+          // Update order status to failed
+          await db.updateScheduledOrderStatus(id, 'failed');
+
+          // Notify user
+          try {
+            await this.bot.sendMessage(chat_id,
+              `❌ *Scheduled Order Failed*\n🆔 #${id}\n\n⚠️ No credentials found\nAdd credentials in /settings`,
+              { parse_mode: 'Markdown' }
+            );
+          } catch (notifyErr) {
+            logger.error(`Could not send notification to user ${telegram_user_id}`);
+          }
+          return;
+        }
+
+        // Perform auto-login
+        const scraperService = require('./RazerScraperService');
+
+        try {
+          logger.info(`ScheduledOrderService: Logging in user ${telegram_user_id}`);
+          await scraperService.login(telegram_user_id, credentials.email, credentials.password);
+          logger.success(`ScheduledOrderService: Auto-login successful for user ${telegram_user_id}`);
+        } catch (loginErr) {
+          logger.error(`ScheduledOrderService: Auto-login failed for user ${telegram_user_id}:`, loginErr);
+
+          // Update order status to failed
+          await db.updateScheduledOrderStatus(id, 'failed');
+
+          // Notify user
+          try {
+            await this.bot.sendMessage(chat_id,
+              `❌ *Scheduled Order Failed*\n🆔 #${id}\n\n⚠️ Login failed\nCheck credentials in /settings`,
+              { parse_mode: 'Markdown' }
+            );
+          } catch (notifyErr) {
+            logger.error(`Could not send notification to user ${telegram_user_id}`);
+          }
+          return;
+        }
+      }
+
       // Send notification to user that order is starting (with cancel button)
       try {
         const startMsg = await this.bot.sendMessage(chat_id,
-          `⏰ *SCHEDULED ORDER STARTING*\n\n` +
-          `🎮 Game: ${game_name}\n` +
-          `💳 Card: ${card_name}\n` +
-          `🔢 Quantity: ${quantity}\n\n` +
-          `⏳ Processing your order...\n` +
-          `This may take several minutes.`,
+          `⏰ *Scheduled Order*\n🎮 ${game_name}\n💎 ${card_name}\n📦 Qty: ${quantity}\n\n⏳ Processing...`,
           {
             parse_mode: 'Markdown',
             reply_markup: {
               inline_keyboard: [[
-                { text: '🛑 Cancel Order', callback_data: 'scheduled_cancel_' + chat_id }
+                { text: '🛑 Cancel', callback_data: 'scheduled_cancel_' + chat_id }
               ]]
             }
           }
@@ -228,11 +277,7 @@ class ScheduledOrderService {
             const progressBar = this.createProgressBar(completed, total);
             const percentage = Math.round((completed / total) * 100);
 
-            const progressText = `⏳ *PURCHASE PROGRESS*   \n` +
-              `${progressBar}\n\n` +
-              `✅ *Completed:* ${completed} / ${total} cards\n` +
-              `📊 *Progress:* ${percentage}%\n\n` +
-              `_Processing... Please wait_`;
+            const progressText = `⏳ *Progress*\n${progressBar}\n✅ ${completed}/${total} (📊 ${percentage}%)`;
 
             // Check if we have a previous progress message to edit
             const existingMessageId = this.progressMessages.get(chat_id);
@@ -361,12 +406,9 @@ class ScheduledOrderService {
             }
 
             await this.bot.sendMessage(chat_id,
-              `🛑 *SCHEDULED ORDER CANCELLED*   \n` +
-              `🆔 *Order ID:* #${err.partialOrder.order.id}\n\n` +
-              `✅ ${err.partialOrder.pins.length - failedCards} card(s) completed\n` +
-              (failedCards > 0 ? `❌ ${failedCards} card(s) failed\n` : '') +
-              `⏹️ Remaining cards not processed\n\n` +
-              `Your completed PINs will be sent below.`,
+              `🛑 *Cancelled* #${err.partialOrder.order.id}\n✅ ${err.partialOrder.pins.length - failedCards} done` +
+              (failedCards > 0 ? `\n❌ ${failedCards} failed` : '') +
+              `\n⏹️ Rest not processed`,
               { parse_mode: 'Markdown' }
             );
 
@@ -376,11 +418,7 @@ class ScheduledOrderService {
 
             const remaining = err.partialOrder.order.cards_count - err.partialOrder.order.completed_purchases;
             if (remaining > 0) {
-              await this.bot.sendMessage(chat_id,
-                `ℹ️ ${remaining} card(s) were not processed.\n\n` +
-                `Use /start to create a new order.`,
-                { parse_mode: 'Markdown' }
-              );
+              await this.bot.sendMessage(chat_id, `ℹ️ ${remaining} not processed. Use /start for new order.`);
             }
           } else {
             // No purchases completed
@@ -402,12 +440,7 @@ class ScheduledOrderService {
               }
             }
 
-            await this.bot.sendMessage(chat_id,
-              `🛑 *SCHEDULED ORDER CANCELLED*   \n` +
-              `No cards were processed.\n\n` +
-              `Use /start to create a new order.`,
-              { parse_mode: 'Markdown' }
-            );
+            await this.bot.sendMessage(chat_id, '🛑 *Cancelled*\nNo cards processed.');
           }
         } catch (sendErr) {
           logger.error('Error sending cancellation message:', sendErr);
@@ -434,9 +467,7 @@ class ScheduledOrderService {
         // Use ErrorHandler for consistent error handling (SOLID principle)
         const friendlyError = errorHandler.getUserFriendlyError(err);
         await this.bot.sendMessage(chat_id,
-          `❌ *SCHEDULED ORDER FAILED*\n\n` +
-          friendlyError + `\n\n` +
-          `Please try creating a new order with /start`,
+          `❌ *Scheduled Failed*\n${friendlyError}\nUse /start for new order.`,
           { parse_mode: 'Markdown' }
         );
       } catch (notifyErr) {

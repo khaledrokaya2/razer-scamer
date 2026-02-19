@@ -85,10 +85,7 @@ class ErrorHandler {
    * @returns {string} - Formatted error message
    */
   formatSessionExpiredError() {
-    return `🔐 *SESSION EXPIRED*\n\n` +
-           `Your Razer session has expired.\n` +
-           `Please update credentials in Settings.\n\n` +
-           `Use /settings to update.`;
+    return `🔐 *Session Expired*\nUpdate credentials in /settings`;
   }
 
   /**
@@ -96,10 +93,7 @@ class ErrorHandler {
    * @returns {string} - Formatted error message
    */
   formatInvalidBackupCodeError() {
-    return `🔐 *BACKUP CODE ERROR*\n\n` +
-           `All backup codes are invalid or used.\n` +
-           `Please add new backup codes in Settings.\n\n` +
-           `Use /settings to update.`;
+    return `🔐 *Backup Code Error*\nAdd new codes in /settings`;
   }
 
   /**
@@ -107,11 +101,7 @@ class ErrorHandler {
    * @returns {string} - Formatted error message
    */
   formatStockNotAvailableError() {
-    return `📦 *OUT OF STOCK*\n\n` +
-           `The requested card is currently\n` +
-           `not available.\n\n` +
-           `Please try again later or choose\n` +
-           `a different card value.`;
+    return `📦 *Out of Stock*\nTry again later or choose different card.`;
   }
 
   /**
@@ -119,10 +109,7 @@ class ErrorHandler {
    * @returns {string} - Formatted error message
    */
   formatNetworkError() {
-    return `🌐 *NETWORK ERROR*\n\n` +
-           `Unable to connect to Razer.\n\n` +
-           `Please check your internet connection\n` +
-           `and try again.`;
+    return `🌐 *Network Error*\nCheck connection and retry.`;
   }
 
   /**
@@ -130,10 +117,7 @@ class ErrorHandler {
    * @returns {string} - Formatted error message
    */
   formatPaymentMethodNotFoundError() {
-    return `💳 *PAYMENT METHOD ERROR*\n\n` +
-           `Unable to find payment method.\n\n` +
-           `Please check your Razer account\n` +
-           `settings and try again.`;
+    return `💳 *Payment Method Error*\nCheck Razer account settings.`;
   }
 
   /**
@@ -141,11 +125,7 @@ class ErrorHandler {
    * @returns {string} - Formatted error message
    */
   format2FAError() {
-    return `🔐 *2FA ERROR*\n\n` +
-           `Unable to complete 2FA verification.\n\n` +
-           `Please try again. If the problem\n` +
-           `persists, update your backup codes\n` +
-           `in Settings.`;
+    return `🔐 *2FA Error*\nRetry or update backup codes in /settings`;
   }
 
   /**
@@ -154,10 +134,7 @@ class ErrorHandler {
    * @returns {string} - Formatted error message
    */
   formatPurchaseFailedError(err) {
-    return `❌ *PURCHASE FAILED*\n\n` +
-           `Unable to complete purchase.\n\n` +
-           `Reason: ${err.message || 'Unknown error'}\n\n` +
-           `Please try again or contact support.`;
+    return `❌ *Purchase Failed*\n${err.message || 'Unknown error'}\nRetry or contact support.`;
   }
 
   /**
@@ -167,12 +144,7 @@ class ErrorHandler {
    */
   formatGenericError(err) {
     const errorMsg = err.message || 'Unknown error occurred';
-    
-    return `❌ *ERROR*\n\n` +
-           `Something went wrong:\n\n` +
-           `${errorMsg}\n\n` +
-           `Please try again. If the problem\n` +
-           `persists, use /start to restart.`;
+    return `❌ *Error*\n${errorMsg}\nUse /start to restart.`;
   }
 
   /**
