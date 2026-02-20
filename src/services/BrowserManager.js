@@ -95,6 +95,14 @@ class BrowserManager {
 
       logger.success('Global browser logged in successfully');
 
+      // Navigate to gold.razer.com to establish session (login was on razerid subdomain)
+      logger.system('Navigating to gold.razer.com to establish session...');
+      await page.goto('https://gold.razer.com/global/en', {
+        waitUntil: 'domcontentloaded',
+        timeout: 15000
+      });
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for session cookies
+
       this.globalBrowser = browser;
       this.globalPage = page;
 

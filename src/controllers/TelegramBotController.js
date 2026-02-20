@@ -630,96 +630,12 @@ class TelegramBotController {
               await orderFlowHandler.showOrderConfirmation(this.bot, chatId);
             } else {
               // Instant purchase mode: start buying immediately
-              // Auto-login if no browser session exists
-              const browserManager = require('../services/BrowserManager');
-              const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
-
-              if (!hasActiveBrowser) {
-                const db = require('../services/DatabaseService');
-                const credentials = await db.getUserCredentials(telegramUserId);
-
-                if (!credentials || !credentials.email || !credentials.password) {
-                  await this.bot.sendMessage(chatId, '⚠️ No credentials. Use /settings');
-                  orderFlowHandler.clearSession(chatId);
-                  return;
-                }
-
-                // Show login progress
-                const loginMsg = await this.bot.sendMessage(chatId, '⏳ Logging in...');
-
-                try {
-                  logger.info(`Auto-login for purchase: User ${telegramUserId}`);
-                  await scraperService.login(telegramUserId, credentials.email, credentials.password);
-
-                  try {
-                    await this.bot.deleteMessage(chatId, loginMsg.message_id);
-                  } catch (delErr) {
-                    logger.debug('Could not delete login message');
-                  }
-                } catch (loginErr) {
-                  logger.error('Auto-login failed for purchase:', loginErr);
-
-                  try {
-                    await this.bot.deleteMessage(chatId, loginMsg.message_id);
-                  } catch (delErr) {
-                    logger.debug('Could not delete login message');
-                  }
-
-                  await this.bot.sendMessage(chatId, '❌ Login failed. Check /settings');
-                  orderFlowHandler.clearSession(chatId);
-                  return;
-                }
-              }
-
+              // Parallel purchases create their own browsers - no need for pre-login
               await orderFlowHandler.handleBuyNow(this.bot, chatId, telegramUserId);
             }
 
           } else if (callbackData === 'order_buy_now') {
-            // Auto-login if no browser session exists
-            const browserManager = require('../services/BrowserManager');
-            const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
-
-            if (!hasActiveBrowser) {
-              // Get user credentials
-              const db = require('../services/DatabaseService');
-              const credentials = await db.getUserCredentials(telegramUserId);
-
-              if (!credentials || !credentials.email || !credentials.password) {
-                await this.bot.sendMessage(chatId, '⚠️ No credentials. Use /settings');
-                orderFlowHandler.clearSession(chatId);
-                return;
-              }
-
-              // Show login progress
-              const loginMsg = await this.bot.sendMessage(chatId, '⏳ Logging in...');
-
-              try {
-                // Auto-login
-                logger.info(`Auto-login for purchase: User ${telegramUserId}`);
-                await scraperService.login(telegramUserId, credentials.email, credentials.password);
-
-                // Delete login message
-                try {
-                  await this.bot.deleteMessage(chatId, loginMsg.message_id);
-                } catch (delErr) {
-                  logger.debug('Could not delete login message');
-                }
-              } catch (loginErr) {
-                logger.error('Auto-login failed for purchase:', loginErr);
-
-                // Delete login message
-                try {
-                  await this.bot.deleteMessage(chatId, loginMsg.message_id);
-                } catch (delErr) {
-                  logger.debug('Could not delete login message');
-                }
-
-                await this.bot.sendMessage(chatId, '❌ Login failed. Check /settings');
-                orderFlowHandler.clearSession(chatId);
-                return;
-              }
-            }
-
+            // Parallel purchases create their own browsers - no need for pre-login
             await orderFlowHandler.handleBuyNow(this.bot, chatId, telegramUserId);
 
           } else if (callbackData === 'order_schedule') {

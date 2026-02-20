@@ -1289,6 +1289,14 @@ class PurchaseService {
 
         logger.success(`${label} Logged in successfully`);
 
+        // Navigate to gold.razer.com to establish session (login was on razerid subdomain)
+        logger.debug(`${label} Navigating to gold.razer.com to establish session...`);
+        await page.goto('https://gold.razer.com/global/en', {
+          waitUntil: 'domcontentloaded',
+          timeout: 15000
+        });
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for session cookies
+
         // Step 3: Process cards from queue until empty
         let cardsProcessed = 0;
         while (true) {
