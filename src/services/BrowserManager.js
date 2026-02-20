@@ -28,7 +28,7 @@ class BrowserManager {
   }
 
   /**
-   * Initialize global browser for catalog browsing (no login)
+   * Initialize global browser for catalog browsing (with login)
    * Should be called once when bot starts
    * @returns {Promise<void>}
    */
@@ -44,27 +44,6 @@ class BrowserManager {
       await page.setDefaultNavigationTimeout(60000);
       await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-      // Stealth mode - hide headless indicators
-      await page.evaluateOnNewDocument(() => {
-        // Override navigator.webdriver
-        Object.defineProperty(navigator, 'webdriver', {
-          get: () => false
-        });
-
-        // Override chrome object
-        window.chrome = {
-          runtime: {}
-        };
-
-        // Override permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-          parameters.name === 'notifications' ?
-            Promise.resolve({ state: Notification.permission }) :
-            originalQuery(parameters)
-        );
-      });
-
       // Enable request interception for faster loading
       await page.setRequestInterception(true);
       page.on('request', (request) => {
@@ -77,10 +56,49 @@ class BrowserManager {
         }
       });
 
+      // Login to Razer to access global region content
+      logger.system('Logging in to global browser...');
+      const LOGIN_URL = 'https://razerid.razer.com';
+      const email = 'mostloda14@gmail.com';
+      const password = 'vvt?Zr54S%Xe+Wp';
+
+      await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+      // Wait for login form
+      await page.waitForSelector('#input-login-email', { visible: true, timeout: 8000 });
+      await page.waitForSelector('#input-login-password', { visible: true, timeout: 8000 });
+
+      // Type credentials
+      await page.type('#input-login-email', email, { delay: 50 });
+      await page.type('#input-login-password', password, { delay: 50 });
+
+      // Handle cookie consent if present
+      try {
+        await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 2000 });
+        await page.click('button[aria-label="Accept All"]');
+        await new Promise(resolve => setTimeout(resolve, 150));
+      } catch (err) {
+        // No cookie banner - that's fine
+      }
+
+      // Submit login form
+      await Promise.all([
+        page.click('button[type="submit"]'),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 })
+      ]);
+
+      // Verify login success
+      const currentUrl = page.url();
+      if (currentUrl === 'https://razerid.razer.com' || currentUrl === 'https://razerid.razer.com/') {
+        throw new Error('Global browser login failed - check credentials');
+      }
+
+      logger.success('Global browser logged in successfully');
+
       this.globalBrowser = browser;
       this.globalPage = page;
 
-      logger.success('Global browser initialized successfully');
+      logger.success('Global browser initialized and ready');
 
       // Auto-restart if browser crashes
       browser.on('disconnected', () => {
@@ -132,27 +150,6 @@ class BrowserManager {
 
     // Set user agent to avoid detection
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-    // Stealth mode - hide headless indicators
-    await page.evaluateOnNewDocument(() => {
-      // Override navigator.webdriver
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => false
-      });
-
-      // Override chrome object
-      window.chrome = {
-        runtime: {}
-      };
-
-      // Override permissions
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-          Promise.resolve({ state: Notification.permission }) :
-          originalQuery(parameters)
-      );
-    });
 
     // Enable request interception to block heavy resources for slow networks
     await page.setRequestInterception(true);
@@ -217,14 +214,8 @@ class BrowserManager {
         '--enable-features=NetworkService,NetworkServiceInProcess',
         '--disable-features=VizDisplayCompositor',
         '--force-prefers-reduced-motion',
-        '--blink-settings=imagesEnabled=false', // Disable images at browser level
-        // Anti-detection
-        '--disable-blink-features=AutomationControlled',
-        '--disable-infobars',
-        '--window-size=1920,1080',
-        '--start-maximized'
-      ],
-      ignoreDefaultArgs: ['--enable-automation']
+        '--blink-settings=imagesEnabled=false' // Disable images at browser level
+      ]
     });
 
     return browser;
@@ -245,30 +236,6 @@ class BrowserManager {
         waitUntil: 'domcontentloaded',
         timeout: 30000
       });
-      // Wait for JavaScript to execute and render dynamic content
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      // Check for geo-redirect (e.g., /global/en/ → /eu/en/)
-      const finalUrl = page.url();
-      if (finalUrl !== url && url.includes('/global/en/')) {
-        // Extract region from redirected URL (e.g., /eu/en/, /us/en/, etc.)
-        const regionMatch = finalUrl.match(/\/([\w-]+)\/([\w-]+)\//);
-        if (regionMatch && !url.includes(regionMatch[0])) {
-          const detectedRegion = `${regionMatch[1]}/${regionMatch[2]}`;
-          logger.warn(`[Global] Geo-redirect detected: /global/en/ → /${detectedRegion}/`);
-
-          // Adjust URL with correct region
-          const correctedUrl = url.replace('/global/en/', `/${detectedRegion}/`);
-          logger.http(`[Global] Navigating to region-corrected URL: ${correctedUrl}`);
-
-          await page.goto(correctedUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000
-          });
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      }
-
       return page;
     } catch (err) {
       logger.error(`[Global] Navigation failed to ${url}:`, err.message);
@@ -278,7 +245,6 @@ class BrowserManager {
         waitUntil: 'domcontentloaded',
         timeout: 20000
       });
-      await new Promise(resolve => setTimeout(resolve, 2000));
       return page;
     }
   }
@@ -300,29 +266,6 @@ class BrowserManager {
         waitUntil: 'domcontentloaded',
         timeout: 30000
       });
-      // Wait for JavaScript to execute and render dynamic content
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      // Check for geo-redirect (e.g., /global/en/ → /eu/en/)
-      const finalUrl = page.url();
-      if (finalUrl !== url && url.includes('/global/en/')) {
-        // Extract region from redirected URL
-        const regionMatch = finalUrl.match(/\/([\w-]+)\/([\w-]+)\//);
-        if (regionMatch && !url.includes(regionMatch[0])) {
-          const detectedRegion = `${regionMatch[1]}/${regionMatch[2]}`;
-          logger.warn(`Geo-redirect detected: /global/en/ → /${detectedRegion}/`);
-
-          // Adjust URL with correct region
-          const correctedUrl = url.replace('/global/en/', `/${detectedRegion}/`);
-          logger.http(`Navigating to region-corrected URL: ${correctedUrl}`);
-
-          await page.goto(correctedUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: 30000
-          });
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      }
 
       // Check if session is still valid (not redirected to login)
       const isSessionValid = await this.checkSessionValid(page);
@@ -330,18 +273,11 @@ class BrowserManager {
         logger.warn(`Session expired for user ${userId}, attempting auto-relogin...`);
         await this.autoRelogin(userId, page);
 
-        // Navigate to original URL after relogin (use region-corrected URL if needed)
-        const finalNavigationUrl = page.url().includes('/global/en/') ?
-          url :
-          page.url().match(/\/([\w-]+)\/([\w-]+)\//) ?
-            url.replace('/global/en/', `/${page.url().match(/\/([\w-]+)\/([\w-]+)\//)[1]}/${page.url().match(/\/([\w-]+)\/([\w-]+)\//)[2]}/`) :
-            url;
-
-        await page.goto(finalNavigationUrl, {
+        // Navigate to original URL after relogin
+        await page.goto(url, {
           waitUntil: 'domcontentloaded',
           timeout: 30000
         });
-        await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       // Update activity after successful navigation

@@ -59,27 +59,26 @@ class PurchaseService {
    * Get available cards from game page
    * @param {number|null} telegramUserId - Telegram User ID (for browser management), null to use global browser
    * @param {string} gameUrl - Game catalog URL
-   * @param {boolean} useGlobalBrowser - If true, use global browser for anonymous browsing
+   * @param {boolean} useGlobalBrowser - If true, use global browser for catalog browsing
    * @returns {Promise<Array>} Array of card options {name, index, disabled}
    */
   async getAvailableCards(telegramUserId, gameUrl, useGlobalBrowser = false) {
     let page;
 
     if (useGlobalBrowser) {
-      // Use global browser for anonymous catalog browsing
+      // Use global browser for catalog browsing
       page = await browserManager.navigateToUrlGlobal(gameUrl);
-      logger.info('[Global Browser] Fetching cards anonymously...');
+      logger.info('[Global Browser] Fetching cards...');
     } else {
       // Use user-specific browser (requires login)
       page = await browserManager.navigateToUrl(telegramUserId, gameUrl);
     }
 
     try {
-      // BrowserManager already waited 2s after domcontentloaded for JS execution
-      logger.http('Verifying page loaded correctly...');
-
-      // Check if page loaded successfully and user is logged in
+      // Wait for page to fully load and JavaScript to execute
+      logger.http('Waiting for page to load...');
       await page.waitForSelector('body', { timeout: 5000 });
+      await new Promise(resolve => setTimeout(resolve, 2000));
 
       // Check for access denied or login required (improved logic)
       const pageStatus = await page.evaluate(() => {
@@ -307,68 +306,6 @@ class PurchaseService {
       });
 
       if (cardsData.cards.length === 0) {
-        // Enhanced debugging for production - capture actual page content
-        logger.error('No cards found - capturing page state for debugging...');
-
-        try {
-          const debugInfo = await page.evaluate(() => {
-            const bodyText = document.body ? document.body.innerText : '';
-            const allRadios = document.querySelectorAll('input[type="radio"]');
-            const radioDetails = Array.from(allRadios).slice(0, 5).map(r => ({
-              name: r.getAttribute('name'),
-              value: r.value,
-              id: r.id,
-              parentText: r.parentElement ? r.parentElement.textContent.substring(0, 50) : ''
-            }));
-
-            return {
-              url: window.location.href,
-              title: document.title,
-              bodyPreview: bodyText.substring(0, 500),
-              radioCount: allRadios.length,
-              radioSample: radioDetails,
-              hasLoginForm: !!document.querySelector('input[type="password"]'),
-              hasAuthError: bodyText.toLowerCase().includes('sign in') || bodyText.toLowerCase().includes('log in') || bodyText.toLowerCase().includes('authenticate'),
-              mainContentHTML: document.querySelector('main')?.innerHTML.substring(0, 1000) || 'No main element'
-            };
-          });
-
-          logger.error('DEBUG - Page State:');
-          logger.error(`  URL: ${debugInfo.url}`);
-          logger.error(`  Title: ${debugInfo.title}`);
-          logger.error(`  Total Radio Buttons: ${debugInfo.radioCount}`);
-          logger.error(`  Has Login Form: ${debugInfo.hasLoginForm}`);
-          logger.error(`  Needs Auth: ${debugInfo.hasAuthError}`);
-          logger.error(`  Body Preview: ${debugInfo.bodyPreview}`);
-          logger.error(`  Radio Sample:`, JSON.stringify(debugInfo.radioSample, null, 2));
-          logger.error(`  Main Content: ${debugInfo.mainContentHTML}`);
-
-          // Save HTML to file for debugging in production
-          const fs = require('fs');
-          const path = require('path');
-          const debugDir = path.join(process.cwd(), 'debug');
-
-          // Create debug directory if it doesn't exist
-          if (!fs.existsSync(debugDir)) {
-            fs.mkdirSync(debugDir, { recursive: true });
-          }
-
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const htmlPath = path.join(debugDir, `page_${timestamp}.html`);
-          const screenshotPath = path.join(debugDir, `screenshot_${timestamp}.png`);
-
-          const fullHTML = await page.content();
-          fs.writeFileSync(htmlPath, fullHTML);
-          logger.error(`  Full page HTML saved to: ${htmlPath}`);
-
-          // Take screenshot
-          await page.screenshot({ path: screenshotPath, fullPage: true });
-          logger.error(`  Screenshot saved to: ${screenshotPath}`);
-
-        } catch (debugErr) {
-          logger.error('Failed to capture debug info:', debugErr.message);
-        }
-
         throw new Error('No cards found. The page might not have loaded properly or the game might not be available.');
       }
 
@@ -457,18 +394,6 @@ class PurchaseService {
       if (!isSameGame) {
         logger.debug('Not on game page, navigating...');
         await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-
-        // Check for geo-redirect and correct URL if needed
-        const finalUrl = page.url();
-        if (finalUrl !== gameUrl && gameUrl.includes('/global/en/') && !finalUrl.includes(targetGameId)) {
-          const regionMatch = finalUrl.match(/\/([\w-]+)\/([\w-]+)\//);
-          if (regionMatch) {
-            const correctedUrl = gameUrl.replace('/global/en/', `/${regionMatch[1]}/${regionMatch[2]}/`);
-            logger.warn(`Geo-redirect detected, navigating to: ${correctedUrl}`);
-            await page.goto(correctedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-          }
-        }
-
         logger.debug(`Navigated to: ${page.url()}`);
         // Wait for JavaScript to render content
         await new Promise(resolve => setTimeout(resolve, 2000));
