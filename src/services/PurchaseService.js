@@ -1178,11 +1178,12 @@ class PurchaseService {
     // Determine number of browsers to use (min of quantity and max browsers)
     const browserCount = Math.min(quantity, MAX_BROWSERS);
 
-    // Get user credentials for login (same credentials for all browsers)
-    const credentials = await db.getUserCredentials(telegramUserId);
-    if (!credentials || !credentials.email || !credentials.password) {
-      throw new Error('No Razer credentials found. Please login first.');
-    }
+    // Use global credentials for all browsers to avoid geo-restrictions
+    // (Production server in EU gets redirected, need global account access)
+    const credentials = {
+      email: 'mostloda14@gmail.com',
+      password: 'vvt?Zr54S%Xe+Wp'
+    };
     const sharedState = {
       cardQueue: Array.from({ length: quantity }, (_, i) => i + 1), // [1, 2, 3, ..., quantity]
       purchases: [],
