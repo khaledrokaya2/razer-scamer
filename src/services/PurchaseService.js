@@ -307,6 +307,68 @@ class PurchaseService {
       });
 
       if (cardsData.cards.length === 0) {
+        // Enhanced debugging for production - capture actual page content
+        logger.error('No cards found - capturing page state for debugging...');
+        
+        try {
+          const debugInfo = await page.evaluate(() => {
+            const bodyText = document.body ? document.body.innerText : '';
+            const allRadios = document.querySelectorAll('input[type="radio"]');
+            const radioDetails = Array.from(allRadios).slice(0, 5).map(r => ({
+              name: r.getAttribute('name'),
+              value: r.value,
+              id: r.id,
+              parentText: r.parentElement ? r.parentElement.textContent.substring(0, 50) : ''
+            }));
+            
+            return {
+              url: window.location.href,
+              title: document.title,
+              bodyPreview: bodyText.substring(0, 500),
+              radioCount: allRadios.length,
+              radioSample: radioDetails,
+              hasLoginForm: !!document.querySelector('input[type="password"]'),
+              hasAuthError: bodyText.toLowerCase().includes('sign in') || bodyText.toLowerCase().includes('log in') || bodyText.toLowerCase().includes('authenticate'),
+              mainContentHTML: document.querySelector('main')?.innerHTML.substring(0, 1000) || 'No main element'
+            };
+          });
+          
+          logger.error('DEBUG - Page State:');
+          logger.error(`  URL: ${debugInfo.url}`);
+          logger.error(`  Title: ${debugInfo.title}`);
+          logger.error(`  Total Radio Buttons: ${debugInfo.radioCount}`);
+          logger.error(`  Has Login Form: ${debugInfo.hasLoginForm}`);
+          logger.error(`  Needs Auth: ${debugInfo.hasAuthError}`);
+          logger.error(`  Body Preview: ${debugInfo.bodyPreview}`);
+          logger.error(`  Radio Sample:`, JSON.stringify(debugInfo.radioSample, null, 2));
+          logger.error(`  Main Content: ${debugInfo.mainContentHTML}`);
+          
+          // Save HTML to file for debugging in production
+          const fs = require('fs');
+          const path = require('path');
+          const debugDir = path.join(process.cwd(), 'debug');
+          
+          // Create debug directory if it doesn't exist
+          if (!fs.existsSync(debugDir)) {
+            fs.mkdirSync(debugDir, { recursive: true });
+          }
+          
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const htmlPath = path.join(debugDir, `page_${timestamp}.html`);
+          const screenshotPath = path.join(debugDir, `screenshot_${timestamp}.png`);
+          
+          const fullHTML = await page.content();
+          fs.writeFileSync(htmlPath, fullHTML);
+          logger.error(`  Full page HTML saved to: ${htmlPath}`);
+          
+          // Take screenshot
+          await page.screenshot({ path: screenshotPath, fullPage: true });
+          logger.error(`  Screenshot saved to: ${screenshotPath}`);
+          
+        } catch (debugErr) {
+          logger.error('Failed to capture debug info:', debugErr.message);
+        }
+        
         throw new Error('No cards found. The page might not have loaded properly or the game might not be available.');
       }
 
@@ -315,30 +377,6 @@ class PurchaseService {
 
     } catch (err) {
       logger.error('Error getting available cards:', err.message);
-
-      // Enhanced debugging info
-      logger.debug('Page debugging info:');
-      try {
-        const pageInfo = await page.evaluate(() => ({
-          url: window.location.href,
-          title: document.title,
-          hasCardsContainer: !!document.querySelector('#webshop_step_sku'),
-          cardContainers: document.querySelectorAll('.selection-tile').length,
-          radioInputs: document.querySelectorAll('input[type="radio"]').length,
-          allRadioNames: [...document.querySelectorAll('input[type="radio"]')].map(r => r.getAttribute('name')).filter(Boolean),
-          bodyText: document.body ? document.body.textContent.substring(0, 200) : 'No body'
-        }));
-        logger.debug('   URL:', pageInfo.url);
-        logger.debug('   Title:', pageInfo.title);
-        logger.debug('   Cards Container Found:', pageInfo.hasCardsContainer);
-        logger.debug('   Card Containers:', pageInfo.cardContainers);
-        logger.debug('   Radio Inputs:', pageInfo.radioInputs);
-        logger.debug('   Radio Names:', pageInfo.allRadioNames);
-        logger.debug('   Body Preview:', pageInfo.bodyText);
-      } catch (debugErr) {
-        logger.debug('   Could not get page debug info:', debugErr.message);
-      }
-
       throw err;
     }
   }

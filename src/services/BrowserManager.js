@@ -44,6 +44,27 @@ class BrowserManager {
       await page.setDefaultNavigationTimeout(60000);
       await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
+      // Stealth mode - hide headless indicators
+      await page.evaluateOnNewDocument(() => {
+        // Override navigator.webdriver
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => false
+        });
+        
+        // Override chrome object
+        window.chrome = {
+          runtime: {}
+        };
+        
+        // Override permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+          parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission }) :
+            originalQuery(parameters)
+        );
+      });
+
       // Enable request interception for faster loading
       await page.setRequestInterception(true);
       page.on('request', (request) => {
@@ -112,6 +133,27 @@ class BrowserManager {
     // Set user agent to avoid detection
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
+    // Stealth mode - hide headless indicators
+    await page.evaluateOnNewDocument(() => {
+      // Override navigator.webdriver
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => false
+      });
+      
+      // Override chrome object
+      window.chrome = {
+        runtime: {}
+      };
+      
+      // Override permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+    });
+
     // Enable request interception to block heavy resources for slow networks
     await page.setRequestInterception(true);
 
@@ -175,8 +217,14 @@ class BrowserManager {
         '--enable-features=NetworkService,NetworkServiceInProcess',
         '--disable-features=VizDisplayCompositor',
         '--force-prefers-reduced-motion',
-        '--blink-settings=imagesEnabled=false' // Disable images at browser level
-      ]
+        '--blink-settings=imagesEnabled=false', // Disable images at browser level
+        // Anti-detection
+        '--disable-blink-features=AutomationControlled',
+        '--disable-infobars',
+        '--window-size=1920,1080',
+        '--start-maximized'
+      ],
+      ignoreDefaultArgs: ['--enable-automation']
     });
 
     return browser;
