@@ -901,7 +901,7 @@ class PurchaseService {
                     // Success: Navigated away from game page
                     return !currentUrl.includes(gameUrl);
                   },
-                  { timeout: 45000, polling: 300 },
+                  { timeout: 60000, polling: 300 },
                   gameUrl
                 );
 
@@ -1184,6 +1184,7 @@ class PurchaseService {
   /**
    * Process bulk purchases using parallel browsers (up to 10 simultaneous)
    * Based on test.js pipeline pattern for maximum speed
+   * WITH RETRY LOGIC: Handles browser crashes, login failures, and purchase errors
    */
   async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, onProgress, onCardCompleted, checkCancellation }) {
     const db = require('./DatabaseService');
@@ -1192,6 +1193,12 @@ class PurchaseService {
     // Configuration - OPTIMIZED for low resource usage (more browsers, less memory each)
     const MAX_BROWSERS = 10; // Increased to 10 for faster parallel processing
     const LAUNCH_STAGGER_MS = 300; // 300ms stagger - fast parallel launch
+
+    // Retry configuration
+    const MAX_BROWSER_LAUNCH_RETRIES = 3; // Retry browser launch up to 3 times
+    const MAX_LOGIN_RETRIES = 3; // Retry login up to 3 times
+    const MAX_PURCHASE_RETRIES = 2; // Retry each card purchase up to 2 times
+    const RETRY_DELAY_MS = 2000; // Base delay between retries (exponential backoff)
 
     // Determine number of browsers to use (min of quantity and max browsers)
     const browserCount = Math.min(quantity, MAX_BROWSERS);
@@ -1218,8 +1225,162 @@ class PurchaseService {
     logger.purchase(`${'='.repeat(60)}\n`);
 
     /**
+     * Launch browser with retry logic (handles launch failures)
+     */
+    const launchBrowserWithRetry = async (label) => {
+      for (let attempt = 1; attempt <= MAX_BROWSER_LAUNCH_RETRIES; attempt++) {
+        try {
+          logger.debug(`${label} Launching browser (attempt ${attempt}/${MAX_BROWSER_LAUNCH_RETRIES})...`);
+
+          const browser = await puppeteer.launch({
+            headless: true,
+            args: [
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-dev-shm-usage',
+              '--disable-gpu',
+              '--disable-extensions',
+              '--disable-sync',
+              '--disable-translate',
+              '--no-first-run',
+              '--mute-audio',
+              '--disable-blink-features=AutomationControlled',
+              '--incognito',
+              '--js-flags=--max-old-space-size=256'
+            ]
+          });
+
+          const page = await browser.newPage();
+
+          // Configure page
+          await page.setViewport({ width: 1280, height: 720 });
+          await page.setDefaultTimeout(45000);
+          await page.setDefaultNavigationTimeout(60000);
+          await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+          // Request interception
+          await page.setRequestInterception(true);
+          page.on('request', (request) => {
+            const resourceType = request.resourceType();
+            if (resourceType === 'image' || resourceType === 'media') {
+              request.abort();
+            } else {
+              request.continue();
+            }
+          });
+
+          logger.success(`${label} Browser launched successfully`);
+          return { browser, page };
+
+        } catch (err) {
+          logger.error(`${label} Browser launch failed (attempt ${attempt}/${MAX_BROWSER_LAUNCH_RETRIES}): ${err.message}`);
+
+          if (attempt < MAX_BROWSER_LAUNCH_RETRIES) {
+            const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1); // Exponential backoff
+            logger.debug(`${label} Retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          } else {
+            throw new Error(`Failed to launch browser after ${MAX_BROWSER_LAUNCH_RETRIES} attempts: ${err.message}`);
+          }
+        }
+      }
+    };
+
+    /**
+     * Login to Razer with retry logic (handles login failures)
+     */
+    const loginWithRetry = async (label, page) => {
+      for (let attempt = 1; attempt <= MAX_LOGIN_RETRIES; attempt++) {
+        try {
+          logger.debug(`${label} Logging in to Razer (attempt ${attempt}/${MAX_LOGIN_RETRIES})...`);
+
+          // Navigate to login page
+          await page.goto('https://razerid.razer.com', {
+            waitUntil: 'load',
+            timeout: 60000
+          });
+
+          // Wait for login form
+          await page.waitForSelector('#input-login-email', { visible: true, timeout: 15000 });
+          await page.waitForSelector('#input-login-password', { visible: true, timeout: 15000 });
+
+          // Clear any existing values
+          await page.evaluate(() => {
+            const emailInput = document.querySelector('#input-login-email');
+            const passwordInput = document.querySelector('#input-login-password');
+            if (emailInput) emailInput.value = '';
+            if (passwordInput) passwordInput.value = '';
+          });
+
+          // Type credentials
+          await page.type('#input-login-email', credentials.email, { delay: 20 });
+          await page.type('#input-login-password', credentials.password, { delay: 20 });
+
+          // Handle cookie consent
+          try {
+            await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 1500 });
+            await page.click('button[aria-label="Accept All"]');
+          } catch (err) {
+            // No cookie banner
+          }
+
+          // Submit and wait for navigation
+          await Promise.all([
+            page.click('button[type="submit"]'),
+            page.waitForNavigation({ waitUntil: 'load', timeout: 60000 })
+          ]);
+
+          // Verify login success
+          const currentUrl = page.url();
+          if (currentUrl === 'https://razerid.razer.com' || currentUrl === 'https://razerid.razer.com/') {
+            throw new Error('Login failed - still on login page');
+          }
+
+          logger.success(`${label} Logged in successfully`);
+
+          // Navigate to gold.razer.com
+          logger.debug(`${label} Establishing session on gold.razer.com...`);
+          await page.goto('https://gold.razer.com/global/en', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+          });
+          await new Promise(resolve => setTimeout(resolve, 500));
+
+          return true;
+
+        } catch (err) {
+          logger.error(`${label} Login failed (attempt ${attempt}/${MAX_LOGIN_RETRIES}): ${err.message}`);
+
+          if (attempt < MAX_LOGIN_RETRIES) {
+            const delay = RETRY_DELAY_MS * attempt; // Linear backoff for login
+            logger.debug(`${label} Retrying login in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          } else {
+            throw new Error(`Failed to login after ${MAX_LOGIN_RETRIES} attempts: ${err.message}`);
+          }
+        }
+      }
+    };
+
+    /**
+     * Check if browser is still alive and responsive
+     */
+    const isBrowserAlive = async (browser, page) => {
+      try {
+        if (!browser || !browser.isConnected()) return false;
+        if (!page || page.isClosed()) return false;
+
+        // Try a simple operation to verify responsiveness
+        await page.evaluate(() => true);
+        return true;
+      } catch (err) {
+        return false;
+      }
+    };
+
+    /**
      * Single browser session that processes cards from the shared queue
-     * Similar to runSession() in test.js but for purchases instead of balance checks
+     * WITH RETRY LOGIC: Automatically relaunches browser/re-login if needed
      */
     const runPurchaseSession = async (sessionIndex) => {
       const label = `[Browser ${sessionIndex + 1}]`;
@@ -1227,49 +1388,10 @@ class PurchaseService {
       let page = null;
 
       try {
-        // Step 1: Launch browser
-        logger.debug(`${label} Launching browser...`);
-        browser = await puppeteer.launch({
-          headless: true,
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-extensions',
-            '--disable-sync',
-            '--disable-translate',
-            '--no-first-run',
-            '--mute-audio',
-            '--disable-blink-features=AutomationControlled',
-            // Use incognito mode for clean sessions (like anonymous browsing)
-            '--incognito',
-            // Memory optimization (reasonable limits)
-            '--js-flags=--max-old-space-size=256'
-          ]
-        });
-
-        page = await browser.newPage();
-
-        // Configure page with safe timeouts for reliability
-        await page.setViewport({ width: 1280, height: 720 }); // Larger viewport for better rendering
-        await page.setDefaultTimeout(45000); // Increased for reliability
-        await page.setDefaultNavigationTimeout(60000); // Increased for reliability
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-        // Block ONLY images to save bandwidth but allow everything else for proper rendering
-        await page.setRequestInterception(true);
-        page.on('request', (request) => {
-          const resourceType = request.resourceType();
-          // Block ONLY images - allow fonts, stylesheets, scripts for proper page rendering
-          if (resourceType === 'image' || resourceType === 'media') {
-            request.abort();
-          } else {
-            request.continue();
-          }
-        });
-
-        logger.success(`${label} Browser launched successfully`);
+        // Step 1: Launch browser with retry
+        const launchResult = await launchBrowserWithRetry(label);
+        browser = launchResult.browser;
+        page = launchResult.page;
 
         // Register browser for cancellation tracking
         sharedState.browsers.push(browser);
@@ -1278,53 +1400,8 @@ class PurchaseService {
         }
         this.activeBrowsers.get(telegramUserId).push(browser);
 
-        // Step 2: Login to Razer
-        logger.debug(`${label} Logging in to Razer...`);
-
-        // Navigate to login page
-        await page.goto('https://razerid.razer.com', {
-          waitUntil: 'load',
-          timeout: 45000
-        });
-
-        // Wait for login form
-        await page.waitForSelector('#input-login-email', { visible: true, timeout: 15000 });
-        await page.waitForSelector('#input-login-password', { visible: true, timeout: 15000 });
-
-        // Type credentials (faster typing = less waiting)
-        await page.type('#input-login-email', credentials.email, { delay: 20 });
-        await page.type('#input-login-password', credentials.password, { delay: 20 });
-
-        // Handle cookie consent banner if present (no delay after click)
-        try {
-          await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 1500 });
-          await page.click('button[aria-label="Accept All"]');
-        } catch (err) {
-          // No cookie banner - that's fine
-        }
-
-        // Submit login form
-        await Promise.all([
-          page.click('button[type="submit"]'),
-          page.waitForNavigation({ waitUntil: 'load', timeout: 60000 })
-        ]);
-
-        // Verify login success
-        const currentUrl = page.url();
-        if (currentUrl === 'https://razerid.razer.com' || currentUrl === 'https://razerid.razer.com/') {
-          throw new Error('Login failed - wrong credentials or captcha');
-        }
-
-        logger.success(`${label} Logged in successfully`);
-
-        // Navigate to gold.razer.com to establish session (login was on razerid subdomain)
-        logger.debug(`${label} Navigating to gold.razer.com to establish session...`);
-        await page.goto('https://gold.razer.com/global/en', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000
-        });
-        // Short wait for session cookies to sync - page will be reloaded when navigating to game anyway
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Step 2: Login with retry
+        await loginWithRetry(label, page);
 
         // Step 3: Process cards from queue until empty
         let cardsProcessed = 0;
@@ -1334,6 +1411,39 @@ class PurchaseService {
             sharedState.cancelled = true;
             logger.info(`${label} Order cancelled - stopping`);
             break;
+          }
+
+          // CRITICAL: Check if browser is still alive before processing next card
+          const browserAlive = await isBrowserAlive(browser, page);
+          if (!browserAlive) {
+            logger.warn(`${label} Browser crashed or disconnected - relaunching...`);
+
+            try {
+              // Close dead browser if possible
+              if (browser) {
+                try { await browser.close(); } catch (e) { }
+              }
+
+              // Relaunch browser and re-login
+              const launchResult = await launchBrowserWithRetry(label);
+              browser = launchResult.browser;
+              page = launchResult.page;
+
+              // Re-register browser
+              sharedState.browsers.push(browser);
+              if (this.activeBrowsers.has(telegramUserId)) {
+                this.activeBrowsers.get(telegramUserId).push(browser);
+              }
+
+              // Re-login
+              await loginWithRetry(label, page);
+
+              logger.success(`${label} Browser relaunched and logged in`);
+            } catch (relaunchErr) {
+              logger.error(`${label} Failed to relaunch browser: ${relaunchErr.message}`);
+              logger.error(`${label} Stopping this session - other browsers will continue`);
+              break;
+            }
           }
 
           // Get next card from queue (thread-safe due to Node.js single-threaded)
@@ -1346,34 +1456,119 @@ class PurchaseService {
 
           logger.purchase(`${label} Processing card ${cardNumber}/${quantity}...`);
 
-          try {
-            // Get backup code from database
-            const backupCode = await db.getNextBackupCode(telegramUserId);
+          // RETRY LOGIC for individual card purchase
+          let purchaseSuccess = false;
+          let lastError = null;
+          let result = null;
 
-            if (!backupCode) {
-              logger.error(`${label} No more backup codes available`);
-              // Put card back in queue (at the front) so another browser can try
-              sharedState.cardQueue.unshift(cardNumber);
-              throw new Error('No more backup codes available');
+          for (let purchaseAttempt = 1; purchaseAttempt <= MAX_PURCHASE_RETRIES + 1; purchaseAttempt++) {
+            try {
+              // Get backup code from database
+              const backupCode = await db.getNextBackupCode(telegramUserId);
+
+              if (!backupCode) {
+                logger.error(`${label} No more backup codes available`);
+                // Put card back in queue (at the front) so another browser can try
+                sharedState.cardQueue.unshift(cardNumber);
+                throw new Error('No more backup codes available');
+              }
+
+              if (purchaseAttempt > 1) {
+                logger.debug(`${label} Retry ${purchaseAttempt - 1}/${MAX_PURCHASE_RETRIES} for card ${cardNumber}`);
+              }
+
+              logger.debug(`${label} Using backup code for card ${cardNumber}`);
+
+              // Complete the purchase
+              result = await this.completePurchase({
+                telegramUserId,
+                page,
+                gameUrl,
+                cardIndex,
+                backupCode,
+                checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                cardNumber,
+                gameName,
+                cardName
+              });
+
+              // Mark backup code as used
+              await db.markBackupCodeAsUsed(telegramUserId);
+
+              // Purchase completed (success or failed extraction)
+              purchaseSuccess = true;
+              break; // Exit retry loop
+
+            } catch (purchaseErr) {
+              lastError = purchaseErr;
+
+              // Mark backup code as used if it was invalid
+              if (purchaseErr instanceof InvalidBackupCodeError) {
+                await db.markBackupCodeAsUsed(telegramUserId);
+                logger.debug(`${label} Backup code marked as used (was invalid)`);
+              }
+
+              // Don't retry for these critical errors
+              if (purchaseErr instanceof InsufficientBalanceError ||
+                purchaseErr instanceof InvalidBackupCodeError ||
+                (purchaseErr.message && purchaseErr.message.includes('cancelled by user')) ||
+                (purchaseErr.message && purchaseErr.message.includes('No more backup codes'))) {
+                logger.error(`${label} Critical error - no retry: ${purchaseErr.message}`);
+                break; // Don't retry
+              }
+
+              // Check if this is a network/temporary error that we should retry
+              const isRetryableError = purchaseErr.message && (
+                purchaseErr.message.includes('timeout') ||
+                purchaseErr.message.includes('Navigation') ||
+                purchaseErr.message.includes('disconnected') ||
+                purchaseErr.message.includes('Protocol error') ||
+                purchaseErr.message.includes('Execution context')
+              );
+
+              if (isRetryableError && purchaseAttempt <= MAX_PURCHASE_RETRIES) {
+                logger.warn(`${label} Retryable error for card ${cardNumber}: ${purchaseErr.message}`);
+                logger.debug(`${label} Will retry (attempt ${purchaseAttempt + 1}/${MAX_PURCHASE_RETRIES + 1})...`);
+
+                // Check if browser crashed during purchase
+                const stillAlive = await isBrowserAlive(browser, page);
+                if (!stillAlive) {
+                  logger.warn(`${label} Browser died during purchase - relaunching...`);
+                  try {
+                    if (browser) {
+                      try { await browser.close(); } catch (e) { }
+                    }
+
+                    const launchResult = await launchBrowserWithRetry(label);
+                    browser = launchResult.browser;
+                    page = launchResult.page;
+
+                    sharedState.browsers.push(browser);
+                    if (this.activeBrowsers.has(telegramUserId)) {
+                      this.activeBrowsers.get(telegramUserId).push(browser);
+                    }
+
+                    await loginWithRetry(label, page);
+                    logger.success(`${label} Browser relaunched for retry`);
+                  } catch (relaunchErr) {
+                    logger.error(`${label} Failed to relaunch for retry: ${relaunchErr.message}`);
+                    break; // Can't retry without browser
+                  }
+                }
+
+                // Wait before retry
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+                continue; // Retry
+              } else {
+                // Not retryable or out of retries
+                logger.error(`${label} Purchase failed (no more retries): ${purchaseErr.message}`);
+                break;
+              }
             }
+          }
 
-            logger.debug(`${label} Using backup code for card ${cardNumber}`);
-
-            // Complete the purchase
-            const result = await this.completePurchase({
-              telegramUserId,
-              page,
-              gameUrl,
-              cardIndex,
-              backupCode,
-              checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-              cardNumber,
-              gameName,
-              cardName
-            });
-
-            // Mark backup code as used
-            await db.markBackupCodeAsUsed(telegramUserId);
+          // Handle purchase result
+          if (purchaseSuccess && result) {
 
             // Add to shared purchases array
             sharedState.purchases.push(result);
@@ -1410,32 +1605,27 @@ class PurchaseService {
               }
             }
 
-          } catch (err) {
+          } else if (lastError) {
+            // Purchase failed after all retries
             sharedState.failedCount++;
             sharedState.processedCount++;
 
             // Log error
-            if (err.message && err.message.includes('cancelled by user')) {
+            if (lastError.message && lastError.message.includes('cancelled by user')) {
               logger.info(`${label} Card ${cardNumber}/${quantity} cancelled`);
               sharedState.cancelled = true;
             } else {
-              logger.error(`${label} Card ${cardNumber}/${quantity} failed: ${err.message}`);
-            }
-
-            // Mark backup code as used if it was invalid
-            if (err instanceof InvalidBackupCodeError) {
-              await db.markBackupCodeAsUsed(telegramUserId);
-              logger.debug(`${label} Backup code marked as used (was invalid)`);
+              logger.error(`${label} Card ${cardNumber}/${quantity} failed after retries: ${lastError.message}`);
             }
 
             // Add failed purchase to array
             const failedPurchase = {
               success: false,
-              transactionId: err.transactionId || null,
+              transactionId: lastError.transactionId || null,
               pinCode: 'FAILED',
               serial: 'FAILED',
-              error: err.message,
-              stage: err.stage,
+              error: lastError.message,
+              stage: lastError.stage,
               requiresManualCheck: true
             };
             sharedState.purchases.push(failedPurchase);
@@ -1450,8 +1640,9 @@ class PurchaseService {
               }
             }
 
-            // Stop processing if insufficient balance or invalid backup code
-            if (err instanceof InsufficientBalanceError || err instanceof InvalidBackupCodeError) {
+            // Stop processing if insufficient balance or no more backup codes
+            if (lastError instanceof InsufficientBalanceError ||
+              (lastError.message && lastError.message.includes('No more backup codes'))) {
               logger.error(`${label} Critical error - stopping this browser`);
               break;
             }
