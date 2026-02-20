@@ -39,20 +39,19 @@ class BrowserManager {
       const browser = await this.launchBrowser();
       const page = await browser.newPage();
 
-      // Configure page with minimal resource usage
-      await page.setViewport({ width: 800, height: 600 }); // Small viewport
-      await page.setDefaultTimeout(20000); // Reduced from 30s
-      await page.setDefaultNavigationTimeout(30000); // Reduced from 60s
+      // Configure page with safe timeouts for reliability
+      await page.setViewport({ width: 1280, height: 720 }); // Larger viewport for better rendering
+      await page.setDefaultTimeout(45000); // Increased for reliability
+      await page.setDefaultNavigationTimeout(60000); // Increased for reliability
       await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-      // Optimized resource blocking (allow stylesheets for rendering)
+      // Block ONLY images to save bandwidth but allow everything else for proper rendering
       await page.setRequestInterception(true);
       page.on('request', (request) => {
         const resourceType = request.resourceType();
-        // Allow essential resources: stylesheets needed for page rendering
-        const allowedTypes = ['document', 'script', 'stylesheet', 'xhr', 'fetch'];
-        if (!allowedTypes.includes(resourceType)) {
-          request.abort(); // Block: images, fonts, media, websockets, etc.
+        // Block ONLY images - allow fonts, stylesheets, scripts for proper page rendering
+        if (resourceType === 'image' || resourceType === 'media') {
+          request.abort();
         } else {
           request.continue();
         }
@@ -64,11 +63,11 @@ class BrowserManager {
       const email = 'mostloda14@gmail.com';
       const password = 'vvt?Zr54S%Xe+Wp';
 
-      await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-      // Wait for login form (reduced timeout)
-      await page.waitForSelector('#input-login-email', { visible: true, timeout: 10000 });
-      await page.waitForSelector('#input-login-password', { visible: true, timeout: 10000 });
+      // Wait for login form
+      await page.waitForSelector('#input-login-email', { visible: true, timeout: 15000 });
+      await page.waitForSelector('#input-login-password', { visible: true, timeout: 15000 });
 
       // Type credentials (faster typing)
       await page.type('#input-login-email', email, { delay: 20 });
@@ -145,24 +144,21 @@ class BrowserManager {
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
 
-    // Configure page with minimal resource usage
-    await page.setViewport({ width: 800, height: 600 }); // Small viewport = less memory
-    await page.setDefaultTimeout(20000); // Reduced from 30s
-    await page.setDefaultNavigationTimeout(30000); // Reduced from 60s
+    // Configure page with safe timeouts for reliability
+    await page.setViewport({ width: 1280, height: 720 }); // Larger viewport for better rendering
+    await page.setDefaultTimeout(45000); // Increased for reliability
+    await page.setDefaultNavigationTimeout(60000); // Increased for reliability
 
     // Set user agent to avoid detection
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-    // Optimized resource blocking (allow stylesheets for rendering)
+    // Block ONLY images to save bandwidth but allow everything else for proper rendering
     await page.setRequestInterception(true);
-
-    // Block heavy resources but allow stylesheets for proper rendering
     page.on('request', (request) => {
       const resourceType = request.resourceType();
-      // Allow essential resources: stylesheets needed for page rendering
-      const allowedTypes = ['document', 'script', 'stylesheet', 'xhr', 'fetch'];
-      if (!allowedTypes.includes(resourceType)) {
-        request.abort(); // Block: images, fonts, media, websockets, etc.
+      // Block ONLY images - allow fonts, stylesheets, scripts for proper page rendering
+      if (resourceType === 'image' || resourceType === 'media') {
+        request.abort();
       } else {
         request.continue();
       }
@@ -202,9 +198,7 @@ class BrowserManager {
         // Use incognito mode for clean sessions (like anonymous browsing)
         '--incognito',
         // Memory optimization (reasonable limits)
-        '--js-flags=--max-old-space-size=256',
-        // Disable images to save bandwidth (but allow cookies/storage for login)
-        '--blink-settings=imagesEnabled=false'
+        '--js-flags=--max-old-space-size=256'
       ]
     });
 

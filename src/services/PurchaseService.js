@@ -397,29 +397,36 @@ class PurchaseService {
 
       if (!isSameGame) {
         logger.debug('Not on game page, navigating...');
-        await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        await page.goto(gameUrl, { waitUntil: 'networkidle2', timeout: 45000 });
         logger.debug(`Navigated to: ${page.url()}`);
-        // Wait for JavaScript to render content
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Wait for page to fully render (styles, fonts, scripts)
+        await new Promise(resolve => setTimeout(resolve, 3000));
       } else {
         logger.debug('Already on correct game page, refreshing to ensure clean state...');
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 25000 });
+        await page.reload({ waitUntil: 'networkidle2', timeout: 45000 });
         logger.debug(`Page refreshed: ${page.url()}`);
-        // Wait for JavaScript to render content
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Wait for page to fully render (styles, fonts, scripts)
+        await new Promise(resolve => setTimeout(resolve, 3000));
       }
 
-      // Wait for cards with increased timeout and better error message
-      logger.debug('Waiting for card selection tiles...');
+      // Wait for cards with safe timeout and better error message
+      logger.debug('Waiting for card selection tiles to load...');
       try {
+        // First wait for the main content area to be visible
+        await page.waitForSelector('#webshop_step_sku', { visible: true, timeout: 20000 });
+        logger.debug('Main webshop area loaded');
+
+        // Then wait for actual card tiles
         await page.waitForSelector("div[class*='selection-tile__text']", {
           visible: true,
-          timeout: 15000
+          timeout: 20000
         });
+        logger.success('Card tiles loaded successfully');
       } catch (err) {
         // Log page content for debugging
         const bodyHTML = await page.evaluate(() => document.body.innerText.substring(0, 500));
         logger.error(`Failed to find card tiles. Page content: ${bodyHTML}`);
+        logger.error(`Current URL: ${page.url()}`);
         throw new Error('Card selection tiles not found - page may not have loaded correctly');
       }
 
@@ -449,7 +456,7 @@ class PurchaseService {
       // Wait for card containers to be fully loaded and clickable
       await page.waitForSelector('#webshop_step_sku .selection-tile', {
         visible: true,
-        timeout: 4000
+        timeout: 15000
       });
 
       // Get all card containers from the cards section
@@ -1231,22 +1238,29 @@ class PurchaseService {
             // Use incognito mode for clean sessions (like anonymous browsing)
             '--incognito',
             // Memory optimization (reasonable limits)
-            '--js-flags=--max-old-space-size=256',
-            // Disable images to save bandwidth (but allow cookies/storage for login)
-            '--blink-settings=imagesEnabled=false'
+            '--js-flags=--max-old-space-size=256'
           ]
         });
 
         page = await browser.newPage();
 
-        // Configure page with reduced timeouts and minimal viewport
-        await page.setViewport({ width: 800, height: 600 }); // Small viewport = less memory
-        await page.setDefaultTimeout(20000); // Reduced from 30s to 20s
-        await page.setDefaultNavigationTimeout(30000); // Reduced from 60s to 30s
+        // Configure page with safe timeouts for reliability
+        await page.setViewport({ width: 1280, height: 720 }); // Larger viewport for better rendering
+        await page.setDefaultTimeout(45000); // Increased for reliability
+        await page.setDefaultNavigationTimeout(60000); // Increased for reliability
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        // Don't use request interception to avoid login issues
-        // Images are already disabled via browser flag: --blink-settings=imagesEnabled=false
+        // Block ONLY images to save bandwidth but allow everything else for proper rendering
+        await page.setRequestInterception(true);
+        page.on('request', (request) => {
+          const resourceType = request.resourceType();
+          // Block ONLY images - allow fonts, stylesheets, scripts for proper page rendering
+          if (resourceType === 'image' || resourceType === 'media') {
+            request.abort();
+          } else {
+            request.continue();
+          }
+        });
 
         logger.success(`${label} Browser launched successfully`);
 
@@ -1262,13 +1276,13 @@ class PurchaseService {
 
         // Navigate to login page
         await page.goto('https://razerid.razer.com', {
-          waitUntil: 'domcontentloaded',
-          timeout: 20000
+          waitUntil: 'networkidle2',
+          timeout: 30000
         });
 
-        // Wait for login form (reduced timeouts)
-        await page.waitForSelector('#input-login-email', { visible: true, timeout: 20000 });
-        await page.waitForSelector('#input-login-password', { visible: true, timeout: 20000 });
+        // Wait for login form
+        await page.waitForSelector('#input-login-email', { visible: true, timeout: 15000 });
+        await page.waitForSelector('#input-login-password', { visible: true, timeout: 15000 });
 
         // Type credentials (faster typing = less waiting)
         await page.type('#input-login-email', credentials.email, { delay: 20 });
@@ -1285,7 +1299,7 @@ class PurchaseService {
         // Submit login form
         await Promise.all([
           page.click('button[type="submit"]'),
-          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 })
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 })
         ]);
 
         // Verify login success
@@ -1299,10 +1313,10 @@ class PurchaseService {
         // Navigate to gold.razer.com to establish session (login was on razerid subdomain)
         logger.debug(`${label} Navigating to gold.razer.com to establish session...`);
         await page.goto('https://gold.razer.com/global/en', {
-          waitUntil: 'domcontentloaded',
-          timeout: 15000
+          waitUntil: 'networkidle2',
+          timeout: 30000
         });
-        await new Promise(resolve => setTimeout(resolve, 200)); // Minimal session cookie sync
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for session sync and page render
 
         // Step 3: Process cards from queue until empty
         let cardsProcessed = 0;
