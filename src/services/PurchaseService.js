@@ -1222,31 +1222,18 @@ class PurchaseService {
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-gpu',
-            '--disable-software-rasterizer',
             '--disable-extensions',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
+            '--disable-sync',
+            '--disable-translate',
             '--no-first-run',
             '--mute-audio',
-            '--blink-settings=imagesEnabled=false',
-            // AGGRESSIVE memory optimization - 50% less RAM per browser
-            '--disable-features=site-per-process',
-            '--single-process',
-            '--no-zygote',
-            '--disable-accelerated-2d-canvas',
-            '--disable-features=VizDisplayCompositor',
-            '--js-flags=--max-old-space-size=128', // Reduced from 256MB to 128MB
-            '--disable-web-security', // Reduce CORS overhead
-            '--disable-features=IsolateOrigins,site-per-process',
             '--disable-blink-features=AutomationControlled',
-            '--disk-cache-size=0', // No disk cache
-            '--media-cache-size=0',
-            '--aggressive-cache-discard',
-            '--disable-cache',
-            '--disable-application-cache',
-            '--disable-offline-load-stale-cache',
-            '--disable-plugins'
+            // Use incognito mode for clean sessions (like anonymous browsing)
+            '--incognito',
+            // Memory optimization (reasonable limits)
+            '--js-flags=--max-old-space-size=256',
+            // Disable images to save bandwidth (but allow cookies/storage for login)
+            '--blink-settings=imagesEnabled=false'
           ]
         });
 
@@ -1258,18 +1245,8 @@ class PurchaseService {
         await page.setDefaultNavigationTimeout(30000); // Reduced from 60s to 30s
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        // Optimized resource blocking (allow stylesheets for rendering)
-        await page.setRequestInterception(true);
-        page.on('request', (request) => {
-          const resourceType = request.resourceType();
-          // Allow essential resources: stylesheets needed for page rendering
-          const allowedTypes = ['document', 'script', 'stylesheet', 'xhr', 'fetch'];
-          if (!allowedTypes.includes(resourceType)) {
-            request.abort(); // Block: images, fonts, media, websockets, etc.
-          } else {
-            request.continue();
-          }
-        });
+        // Don't use request interception to avoid login issues
+        // Images are already disabled via browser flag: --blink-settings=imagesEnabled=false
 
         logger.success(`${label} Browser launched successfully`);
 

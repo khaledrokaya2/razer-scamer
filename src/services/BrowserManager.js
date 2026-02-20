@@ -85,7 +85,7 @@ class BrowserManager {
       // Submit login form
       await Promise.all([
         page.click('button[type="submit"]'),
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 })
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 50000 })
       ]);
 
       // Verify login success
@@ -95,14 +95,6 @@ class BrowserManager {
       }
 
       logger.success('Global browser logged in successfully');
-
-      // Navigate to gold.razer.com to establish session (login was on razerid subdomain)
-      logger.system('Navigating to gold.razer.com to establish session...');
-      await page.goto('https://gold.razer.com/global/en', {
-        waitUntil: 'domcontentloaded',
-        timeout: 15000
-      });
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for session cookies
 
       this.globalBrowser = browser;
       this.globalPage = page;
@@ -201,38 +193,18 @@ class BrowserManager {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--disable-software-rasterizer',
         '--disable-extensions',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-hang-monitor',
         '--disable-sync',
         '--disable-translate',
-        '--metrics-recording-only',
         '--no-first-run',
         '--mute-audio',
-        // Network optimizations for slow connections
-        '--enable-features=NetworkService,NetworkServiceInProcess',
-        '--disable-features=VizDisplayCompositor',
-        '--force-prefers-reduced-motion',
-        '--blink-settings=imagesEnabled=false', // Disable images at browser level
-        // AGGRESSIVE memory optimization - 50% less RAM per browser
-        '--disable-features=site-per-process',
-        '--single-process',
-        '--no-zygote',
-        '--disable-accelerated-2d-canvas',
-        '--js-flags=--max-old-space-size=128', // Reduced from 256MB to 128MB
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
         '--disable-blink-features=AutomationControlled',
-        '--disk-cache-size=0',
-        '--media-cache-size=0',
-        '--aggressive-cache-discard',
-        '--disable-cache',
-        '--disable-application-cache',
-        '--disable-offline-load-stale-cache',
-        '--disable-plugins'
+        // Use incognito mode for clean sessions (like anonymous browsing)
+        '--incognito',
+        // Memory optimization (reasonable limits)
+        '--js-flags=--max-old-space-size=256',
+        // Disable images to save bandwidth (but allow cookies/storage for login)
+        '--blink-settings=imagesEnabled=false'
       ]
     });
 
