@@ -399,27 +399,34 @@ class PurchaseService {
         logger.debug('Not on game page, navigating...');
         await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
         logger.debug(`Navigated to: ${page.url()}`);
-        // Wait for page to fully render (styles, fonts, scripts)
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        // Brief wait for JavaScript to start (we explicitly wait for interactive elements below)
+        await new Promise(resolve => setTimeout(resolve, 2000));
       } else {
         logger.debug('Already on correct game page, refreshing to ensure clean state...');
         await page.reload({ waitUntil: 'load', timeout: 60000 });
         logger.debug(`Page refreshed: ${page.url()}`);
-        // Wait for page to fully render (styles, fonts, scripts)
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        // Brief wait for JavaScript to start (we explicitly wait for interactive elements below)
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       // Wait for cards with safe timeout and better error message
-      logger.debug('Waiting for card selection tiles to load...');
+      logger.debug('Waiting for interactive card tiles to load...');
       try {
         // First wait for the main content area to be visible
-        await page.waitForSelector('#webshop_step_sku', { visible: true, timeout: 20000 });
+        await page.waitForSelector('#webshop_step_sku', { visible: true, timeout: 25000 });
         logger.debug('Main webshop area loaded');
 
-        // Then wait for actual card tiles
-        await page.waitForSelector("div[class*='selection-tile__text']", {
+        // Wait for actual interactive card tiles (the ones with labels and radio inputs)
+        await page.waitForSelector('#webshop_step_sku .selection-tile', {
           visible: true,
-          timeout: 20000
+          timeout: 25000
+        });
+        logger.debug('Card tile containers loaded');
+
+        // Wait for radio inputs to be rendered inside the tiles
+        await page.waitForSelector('#webshop_step_sku .selection-tile input[type="radio"]', {
+          visible: true,
+          timeout: 25000
         });
         logger.success('Card tiles loaded successfully');
       } catch (err) {
@@ -1183,8 +1190,8 @@ class PurchaseService {
     const puppeteer = require('puppeteer');
 
     // Configuration - OPTIMIZED for low resource usage (more browsers, less memory each)
-    const MAX_BROWSERS = 7; // Increased from 5 - each browser uses ~50% less memory
-    const LAUNCH_STAGGER_MS = 400; // 400ms stagger - fast but safe against rate limiting
+    const MAX_BROWSERS = 10; // Increased to 10 for faster parallel processing
+    const LAUNCH_STAGGER_MS = 300; // 300ms stagger - fast parallel launch
 
     // Determine number of browsers to use (min of quantity and max browsers)
     const browserCount = Math.min(quantity, MAX_BROWSERS);
@@ -1313,10 +1320,11 @@ class PurchaseService {
         // Navigate to gold.razer.com to establish session (login was on razerid subdomain)
         logger.debug(`${label} Navigating to gold.razer.com to establish session...`);
         await page.goto('https://gold.razer.com/global/en', {
-          waitUntil: 'load',
-          timeout: 60000
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
         });
-        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for session sync and page render
+        // Short wait for session cookies to sync - page will be reloaded when navigating to game anyway
+        await new Promise(resolve => setTimeout(resolve, 500));
 
         // Step 3: Process cards from queue until empty
         let cardsProcessed = 0;
