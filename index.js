@@ -112,18 +112,6 @@ async function initializeServices(config) {
   const botType = config.isDevelopment ? 'TEST' : 'PRODUCTION';
   logger.bot(`Starting ${botType} bot...`);
 
-  // Debug: Show configuration details
-  console.log('='.repeat(80));
-  console.log('🔍 CONFIGURATION DEBUG:');
-  console.log(`   NODE_ENV: ${config.environment}`);
-  console.log(`   isDevelopment: ${config.isDevelopment}`);
-  console.log(`   Bot Type: ${botType}`);
-  console.log(`   Bot Token (first 15 chars): ${config.botToken.substring(0, 15)}...`);
-  console.log(`   Database: ${config.dbConnectionString ? config.dbConnectionString.substring(0, 50) + '...' : 'NOT SET'}`);
-  console.log(`   Is TEST DB (db40738): ${config.dbConnectionString && config.dbConnectionString.includes('db40738')}`);
-  console.log(`   Is PROD DB (db29926): ${config.dbConnectionString && config.dbConnectionString.includes('db29926')}`);
-  console.log('='.repeat(80));
-
   botController.initialize(config.botToken);
 
   // Initialize scheduled order service (singleton pattern)

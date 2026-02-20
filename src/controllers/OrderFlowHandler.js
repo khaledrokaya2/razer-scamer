@@ -916,11 +916,55 @@ class OrderFlowHandler {
 
       // Send success message with option to start new order
       const validPinCount = fileGenerator.getValidPinCount(result.pins);
-      const statusMessage = isScheduled
-        ? messageFormatter.formatScheduledOrderComplete(result, validPinCount)
-        : messageFormatter.formatOrderComplete(result.order, validPinCount);
-
-      await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+      const failedCount = result.pins ? result.pins.filter(p => p.pinCode === 'FAILED').length : 0;
+      const totalCount = result.pins ? result.pins.length : 0;
+      
+      // Check if all cards failed
+      if (validPinCount === 0 && totalCount > 0) {
+        // All cards failed - check for specific error types
+        const firstFailedCard = result.pins.find(p => p.pinCode === 'FAILED');
+        const hasInsufficientBalance = result.pins.some(p => 
+          p.pinCode === 'FAILED' && p.error && p.error.includes('Insufficient')
+        );
+        
+        if (hasInsufficientBalance) {
+          // Insufficient balance error
+          await bot.sendMessage(
+            chatId,
+            '❌ *Order Failed*\n\n💰 *Insufficient Razer Gold Balance*\n\nPlease reload your account and try again.\n\n' +
+            `Failed: ${failedCount}/${totalCount} cards`,
+            { parse_mode: 'Markdown' }
+          );
+        } else {
+          // Other errors
+          await bot.sendMessage(
+            chatId,
+            `❌ *Order Failed*\n\n${failedCount}/${totalCount} cards failed\n\nPlease check your account and try again.`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+      } else if (failedCount > 0 && validPinCount > 0) {
+        // Partial success - some cards succeeded, some failed
+        const statusMessage = isScheduled
+          ? messageFormatter.formatScheduledOrderComplete(result, validPinCount)
+          : messageFormatter.formatOrderComplete(result.order, validPinCount);
+        
+        await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+        
+        // Add warning about failed cards
+        await bot.sendMessage(
+          chatId,
+          `⚠️ *Partial Success*\n\n✅ Success: ${validPinCount}/${totalCount}\n❌ Failed: ${failedCount}/${totalCount}`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        // All cards succeeded
+        const statusMessage = isScheduled
+          ? messageFormatter.formatScheduledOrderComplete(result, validPinCount)
+          : messageFormatter.formatOrderComplete(result.order, validPinCount);
+        
+        await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
+      }
 
       // Send pin files
       if (result.pins && result.pins.length > 0) {
@@ -1326,74 +1370,7 @@ class OrderFlowHandler {
     // Store telegram user ID in session
     session.telegramUserId = telegramUserId;
 
-    // Auto-login if no browser session exists
-    const browserManager = require('../services/BrowserManager');
-    const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
-
-    if (!hasActiveBrowser) {
-      const db = require('../services/DatabaseService');
-      const scraperService = require('../services/RazerScraperService');
-      const logger = require('../utils/logger');
-
-      // Get user credentials
-      const credentials = await db.getUserCredentials(telegramUserId);
-
-      if (!credentials || !credentials.email || !credentials.password) {
-        await bot.sendMessage(
-          chatId,
-          '⚠️ *No Credentials*\n\nAdd Razer credentials in /settings',
-          { parse_mode: 'Markdown' }
-        );
-        this.clearSession(chatId);
-        return;
-      }
-
-      // Show login progress
-      const loginMsg = await bot.sendMessage(chatId, '⏳ *Logging in...*', { parse_mode: 'Markdown' });
-
-      try {
-        logger.info(`Auto-login for purchase: User ${telegramUserId}`);
-        await scraperService.login(telegramUserId, credentials.email, credentials.password);
-
-        // Delete login message
-        try {
-          await bot.deleteMessage(chatId, loginMsg.message_id);
-        } catch (delErr) {
-          logger.debug('Could not delete login message');
-        }
-      } catch (loginErr) {
-        // Check if operation was cancelled before showing error
-        if (this.isCancelled(chatId)) {
-          // Operation was cancelled - don't show error, /cancel will handle the message
-          logger.info('Login cancelled by user');
-          try {
-            await bot.deleteMessage(chatId, loginMsg.message_id);
-          } catch (delErr) {
-            logger.debug('Could not delete login message');
-          }
-          return;
-        }
-
-        logger.error('Auto-login failed for purchase:', loginErr);
-
-        // Delete login message
-        try {
-          await bot.deleteMessage(chatId, loginMsg.message_id);
-        } catch (delErr) {
-          logger.debug('Could not delete login message');
-        }
-
-        await bot.sendMessage(
-          chatId,
-          '❌ *Login Failed*\n\nCheck credentials in /settings',
-          { parse_mode: 'Markdown' }
-        );
-        this.clearSession(chatId);
-        return;
-      }
-    }
-
-    // Process order using unified method (REFACTORED: eliminates duplicate code)
+    // Process order using unified method (parallel purchase flow handles its own login)
     try {
       this.updateSession(chatId, { step: 'processing' });
 
@@ -1412,19 +1389,9 @@ class OrderFlowHandler {
       // Clear session on success
       this.clearSession(chatId);
 
-      // Close browser after successful purchase
-      const browserManager = require('../services/BrowserManager');
-      await browserManager.closeBrowser(telegramUserId);
-      logger.info(`Browser closed after successful purchase for user ${telegramUserId}`);
-
     } catch (err) {
       // Unified method handles most error scenarios
       this.clearSession(chatId);
-
-      // Close browser on ANY error (cancellation or failure)
-      const browserManager = require('../services/BrowserManager');
-      await browserManager.closeBrowser(telegramUserId);
-      logger.info(`Browser closed after order error/cancellation for user ${telegramUserId}`);
     }
   }
 

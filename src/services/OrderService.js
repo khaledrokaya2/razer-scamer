@@ -186,6 +186,8 @@ class OrderService {
               transactionId: purchase.transactionId || null,
               success: false,
               requiresManualCheck: true,
+              error: purchase.error || null,  // Preserve error message
+              stage: purchase.stage || null,
               gameName: gameName,
               cardValue: cardName
             });

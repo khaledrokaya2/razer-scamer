@@ -50,12 +50,19 @@ class RazerScraperService {
       await page.type('#input-login-email', email, { delay: 50 });
       await page.type('#input-login-password', password, { delay: 50 });
 
+      // Handle cookie consent banner if present
+      try {
+        await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 2000 });
+        await page.click('button[aria-label="Accept All"]');
+        await new Promise(resolve => setTimeout(resolve, 150));
+        logger.debug('Cookie consent accepted');
+      } catch (err) {
+        // No cookie banner - that's fine
+        logger.debug('No cookie consent banner');
+      }
+
       // Click submit button and wait for navigation to complete
       logger.info('Submitting login form...');
-      const submitButton = await page.$('button[type="submit"]');
-      const innerHTML = await page.evaluate(el => el.innerHTML, submitButton);
-      if (innerHTML !== "LOG IN")
-        await page.click('button[aria-label="Accept All"]');
       await Promise.all([
         page.click('button[type="submit"]'),
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 })

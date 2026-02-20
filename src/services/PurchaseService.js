@@ -379,8 +379,8 @@ class PurchaseService {
       logger.debug('Out of stock, waiting 0.5 seconds before retry...');
       await new Promise(resolve => setTimeout(resolve, this.RELOAD_CHECK_INTERVAL));
 
-      // Reload page
-      await page.reload({ waitUntil: 'domcontentloaded' });
+      // Reload page and wait for full load
+      await page.reload({ waitUntil: 'networkidle2', timeout: 20000 });
 
       attempts++;
     }
@@ -410,18 +410,32 @@ class PurchaseService {
       logger.debug(`Stage: ${currentStage}`);
 
       let currentUrl = page.url();
+      logger.debug(`Current URL: ${currentUrl}`);
+      logger.debug(`Target game URL: ${gameUrl}`);
+
       if (!currentUrl.includes(gameUrl)) {
         logger.debug('Not on game page, navigating...');
-        await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.goto(gameUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        logger.debug(`Navigated to: ${page.url()}`);
       } else {
-        logger.debug('Already on game page, skipping navigation');
+        logger.debug('Already on game page, refreshing to ensure clean state...');
+        await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+        logger.debug(`Page refreshed: ${page.url()}`);
       }
 
-      // Wait for cards with reduced timeout
-      await page.waitForSelector("div[class*='selection-tile__text']", {
-        visible: true,
-        timeout: 4000
-      });
+      // Wait for cards with increased timeout and better error message
+      logger.debug('Waiting for card selection tiles...');
+      try {
+        await page.waitForSelector("div[class*='selection-tile__text']", {
+          visible: true,
+          timeout: 15000
+        });
+      } catch (err) {
+        // Log page content for debugging
+        const bodyHTML = await page.evaluate(() => document.body.innerText.substring(0, 500));
+        logger.error(`Failed to find card tiles. Page content: ${bodyHTML}`);
+        throw new Error('Card selection tiles not found - page may not have loaded correctly');
+      }
 
       // Check cancellation
       if (checkCancellation && checkCancellation()) {
@@ -723,7 +737,7 @@ class PurchaseService {
 
       // Wait for navigation after checkout
       logger.http('Waiting for page to load after checkout...');
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {
         logger.debug('Navigation timeout - will check URL...');
       });
 
@@ -1108,6 +1122,7 @@ class PurchaseService {
             pinCode: 'FAILED',
             serialNumber: 'FAILED',
             requiresManualCheck: true,
+            error: 'Could not extract PIN or Serial - please check transaction manually',
             stage: currentStage,
             gameName: gameName,
             cardValue: cardName  // Use cardName as cardValue
@@ -1166,194 +1181,327 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters
    * @returns {Promise<Array>} Array of purchase results (including failed ones)
    */
+  /**
+   * Process bulk purchases using parallel browsers (up to 10 simultaneous)
+   * Based on test.js pipeline pattern for maximum speed
+   */
   async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, onProgress, onCardCompleted, checkCancellation }) {
-    // Get user's existing browser session (using telegram user ID)
-    const page = browserManager.getPage(telegramUserId);
-
-    if (!page) {
-      throw new Error('No active browser session. Please login first.');
-    }
-
-    // Mark browser as in-use to prevent cleanup during purchase
-    browserManager.markInUse(telegramUserId);
-
     const db = require('./DatabaseService');
-    const purchases = [];
-    let successCount = 0;
-    let failedCount = 0;
+    const puppeteer = require('puppeteer');
+
+    // Configuration
+    const MAX_BROWSERS = 10;
+    const LAUNCH_STAGGER_MS = 300; // 300ms delay between browser spawns
+
+    // Determine number of browsers to use (min of quantity and max browsers)
+    const browserCount = Math.min(quantity, MAX_BROWSERS);
+
+    // Get user credentials for login (same credentials for all browsers)
+    const credentials = await db.getUserCredentials(telegramUserId);
+    if (!credentials || !credentials.email || !credentials.password) {
+      throw new Error('No Razer credentials found. Please login first.');
+    }
+    const sharedState = {
+      cardQueue: Array.from({ length: quantity }, (_, i) => i + 1), // [1, 2, 3, ..., quantity]
+      purchases: [],
+      successCount: 0,
+      failedCount: 0,
+      processedCount: 0,
+      cancelled: false
+    };
 
     logger.purchase(`\n${'='.repeat(60)}`);
-    logger.purchase(`Starting bulk purchase: ${quantity} x ${cardName}`);
+    logger.purchase(`Starting PARALLEL bulk purchase: ${quantity} x ${cardName}`);
+    logger.purchase(`Using ${browserCount} simultaneous browsers`);
     logger.purchase(`${'='.repeat(60)}\n`);
 
-    try {
-      // SOLUTION #2: No retry - process each card once
-      for (let i = 1; i <= quantity; i++) {
-        // Check if order was cancelled
-        if (checkCancellation && checkCancellation()) {
-          logger.warn('Order cancelled by user');
-          const error = new Error('Order cancelled by user');
-          error.purchases = purchases;  // Include what we have so far
-          throw error;
-        }
+    /**
+     * Single browser session that processes cards from the shared queue
+     * Similar to runSession() in test.js but for purchases instead of balance checks
+     */
+    const runPurchaseSession = async (sessionIndex) => {
+      const label = `[Browser ${sessionIndex + 1}]`;
+      let browser = null;
+      let page = null;
 
-        // Get next backup code from database
-        const backupCode = await db.getNextBackupCode(telegramUserId);
+      try {
+        // Step 1: Launch browser
+        logger.debug(`${label} Launching browser...`);
+        browser = await puppeteer.launch({
+          headless: process.env.NODE_ENV === 'development',
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-software-rasterizer',
+            '--disable-extensions',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--no-first-run',
+            '--mute-audio',
+            '--blink-settings=imagesEnabled=false'
+          ]
+        });
 
-        if (!backupCode) {
-          logger.error(`No more backup codes available in database`);
-          const codeError = new Error('No more backup codes available. Please add more codes in Settings → Backup Codes.');
-          codeError.purchases = purchases;
-          throw codeError;
-        }
+        page = await browser.newPage();
 
-        logger.purchase(`\n--- Processing Card ${i}/${quantity} ---`);
-        logger.debug(`   Using backup code from database`);
+        // Configure page
+        await page.setDefaultTimeout(30000);
+        await page.setDefaultNavigationTimeout(60000);
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
+        // Enable request interception to block heavy resources
+        await page.setRequestInterception(true);
+        page.on('request', (request) => {
+          const resourceType = request.resourceType();
+          const blockedTypes = ['image', 'font', 'media', 'manifest', 'texttrack', 'eventsource'];
+          if (blockedTypes.includes(resourceType)) {
+            request.abort();
+          } else {
+            request.continue();
+          }
+        });
+
+        logger.success(`${label} Browser launched successfully`);
+
+        // Step 2: Login to Razer
+        logger.debug(`${label} Logging in to Razer...`);
+
+        // Navigate to login page
+        await page.goto('https://razerid.razer.com', {
+          waitUntil: 'domcontentloaded',
+          timeout: 20000
+        });
+
+        // Wait for login form
+        await page.waitForSelector('#input-login-email', { visible: true, timeout: 8000 });
+        await page.waitForSelector('#input-login-password', { visible: true, timeout: 8000 });
+
+        // Type credentials
+        await page.type('#input-login-email', credentials.email, { delay: 50 });
+        await page.type('#input-login-password', credentials.password, { delay: 50 });
+
+        // Handle cookie consent banner if present
         try {
-          const result = await this.completePurchase({
-            telegramUserId,  // Changed from userId
-            page,
-            gameUrl,
-            cardIndex,
-            backupCode: backupCode, // Use backup code from database
-            checkCancellation,
-            cardNumber: i,  // Pass card number (1, 2, 3...)
-            gameName,       // For later DB save
-            cardName        // For later DB save
-          });
+          await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 2000 });
+          await page.click('button[aria-label="Accept All"]');
+          await new Promise(resolve => setTimeout(resolve, 150));
+        } catch (err) {
+          // No cookie banner - that's fine
+        }
 
-          // Mark backup code as used in database after successful purchase
-          await db.markBackupCodeAsUsed(telegramUserId);
-          logger.debug(`   Backup code marked as used in database`);
+        // Submit login form
+        await Promise.all([
+          page.click('button[type="submit"]'),
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 })
+        ]);
 
-          purchases.push(result);
+        // Verify login success
+        const currentUrl = page.url();
+        if (currentUrl === 'https://razerid.razer.com' || currentUrl === 'https://razerid.razer.com/') {
+          throw new Error('Login failed - wrong credentials or captcha');
+        }
 
-          if (result.success) {
-            successCount++;
-            logger.success(`Card ${i}/${quantity} completed successfully!`);
-            logger.info(`   Transaction ID: ${result.transactionId}`);
-            // 🔒 SECURITY: PIN and Serial not logged to console
+        logger.success(`${label} Logged in successfully`);
 
-            // IMMEDIATE DB SAVE: Save this card to database right now
-            if (onCardCompleted) {
+        // Step 3: Process cards from queue until empty
+        let cardsProcessed = 0;
+        while (true) {
+          // Check if cancelled
+          if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+            sharedState.cancelled = true;
+            logger.info(`${label} Order cancelled - stopping`);
+            break;
+          }
+
+          // Get next card from queue (thread-safe due to Node.js single-threaded)
+          const cardNumber = sharedState.cardQueue.shift();
+          if (cardNumber === undefined) {
+            // Queue is empty
+            logger.debug(`${label} No more cards in queue - finished processing ${cardsProcessed} cards`);
+            break;
+          }
+
+          logger.purchase(`${label} Processing card ${cardNumber}/${quantity}...`);
+
+          try {
+            // Get backup code from database
+            const backupCode = await db.getNextBackupCode(telegramUserId);
+
+            if (!backupCode) {
+              logger.error(`${label} No more backup codes available`);
+              // Put card back in queue (at the front) so another browser can try
+              sharedState.cardQueue.unshift(cardNumber);
+              throw new Error('No more backup codes available');
+            }
+
+            logger.debug(`${label} Using backup code for card ${cardNumber}`);
+
+            // Complete the purchase
+            const result = await this.completePurchase({
+              telegramUserId,
+              page,
+              gameUrl,
+              cardIndex,
+              backupCode,
+              checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+              cardNumber,
+              gameName,
+              cardName
+            });
+
+            // Mark backup code as used
+            await db.markBackupCodeAsUsed(telegramUserId);
+
+            // Add to shared purchases array
+            sharedState.purchases.push(result);
+            cardsProcessed++;
+
+            if (result.success) {
+              sharedState.successCount++;
+              logger.success(`${label} Card ${cardNumber}/${quantity} completed successfully!`);
+              logger.info(`${label} Transaction ID: ${result.transactionId}`);
+
+              // Immediate DB save
+              if (onCardCompleted) {
+                try {
+                  await onCardCompleted(result, cardNumber);
+                  logger.database(`${label} Card ${cardNumber} saved to database`);
+                } catch (saveErr) {
+                  logger.error(`${label} Failed to save card ${cardNumber}:`, saveErr.message);
+                }
+              }
+            } else {
+              sharedState.failedCount++;
+              logger.warn(`${label} Card ${cardNumber}/${quantity} reached transaction page but extraction FAILED`);
+            }
+
+            // Update shared progress counter
+            sharedState.processedCount++;
+
+            // Update progress UI
+            if (onProgress) {
               try {
-                await onCardCompleted(result, i);
-                logger.database(`   Card ${i} saved to database immediately`);
-              } catch (saveErr) {
-                logger.error(`   Failed to save card ${i} to database:`, saveErr.message);
+                await onProgress(sharedState.processedCount, quantity);
+              } catch (progressErr) {
+                logger.debug(`${label} Progress callback error:`, progressErr.message);
               }
             }
-          } else {
-            failedCount++;
-            logger.warn(`Card ${i}/${quantity} reached transaction page but extraction FAILED`);
-            logger.info(`   Transaction ID: ${result.transactionId}`);
-            logger.warn(`   Status: Requires manual check on website`);
-          }
 
-          // Update progress after EVERY card (success or failed)
-          if (onProgress) {
-            try {
-              await onProgress(i, quantity);
-            } catch (progressErr) {
-              logger.debug('Progress callback error:', progressErr.message);
+          } catch (err) {
+            sharedState.failedCount++;
+            sharedState.processedCount++;
+
+            // Log error
+            if (err.message && err.message.includes('cancelled by user')) {
+              logger.info(`${label} Card ${cardNumber}/${quantity} cancelled`);
+              sharedState.cancelled = true;
+            } else {
+              logger.error(`${label} Card ${cardNumber}/${quantity} failed: ${err.message}`);
             }
-          }
 
-        } catch (err) {
-          failedCount++;
+            // Mark backup code as used if it was invalid
+            if (err instanceof InvalidBackupCodeError) {
+              await db.markBackupCodeAsUsed(telegramUserId);
+              logger.debug(`${label} Backup code marked as used (was invalid)`);
+            }
 
-          // Log cancellations as info, other errors as error
-          if (err.message && err.message.includes('cancelled by user')) {
-            logger.info(`Card ${i}/${quantity} cancelled at stage: ${err.stage || 'unknown'}`);
-          } else {
-            logger.error(`Card ${i}/${quantity} failed at stage: ${err.stage || 'unknown'}`);
-            logger.error(`   Error: ${err.message}`);
-          }
+            // Add failed purchase to array
+            const failedPurchase = {
+              success: false,
+              transactionId: err.transactionId || null,
+              pinCode: 'FAILED',
+              serial: 'FAILED',
+              error: err.message,
+              stage: err.stage,
+              requiresManualCheck: true
+            };
+            sharedState.purchases.push(failedPurchase);
+            cardsProcessed++;
 
-          // Mark backup code as used if it was actually used (invalid code error)
-          if (err instanceof InvalidBackupCodeError) {
-            await db.markBackupCodeAsUsed(telegramUserId);
-            logger.debug(`   Backup code marked as used (was invalid)`);
-          } else {
-            logger.debug(`   Backup code NOT consumed - error occurred before 2FA`);
-          }
+            // Update progress even for failed cards
+            if (onProgress) {
+              try {
+                await onProgress(sharedState.processedCount, quantity);
+              } catch (progressErr) {
+                logger.debug(`${label} Progress callback error:`, progressErr.message);
+              }
+            }
 
-          // Check if this is a cancellation error
-          if (err.message && err.message.includes('cancelled by user')) {
-            logger.info('Cancelling remaining cards...');
-            err.purchases = purchases;  // Include what we have so far
-            throw err;
-          }
+            // Stop processing if insufficient balance or invalid backup code
+            if (err instanceof InsufficientBalanceError || err instanceof InvalidBackupCodeError) {
+              logger.error(`${label} Critical error - stopping this browser`);
+              break;
+            }
 
-          // Don't retry if it's insufficient balance
-          if (err instanceof InsufficientBalanceError) {
-            logger.error('Insufficient balance - stopping all remaining purchases');
-            const balanceError = new Error('Insufficient Razer Gold balance');
-            balanceError.purchases = purchases;
-            throw balanceError;
-          }
-
-          // Don't retry if it's invalid backup code
-          if (err instanceof InvalidBackupCodeError) {
-            logger.error('Invalid backup code - stopping all remaining purchases');
-            const codeError = new Error('Invalid backup code');
-            codeError.purchases = purchases;
-            throw codeError;
-          }
-
-          // SOLUTION #2: NO RETRY - just mark as failed and continue
-          // Add failed card to purchases array
-          const failedPurchase = {
-            success: false,
-            transactionId: err.transactionId || null,
-            pinCode: 'FAILED',
-            serial: 'FAILED',
-            error: err.message,
-            stage: err.stage,
-            requiresManualCheck: true
-          };
-
-          purchases.push(failedPurchase);
-
-          logger.debug(`Skipping to next card (no retry)`);
-
-          // Update progress even for failed cards
-          if (onProgress) {
-            try {
-              await onProgress(i, quantity);
-            } catch (progressErr) {
-              logger.debug('Progress callback error:', progressErr.message);
+            // Stop if cancelled
+            if (sharedState.cancelled) {
+              logger.info(`${label} Cancelled - stopping`);
+              break;
             }
           }
         }
+
+        logger.debug(`${label} Session completed - processed ${cardsProcessed} cards`);
+
+      } catch (err) {
+        logger.error(`${label} Browser session error:`, err.message);
+      } finally {
+        // Close browser with timeout to prevent hanging
+        if (browser) {
+          try {
+            await Promise.race([
+              browser.close(),
+              new Promise(resolve => setTimeout(resolve, 5000))
+            ]);
+            logger.debug(`${label} Browser closed`);
+          } catch (closeErr) {
+            logger.error(`${label} Error closing browser:`, closeErr.message);
+          }
+        }
       }
+    };
+
+    try {
+      // Launch all browser sessions with staggered timing
+      const sessionPromises = [];
+
+      for (let i = 0; i < browserCount; i++) {
+        // Stagger browser launches to avoid overwhelming the system
+        if (i > 0) {
+          await new Promise(resolve => setTimeout(resolve, LAUNCH_STAGGER_MS));
+        }
+
+        logger.debug(`Spawning browser ${i + 1}/${browserCount}...`);
+
+        // Launch browser session (don't await - let it run independently)
+        sessionPromises.push(runPurchaseSession(i));
+      }
+
+      logger.success(`All ${browserCount} browsers launched - processing in parallel...`);
+
+      // Wait for all browsers to complete
+      await Promise.all(sessionPromises);
 
       logger.purchase(`\n${'='.repeat(60)}`);
-      logger.success(`All cards processed! Success: ${successCount}, Failed: ${failedCount}, Total: ${quantity}`);
+      logger.success(`All cards processed! Success: ${sharedState.successCount}, Failed: ${sharedState.failedCount}, Total: ${quantity}`);
       logger.purchase(`${'='.repeat(60)}\n`);
 
-      return purchases;
+      return sharedState.purchases;
 
     } catch (err) {
-      // Log cancellations as info, other errors as error
+      // Log error
       if (err.message && err.message.includes('cancelled by user')) {
-        logger.info('Bulk purchase process cancelled:', err.message);
+        logger.info('Parallel bulk purchase cancelled:', err.message);
       } else {
-        logger.error('Bulk purchase process stopped:', err.message);
+        logger.error('Parallel bulk purchase error:', err.message);
       }
 
-      // Always return what we have so far (even on error)
-      if (err.purchases) {
-        err.purchases = err.purchases;
-      } else {
-        err.purchases = purchases;
-      }
-
+      // Return what we have so far
+      err.purchases = sharedState.purchases;
       throw err;
-    } finally {
-      // Mark browser as not in-use after purchase completes or fails
-      browserManager.markNotInUse(telegramUserId);
     }
   }
 }
