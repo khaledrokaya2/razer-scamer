@@ -50,12 +50,12 @@ class BrowserManager {
         Object.defineProperty(navigator, 'webdriver', {
           get: () => false
         });
-        
+
         // Override chrome object
         window.chrome = {
           runtime: {}
         };
-        
+
         // Override permissions
         const originalQuery = window.navigator.permissions.query;
         window.navigator.permissions.query = (parameters) => (
@@ -139,12 +139,12 @@ class BrowserManager {
       Object.defineProperty(navigator, 'webdriver', {
         get: () => false
       });
-      
+
       // Override chrome object
       window.chrome = {
         runtime: {}
       };
-      
+
       // Override permissions
       const originalQuery = window.navigator.permissions.query;
       window.navigator.permissions.query = (parameters) => (

@@ -309,7 +309,7 @@ class PurchaseService {
       if (cardsData.cards.length === 0) {
         // Enhanced debugging for production - capture actual page content
         logger.error('No cards found - capturing page state for debugging...');
-        
+
         try {
           const debugInfo = await page.evaluate(() => {
             const bodyText = document.body ? document.body.innerText : '';
@@ -320,7 +320,7 @@ class PurchaseService {
               id: r.id,
               parentText: r.parentElement ? r.parentElement.textContent.substring(0, 50) : ''
             }));
-            
+
             return {
               url: window.location.href,
               title: document.title,
@@ -332,7 +332,7 @@ class PurchaseService {
               mainContentHTML: document.querySelector('main')?.innerHTML.substring(0, 1000) || 'No main element'
             };
           });
-          
+
           logger.error('DEBUG - Page State:');
           logger.error(`  URL: ${debugInfo.url}`);
           logger.error(`  Title: ${debugInfo.title}`);
@@ -342,33 +342,33 @@ class PurchaseService {
           logger.error(`  Body Preview: ${debugInfo.bodyPreview}`);
           logger.error(`  Radio Sample:`, JSON.stringify(debugInfo.radioSample, null, 2));
           logger.error(`  Main Content: ${debugInfo.mainContentHTML}`);
-          
+
           // Save HTML to file for debugging in production
           const fs = require('fs');
           const path = require('path');
           const debugDir = path.join(process.cwd(), 'debug');
-          
+
           // Create debug directory if it doesn't exist
           if (!fs.existsSync(debugDir)) {
             fs.mkdirSync(debugDir, { recursive: true });
           }
-          
+
           const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
           const htmlPath = path.join(debugDir, `page_${timestamp}.html`);
           const screenshotPath = path.join(debugDir, `screenshot_${timestamp}.png`);
-          
+
           const fullHTML = await page.content();
           fs.writeFileSync(htmlPath, fullHTML);
           logger.error(`  Full page HTML saved to: ${htmlPath}`);
-          
+
           // Take screenshot
           await page.screenshot({ path: screenshotPath, fullPage: true });
           logger.error(`  Screenshot saved to: ${screenshotPath}`);
-          
+
         } catch (debugErr) {
           logger.error('Failed to capture debug info:', debugErr.message);
         }
-        
+
         throw new Error('No cards found. The page might not have loaded properly or the game might not be available.');
       }
 
