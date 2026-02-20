@@ -122,7 +122,7 @@ class PurchaseService {
       // Wait for cards to load with extended timeout for first-time loading
       logger.http('Waiting for cards to load...');
 
-      // Wait for any card-related selector to appear (networkidle2 should have loaded them)
+      // Wait for any card-related selector to appear (BrowserManager already waited 2s for JS)
       try {
         await page.waitForSelector(
           '#webshop_step_sku .selection-tile, div[class*="selection-tile"], input[name="paymentAmountItem"]',
@@ -375,8 +375,10 @@ class PurchaseService {
       logger.debug('Out of stock, waiting 0.5 seconds before retry...');
       await new Promise(resolve => setTimeout(resolve, this.RELOAD_CHECK_INTERVAL));
 
-      // Reload page and wait for full load
-      await page.reload({ waitUntil: 'networkidle2', timeout: 20000 });
+      // Reload page
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+      // Wait for JS to render
+      await new Promise(resolve => setTimeout(resolve, 1500));
 
       attempts++;
     }
@@ -411,12 +413,16 @@ class PurchaseService {
 
       if (!currentUrl.includes(gameUrl)) {
         logger.debug('Not on game page, navigating...');
-        await page.goto(gameUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
         logger.debug(`Navigated to: ${page.url()}`);
+        // Wait for JavaScript to render content
+        await new Promise(resolve => setTimeout(resolve, 2000));
       } else {
         logger.debug('Already on game page, refreshing to ensure clean state...');
-        await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 25000 });
         logger.debug(`Page refreshed: ${page.url()}`);
+        // Wait for JavaScript to render content
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       // Wait for cards with increased timeout and better error message
@@ -733,12 +739,12 @@ class PurchaseService {
 
       // Wait for navigation after checkout
       logger.http('Waiting for page to load after checkout...');
-      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {
         logger.debug('Navigation timeout - will check URL...');
       });
 
-      // Quick check for redirects
-      await new Promise(resolve => setTimeout(resolve, 200));
+      // Wait for any redirects to complete
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Check URL after checkout
       const urlAfterCheckout = await page.url();

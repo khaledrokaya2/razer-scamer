@@ -154,7 +154,7 @@ class BrowserManager {
     const isDevelopment = process.env.NODE_ENV === 'development';
 
     const browser = await puppeteer.launch({
-      headless: !isDevelopment,
+      headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
