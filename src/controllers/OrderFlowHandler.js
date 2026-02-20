@@ -918,15 +918,15 @@ class OrderFlowHandler {
       const validPinCount = fileGenerator.getValidPinCount(result.pins);
       const failedCount = result.pins ? result.pins.filter(p => p.pinCode === 'FAILED').length : 0;
       const totalCount = result.pins ? result.pins.length : 0;
-      
+
       // Check if all cards failed
       if (validPinCount === 0 && totalCount > 0) {
         // All cards failed - check for specific error types
         const firstFailedCard = result.pins.find(p => p.pinCode === 'FAILED');
-        const hasInsufficientBalance = result.pins.some(p => 
+        const hasInsufficientBalance = result.pins.some(p =>
           p.pinCode === 'FAILED' && p.error && p.error.includes('Insufficient')
         );
-        
+
         if (hasInsufficientBalance) {
           // Insufficient balance error
           await bot.sendMessage(
@@ -948,9 +948,9 @@ class OrderFlowHandler {
         const statusMessage = isScheduled
           ? messageFormatter.formatScheduledOrderComplete(result, validPinCount)
           : messageFormatter.formatOrderComplete(result.order, validPinCount);
-        
+
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
-        
+
         // Add warning about failed cards
         await bot.sendMessage(
           chatId,
@@ -962,7 +962,7 @@ class OrderFlowHandler {
         const statusMessage = isScheduled
           ? messageFormatter.formatScheduledOrderComplete(result, validPinCount)
           : messageFormatter.formatOrderComplete(result.order, validPinCount);
-        
+
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
       }
 
