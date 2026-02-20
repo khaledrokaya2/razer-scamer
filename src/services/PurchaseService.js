@@ -75,15 +75,11 @@ class PurchaseService {
     }
 
     try {
-      // Quick page load check - networkidle2 in BrowserManager already ensures full load
-      logger.http('Waiting for page to load...');
+      // BrowserManager already waited 2s after domcontentloaded for JS execution
+      logger.http('Verifying page loaded correctly...');
 
       // Check if page loaded successfully and user is logged in
       await page.waitForSelector('body', { timeout: 5000 });
-
-      // Small wait for final rendering (networkidle2 doesn't guarantee DOMContentLoaded events complete)
-      logger.debug('Waiting for dynamic content to load...');
-      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Check for access denied or login required (improved logic)
       const pageStatus = await page.evaluate(() => {

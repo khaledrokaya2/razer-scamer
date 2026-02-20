@@ -194,18 +194,21 @@ class BrowserManager {
 
     try {
       await page.goto(url, {
-        waitUntil: 'networkidle2',
-        timeout: 40000
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
       });
+      // Wait for JavaScript to execute and render dynamic content
+      await new Promise(resolve => setTimeout(resolve, 2000));
       return page;
     } catch (err) {
       logger.error(`[Global] Navigation failed to ${url}:`, err.message);
-      // Retry once with shorter timeout
+      // Retry once
       logger.http('[Global] Retrying navigation...');
       await page.goto(url, {
-        waitUntil: 'networkidle2',
-        timeout: 30000
+        waitUntil: 'domcontentloaded',
+        timeout: 20000
       });
+      await new Promise(resolve => setTimeout(resolve, 2000));
       return page;
     }
   }
@@ -222,11 +225,13 @@ class BrowserManager {
     logger.http(`Navigating to: ${url}`);
 
     try {
-      // Navigate and wait for network to be idle (ensures JS-rendered content loads)
+      // Navigate with fast loading strategy
       await page.goto(url, {
-        waitUntil: 'networkidle2',
-        timeout: 40000
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
       });
+      // Wait for JavaScript to execute and render dynamic content
+      await new Promise(resolve => setTimeout(resolve, 2000));
 
       // Check if session is still valid (not redirected to login)
       const isSessionValid = await this.checkSessionValid(page);
@@ -236,9 +241,10 @@ class BrowserManager {
 
         // Navigate to original URL after relogin
         await page.goto(url, {
-          waitUntil: 'networkidle2',
-          timeout: 40000
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
         });
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       // Update activity after successful navigation
