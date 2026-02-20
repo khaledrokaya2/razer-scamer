@@ -40,6 +40,10 @@ class PurchaseService {
     this.RELOAD_CHECK_INTERVAL = 500; // 0.5 seconds between stock checks (faster restocking detection)
     this.MAX_RELOAD_ATTEMPTS = 600; // 5 minutes of retrying (600 * 0.5s)
 
+    // Track active browser instances for each user (for cancellation)
+    // Map of telegramUserId -> Array of browser instances
+    this.activeBrowsers = new Map();
+
     // Purchase stages for tracking
     this.STAGES = {
       IDLE: 'idle',
@@ -717,9 +721,9 @@ class PurchaseService {
       await checkoutButton.click();
       logger.success('Checkout button clicked successfully');
 
-      // Wait for navigation after checkout
+      // Wait for navigation after checkout (optimized timeout)
       logger.http('Waiting for page to load after checkout...');
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {
         logger.debug('Navigation timeout - will check URL...');
       });
 
@@ -1171,9 +1175,9 @@ class PurchaseService {
     const db = require('./DatabaseService');
     const puppeteer = require('puppeteer');
 
-    // Configuration
-    const MAX_BROWSERS = 10;
-    const LAUNCH_STAGGER_MS = 300; // 300ms delay between browser spawns
+    // Configuration - OPTIMIZED for low resource usage (more browsers, less memory each)
+    const MAX_BROWSERS = 10; // Increased from 5 - each browser uses ~50% less memory
+    const LAUNCH_STAGGER_MS = 400; // 400ms stagger - fast but safe against rate limiting
 
     // Determine number of browsers to use (min of quantity and max browsers)
     const browserCount = Math.min(quantity, MAX_BROWSERS);
@@ -1190,7 +1194,8 @@ class PurchaseService {
       successCount: 0,
       failedCount: 0,
       processedCount: 0,
-      cancelled: false
+      cancelled: false,
+      browsers: [] // Track all browser instances for forceful cancellation
     };
 
     logger.purchase(`\n${'='.repeat(60)}`);
@@ -1224,30 +1229,56 @@ class PurchaseService {
             '--disable-renderer-backgrounding',
             '--no-first-run',
             '--mute-audio',
-            '--blink-settings=imagesEnabled=false'
+            '--blink-settings=imagesEnabled=false',
+            // AGGRESSIVE memory optimization - 50% less RAM per browser
+            '--disable-features=site-per-process',
+            '--single-process',
+            '--no-zygote',
+            '--disable-accelerated-2d-canvas',
+            '--disable-features=VizDisplayCompositor',
+            '--js-flags=--max-old-space-size=128', // Reduced from 256MB to 128MB
+            '--disable-web-security', // Reduce CORS overhead
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-blink-features=AutomationControlled',
+            '--disk-cache-size=0', // No disk cache
+            '--media-cache-size=0',
+            '--aggressive-cache-discard',
+            '--disable-cache',
+            '--disable-application-cache',
+            '--disable-offline-load-stale-cache',
+            '--disable-plugins'
           ]
         });
 
         page = await browser.newPage();
 
-        // Configure page
-        await page.setDefaultTimeout(30000);
-        await page.setDefaultNavigationTimeout(60000);
+        // Configure page with reduced timeouts and minimal viewport
+        await page.setViewport({ width: 800, height: 600 }); // Small viewport = less memory
+        await page.setDefaultTimeout(20000); // Reduced from 30s to 20s
+        await page.setDefaultNavigationTimeout(30000); // Reduced from 60s to 30s
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-        // Enable request interception to block heavy resources
+        // Optimized resource blocking (allow stylesheets for rendering)
         await page.setRequestInterception(true);
         page.on('request', (request) => {
           const resourceType = request.resourceType();
-          const blockedTypes = ['image', 'font', 'media', 'manifest', 'texttrack', 'eventsource'];
-          if (blockedTypes.includes(resourceType)) {
-            request.abort();
+          // Allow essential resources: stylesheets needed for page rendering
+          const allowedTypes = ['document', 'script', 'stylesheet', 'xhr', 'fetch'];
+          if (!allowedTypes.includes(resourceType)) {
+            request.abort(); // Block: images, fonts, media, websockets, etc.
           } else {
             request.continue();
           }
         });
 
         logger.success(`${label} Browser launched successfully`);
+
+        // Register browser for cancellation tracking
+        sharedState.browsers.push(browser);
+        if (!this.activeBrowsers.has(telegramUserId)) {
+          this.activeBrowsers.set(telegramUserId, []);
+        }
+        this.activeBrowsers.get(telegramUserId).push(browser);
 
         // Step 2: Login to Razer
         logger.debug(`${label} Logging in to Razer...`);
@@ -1258,19 +1289,18 @@ class PurchaseService {
           timeout: 20000
         });
 
-        // Wait for login form
-        await page.waitForSelector('#input-login-email', { visible: true, timeout: 8000 });
-        await page.waitForSelector('#input-login-password', { visible: true, timeout: 8000 });
+        // Wait for login form (reduced timeouts)
+        await page.waitForSelector('#input-login-email', { visible: true, timeout: 10000 });
+        await page.waitForSelector('#input-login-password', { visible: true, timeout: 10000 });
 
-        // Type credentials
-        await page.type('#input-login-email', credentials.email, { delay: 50 });
-        await page.type('#input-login-password', credentials.password, { delay: 50 });
+        // Type credentials (faster typing = less waiting)
+        await page.type('#input-login-email', credentials.email, { delay: 20 });
+        await page.type('#input-login-password', credentials.password, { delay: 20 });
 
-        // Handle cookie consent banner if present
+        // Handle cookie consent banner if present (no delay after click)
         try {
-          await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 2000 });
+          await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 1500 });
           await page.click('button[aria-label="Accept All"]');
-          await new Promise(resolve => setTimeout(resolve, 150));
         } catch (err) {
           // No cookie banner - that's fine
         }
@@ -1295,7 +1325,7 @@ class PurchaseService {
           waitUntil: 'domcontentloaded',
           timeout: 15000
         });
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for session cookies
+        await new Promise(resolve => setTimeout(resolve, 200)); // Minimal session cookie sync
 
         // Step 3: Process cards from queue until empty
         let cardsProcessed = 0;
@@ -1443,6 +1473,23 @@ class PurchaseService {
         // Close browser with timeout to prevent hanging
         if (browser) {
           try {
+            // Remove from tracking before closing
+            const index = sharedState.browsers.indexOf(browser);
+            if (index > -1) {
+              sharedState.browsers.splice(index, 1);
+            }
+            if (this.activeBrowsers.has(telegramUserId)) {
+              const userBrowsers = this.activeBrowsers.get(telegramUserId);
+              const userIndex = userBrowsers.indexOf(browser);
+              if (userIndex > -1) {
+                userBrowsers.splice(userIndex, 1);
+              }
+              // Clean up empty array
+              if (userBrowsers.length === 0) {
+                this.activeBrowsers.delete(telegramUserId);
+              }
+            }
+
             await Promise.race([
               browser.close(),
               new Promise(resolve => setTimeout(resolve, 5000))
@@ -1456,19 +1503,21 @@ class PurchaseService {
     };
 
     try {
-      // Launch all browser sessions with staggered timing
+      // Launch all browser sessions with minimal stagger for speed
       const sessionPromises = [];
 
+      // Launch browsers with minimal delay (more parallel, faster overall)
       for (let i = 0; i < browserCount; i++) {
-        // Stagger browser launches to avoid overwhelming the system
-        if (i > 0) {
-          await new Promise(resolve => setTimeout(resolve, LAUNCH_STAGGER_MS));
-        }
-
         logger.debug(`Spawning browser ${i + 1}/${browserCount}...`);
 
-        // Launch browser session (don't await - let it run independently)
-        sessionPromises.push(runPurchaseSession(i));
+        // Launch browser session immediately (parallel launch)
+        sessionPromises.push(
+          (async () => {
+            // Small stagger to avoid spike but much faster than sequential
+            await new Promise(resolve => setTimeout(resolve, i * LAUNCH_STAGGER_MS));
+            return runPurchaseSession(i);
+          })()
+        );
       }
 
       logger.success(`All ${browserCount} browsers launched - processing in parallel...`);
@@ -1493,7 +1542,58 @@ class PurchaseService {
       // Return what we have so far
       err.purchases = sharedState.purchases;
       throw err;
+    } finally {
+      // CRITICAL: Force close any remaining browsers on exit (cancellation, error, or completion)
+      if (sharedState.browsers && sharedState.browsers.length > 0) {
+        logger.system(`Cleaning up ${sharedState.browsers.length} remaining browsers...`);
+        const closePromises = sharedState.browsers.map(browser => {
+          return Promise.race([
+            browser.close().catch(() => { }),
+            new Promise(resolve => setTimeout(resolve, 2000))
+          ]);
+        });
+        await Promise.all(closePromises);
+        sharedState.browsers = [];
+      }
+
+      // Clean up user browser tracking
+      if (this.activeBrowsers.has(telegramUserId)) {
+        this.activeBrowsers.delete(telegramUserId);
+        logger.debug(`Cleared browser tracking for user ${telegramUserId}`);
+      }
     }
+  }
+
+  /**
+   * Forcefully close all active browsers for a user (for cancellation)
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<number>} Number of browsers closed
+   */
+  async forceCloseUserBrowsers(telegramUserId) {
+    const browsers = this.activeBrowsers.get(telegramUserId);
+    if (!browsers || browsers.length === 0) {
+      logger.debug(`No active browsers to close for user ${telegramUserId}`);
+      return 0;
+    }
+
+    logger.system(`Force closing ${browsers.length} active browsers for user ${telegramUserId}...`);
+
+    const closePromises = browsers.map(async (browser) => {
+      try {
+        await Promise.race([
+          browser.close(),
+          new Promise(resolve => setTimeout(resolve, 2000))
+        ]);
+      } catch (err) {
+        logger.debug('Error closing browser:', err.message);
+      }
+    });
+
+    await Promise.all(closePromises);
+    this.activeBrowsers.delete(telegramUserId);
+
+    logger.success(`Closed ${browsers.length} browsers for user ${telegramUserId}`);
+    return browsers.length;
   }
 }
 

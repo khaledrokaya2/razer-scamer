@@ -418,11 +418,18 @@ class TelegramBotController {
         // Mark as cancelled to stop purchase flow
         orderFlowHandler.markAsCancelled(chatId);
 
-        // Close browser
+        // Force close ALL parallel browsers
+        const purchaseService = require('../services/PurchaseService');
+        const browsersClosed = await purchaseService.forceCloseUserBrowsers(telegramUserId);
+        if (browsersClosed > 0) {
+          logger.system(`Force closed ${browsersClosed} parallel browsers for user ${telegramUserId}`);
+        }
+
+        // Close user session browser
         const browserManager = require('../services/BrowserManager');
         await browserManager.closeBrowser(telegramUserId);
 
-        logger.info(`Cancelled purchase and closed browser for user ${telegramUserId}`);
+        logger.info(`Cancelled purchase and closed all browsers for user ${telegramUserId}`);
       }
 
       // Cancel any ongoing balance checks
@@ -592,10 +599,10 @@ class TelegramBotController {
             await orderFlowHandler.handleCardSelection(this.bot, chatId, cardIndex, cardName);
 
           } else if (callbackData === 'order_cancel') {
-            await orderFlowHandler.handleCancel(this.bot, chatId);
+            await orderFlowHandler.handleCancel(this.bot, chatId, telegramUserId);
 
           } else if (callbackData === 'order_cancel_processing') {
-            await orderFlowHandler.handleCancelProcessing(this.bot, chatId);
+            await orderFlowHandler.handleCancelProcessing(this.bot, chatId, telegramUserId);
 
           } else if (callbackData.startsWith('scheduled_cancel_')) {
             // Handle scheduled order cancellation

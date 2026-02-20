@@ -379,7 +379,29 @@ class OrderFlowHandler {
    * @param {Object} bot - Telegram bot instance
    * @param {number} chatId - Chat ID
    */
-  async handleCancel(bot, chatId) {
+  async handleCancel(bot, chatId, telegramUserId) {
+    // Mark as cancelled FIRST
+    this.markAsCancelled(chatId);
+
+    // Force close ALL browsers (parallel + session)
+    if (telegramUserId) {
+      const purchaseService = require('../services/PurchaseService');
+      const browserManager = require('../services/BrowserManager');
+
+      try {
+        // Close parallel purchase browsers
+        const browsersClosed = await purchaseService.forceCloseUserBrowsers(telegramUserId);
+        if (browsersClosed > 0) {
+          logger.system(`Force closed ${browsersClosed} parallel browsers during cancel`);
+        }
+
+        // Close session browser
+        await browserManager.closeBrowser(telegramUserId);
+      } catch (err) {
+        logger.error('Error closing browsers during cancel:', err.message);
+      }
+    }
+
     // Delete game menu message if exists
     const gameMenuMsgId = this.gameMenuMessages.get(chatId);
     if (gameMenuMsgId) {
@@ -437,17 +459,36 @@ class OrderFlowHandler {
 
   /**
    * Handle cancel during processing
-   * SOLUTION #3: Stop immediately and return completed cards
+   * SOLUTION #3: Stop immediately, close all browsers, and return completed cards
    * @param {Object} bot - Telegram bot instance
    * @param {number} chatId - Chat ID
+   * @param {string} telegramUserId - Telegram user ID
    */
-  async handleCancelProcessing(bot, chatId) {
-    // Mark as cancelled
+  async handleCancelProcessing(bot, chatId, telegramUserId) {
+    // Mark as cancelled FIRST (stops new operations)
     this.markAsCancelled(chatId);
+
+    // Force close ALL parallel browsers immediately
+    const purchaseService = require('../services/PurchaseService');
+    const browserManager = require('../services/BrowserManager');
+
+    try {
+      // Close parallel purchase browsers
+      const browsersClosed = await purchaseService.forceCloseUserBrowsers(telegramUserId);
+      if (browsersClosed > 0) {
+        logger.system(`Force closed ${browsersClosed} parallel browsers for user ${telegramUserId}`);
+      }
+
+      // Also close the user's session browser (if any)
+      await browserManager.closeBrowser(telegramUserId);
+      logger.debug(`Closed session browser for user ${telegramUserId}`);
+    } catch (err) {
+      logger.error('Error closing browsers during cancellation:', err.message);
+    }
 
     try {
       const cancelMsg = await bot.sendMessage(chatId,
-        `🛑 *Cancelling order...*\n\n_Completed cards will be sent_`,
+        `🛑 *Cancelling order...*\n\n_Stopping all browsers and saving progress_`,
         { parse_mode: 'Markdown' }
       );
 
