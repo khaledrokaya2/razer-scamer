@@ -63,7 +63,7 @@ class BrowserManager {
       const email = 'mostloda14@gmail.com';
       const password = 'vvt?Zr54S%Xe+Wp';
 
-      await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+      await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 45000 });
 
       // Wait for login form
       await page.waitForSelector('#input-login-email', { visible: true, timeout: 15000 });
@@ -84,7 +84,7 @@ class BrowserManager {
       // Submit login form
       await Promise.all([
         page.click('button[type="submit"]'),
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 50000 })
+        page.waitForNavigation({ waitUntil: 'load', timeout: 60000 })
       ]);
 
       // Verify login success
@@ -217,8 +217,8 @@ class BrowserManager {
 
     try {
       await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000
+        waitUntil: 'load',
+        timeout: 60000
       });
       return page;
     } catch (err) {
@@ -226,8 +226,8 @@ class BrowserManager {
       // Retry once
       logger.http('[Global] Retrying navigation...');
       await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 20000
+        waitUntil: 'load',
+        timeout: 45000
       });
       return page;
     }
@@ -245,10 +245,10 @@ class BrowserManager {
     logger.http(`Navigating to: ${url}`);
 
     try {
-      // Navigate with fast loading strategy
+      // Navigate with reliable loading strategy
       await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000
+        waitUntil: 'load',
+        timeout: 60000
       });
 
       // Check if session is still valid (not redirected to login)
@@ -259,8 +259,8 @@ class BrowserManager {
 
         // Navigate to original URL after relogin
         await page.goto(url, {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000
+          waitUntil: 'load',
+          timeout: 60000
         });
       }
 
@@ -271,11 +271,11 @@ class BrowserManager {
     } catch (err) {
       logger.error(`Navigation failed to ${url}:`, err.message);
 
-      // If navigation fails, try one more time with minimal wait
+      // If navigation fails, try one more time
       logger.http('Retrying navigation...');
       await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 20000
+        waitUntil: 'load',
+        timeout: 45000
       });
 
       this.updateActivity(userId);
@@ -332,12 +332,12 @@ class BrowserManager {
 
       // Navigate to Razer login page
       await page.goto('https://razerid.razer.com/account/login', {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000
+        waitUntil: 'load',
+        timeout: 45000
       });
 
       // Wait for login form
-      await page.waitForSelector('input[type="email"]', { timeout: 10000 });
+      await page.waitForSelector('input[type="email"]', { timeout: 15000 });
 
       // Enter email
       await page.type('input[type="email"]', credentials.email, { delay: 50 });
@@ -349,7 +349,7 @@ class BrowserManager {
       await page.click('button[type="submit"]');
 
       // Wait for navigation after login
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForNavigation({ waitUntil: 'load', timeout: 60000 });
 
       logger.success(`Auto-relogin successful for user ${userId}`);
     } catch (err) {

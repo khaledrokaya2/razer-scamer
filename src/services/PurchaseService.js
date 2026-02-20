@@ -397,13 +397,13 @@ class PurchaseService {
 
       if (!isSameGame) {
         logger.debug('Not on game page, navigating...');
-        await page.goto(gameUrl, { waitUntil: 'networkidle2', timeout: 45000 });
+        await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
         logger.debug(`Navigated to: ${page.url()}`);
         // Wait for page to fully render (styles, fonts, scripts)
         await new Promise(resolve => setTimeout(resolve, 3000));
       } else {
         logger.debug('Already on correct game page, refreshing to ensure clean state...');
-        await page.reload({ waitUntil: 'networkidle2', timeout: 45000 });
+        await page.reload({ waitUntil: 'load', timeout: 60000 });
         logger.debug(`Page refreshed: ${page.url()}`);
         // Wait for page to fully render (styles, fonts, scripts)
         await new Promise(resolve => setTimeout(resolve, 3000));
@@ -1276,8 +1276,8 @@ class PurchaseService {
 
         // Navigate to login page
         await page.goto('https://razerid.razer.com', {
-          waitUntil: 'networkidle2',
-          timeout: 30000
+          waitUntil: 'load',
+          timeout: 45000
         });
 
         // Wait for login form
@@ -1299,7 +1299,7 @@ class PurchaseService {
         // Submit login form
         await Promise.all([
           page.click('button[type="submit"]'),
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 })
+          page.waitForNavigation({ waitUntil: 'load', timeout: 60000 })
         ]);
 
         // Verify login success
@@ -1313,10 +1313,10 @@ class PurchaseService {
         // Navigate to gold.razer.com to establish session (login was on razerid subdomain)
         logger.debug(`${label} Navigating to gold.razer.com to establish session...`);
         await page.goto('https://gold.razer.com/global/en', {
-          waitUntil: 'networkidle2',
-          timeout: 30000
+          waitUntil: 'load',
+          timeout: 60000
         });
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for session sync and page render
+        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for session sync and page render
 
         // Step 3: Process cards from queue until empty
         let cardsProcessed = 0;
