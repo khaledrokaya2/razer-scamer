@@ -1210,7 +1210,7 @@ class PurchaseService {
         // Step 1: Launch browser
         logger.debug(`${label} Launching browser...`);
         browser = await puppeteer.launch({
-          headless: process.env.NODE_ENV === 'development',
+          headless: true,
           args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
