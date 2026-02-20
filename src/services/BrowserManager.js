@@ -247,6 +247,28 @@ class BrowserManager {
       });
       // Wait for JavaScript to execute and render dynamic content
       await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Check for geo-redirect (e.g., /global/en/ → /eu/en/)
+      const finalUrl = page.url();
+      if (finalUrl !== url && url.includes('/global/en/')) {
+        // Extract region from redirected URL (e.g., /eu/en/, /us/en/, etc.)
+        const regionMatch = finalUrl.match(/\/([\w-]+)\/([\w-]+)\//);
+        if (regionMatch && !url.includes(regionMatch[0])) {
+          const detectedRegion = `${regionMatch[1]}/${regionMatch[2]}`;
+          logger.warn(`[Global] Geo-redirect detected: /global/en/ → /${detectedRegion}/`);
+
+          // Adjust URL with correct region
+          const correctedUrl = url.replace('/global/en/', `/${detectedRegion}/`);
+          logger.http(`[Global] Navigating to region-corrected URL: ${correctedUrl}`);
+
+          await page.goto(correctedUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+          });
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+
       return page;
     } catch (err) {
       logger.error(`[Global] Navigation failed to ${url}:`, err.message);
@@ -281,14 +303,41 @@ class BrowserManager {
       // Wait for JavaScript to execute and render dynamic content
       await new Promise(resolve => setTimeout(resolve, 2000));
 
+      // Check for geo-redirect (e.g., /global/en/ → /eu/en/)
+      const finalUrl = page.url();
+      if (finalUrl !== url && url.includes('/global/en/')) {
+        // Extract region from redirected URL
+        const regionMatch = finalUrl.match(/\/([\w-]+)\/([\w-]+)\//);
+        if (regionMatch && !url.includes(regionMatch[0])) {
+          const detectedRegion = `${regionMatch[1]}/${regionMatch[2]}`;
+          logger.warn(`Geo-redirect detected: /global/en/ → /${detectedRegion}/`);
+
+          // Adjust URL with correct region
+          const correctedUrl = url.replace('/global/en/', `/${detectedRegion}/`);
+          logger.http(`Navigating to region-corrected URL: ${correctedUrl}`);
+
+          await page.goto(correctedUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+          });
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+
       // Check if session is still valid (not redirected to login)
       const isSessionValid = await this.checkSessionValid(page);
       if (!isSessionValid) {
         logger.warn(`Session expired for user ${userId}, attempting auto-relogin...`);
         await this.autoRelogin(userId, page);
 
-        // Navigate to original URL after relogin
-        await page.goto(url, {
+        // Navigate to original URL after relogin (use region-corrected URL if needed)
+        const finalNavigationUrl = page.url().includes('/global/en/') ?
+          url :
+          page.url().match(/\/([\w-]+)\/([\w-]+)\//) ?
+            url.replace('/global/en/', `/${page.url().match(/\/([\w-]+)\/([\w-]+)\//)[1]}/${page.url().match(/\/([\w-]+)\/([\w-]+)\//)[2]}/`) :
+            url;
+
+        await page.goto(finalNavigationUrl, {
           waitUntil: 'domcontentloaded',
           timeout: 30000
         });

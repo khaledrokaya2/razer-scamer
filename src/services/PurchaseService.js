@@ -449,14 +449,31 @@ class PurchaseService {
       logger.debug(`Current URL: ${currentUrl}`);
       logger.debug(`Target game URL: ${gameUrl}`);
 
-      if (!currentUrl.includes(gameUrl)) {
+      // Extract game identifier (last part of URL) to compare across different regions
+      const targetGameId = gameUrl.split('/').pop();
+      const currentGameId = currentUrl.split('/').pop();
+      const isSameGame = currentGameId === targetGameId;
+
+      if (!isSameGame) {
         logger.debug('Not on game page, navigating...');
         await page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+
+        // Check for geo-redirect and correct URL if needed
+        const finalUrl = page.url();
+        if (finalUrl !== gameUrl && gameUrl.includes('/global/en/') && !finalUrl.includes(targetGameId)) {
+          const regionMatch = finalUrl.match(/\/([\w-]+)\/([\w-]+)\//);
+          if (regionMatch) {
+            const correctedUrl = gameUrl.replace('/global/en/', `/${regionMatch[1]}/${regionMatch[2]}/`);
+            logger.warn(`Geo-redirect detected, navigating to: ${correctedUrl}`);
+            await page.goto(correctedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          }
+        }
+
         logger.debug(`Navigated to: ${page.url()}`);
         // Wait for JavaScript to render content
         await new Promise(resolve => setTimeout(resolve, 2000));
       } else {
-        logger.debug('Already on game page, refreshing to ensure clean state...');
+        logger.debug('Already on correct game page, refreshing to ensure clean state...');
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 25000 });
         logger.debug(`Page refreshed: ${page.url()}`);
         // Wait for JavaScript to render content
