@@ -1191,7 +1191,7 @@ class PurchaseService {
     const puppeteer = require('puppeteer');
 
     // Configuration - OPTIMIZED for low resource usage (more browsers, less memory each)
-    const MAX_BROWSERS = 10; // Increased to 10 for faster parallel processing
+    const MAX_BROWSERS = 5; // Increased to 10 for faster parallel processing
     const LAUNCH_STAGGER_MS = 300; // 300ms stagger - fast parallel launch
 
     // Retry configuration
