@@ -75,15 +75,15 @@ class PurchaseService {
     }
 
     try {
-      // Quick page load check - fast loading
+      // Quick page load check - networkidle2 in BrowserManager already ensures full load
       logger.http('Waiting for page to load...');
 
       // Check if page loaded successfully and user is logged in
       await page.waitForSelector('body', { timeout: 5000 });
 
-      // Give page time to execute JavaScript and render dynamic content
+      // Small wait for final rendering (networkidle2 doesn't guarantee DOMContentLoaded events complete)
       logger.debug('Waiting for dynamic content to load...');
-      await new Promise(resolve => setTimeout(resolve, 1500));
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // Check for access denied or login required (improved logic)
       const pageStatus = await page.evaluate(() => {
@@ -126,11 +126,11 @@ class PurchaseService {
       // Wait for cards to load with extended timeout for first-time loading
       logger.http('Waiting for cards to load...');
 
-      // Wait for any card-related selector to appear (up to 8 seconds)
+      // Wait for any card-related selector to appear (networkidle2 should have loaded them)
       try {
         await page.waitForSelector(
           '#webshop_step_sku .selection-tile, div[class*="selection-tile"], input[name="paymentAmountItem"]',
-          { timeout: 8000 }
+          { timeout: 10000 }
         );
         logger.success('Card elements detected on page');
       } catch (waitErr) {

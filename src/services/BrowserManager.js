@@ -194,17 +194,17 @@ class BrowserManager {
 
     try {
       await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000
+        waitUntil: 'networkidle2',
+        timeout: 40000
       });
       return page;
     } catch (err) {
       logger.error(`[Global] Navigation failed to ${url}:`, err.message);
-      // Retry once
+      // Retry once with shorter timeout
       logger.http('[Global] Retrying navigation...');
       await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 20000
+        waitUntil: 'networkidle2',
+        timeout: 30000
       });
       return page;
     }
@@ -222,10 +222,10 @@ class BrowserManager {
     logger.http(`Navigating to: ${url}`);
 
     try {
-      // Navigate with fast loading strategy
+      // Navigate and wait for network to be idle (ensures JS-rendered content loads)
       await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000
+        waitUntil: 'networkidle2',
+        timeout: 40000
       });
 
       // Check if session is still valid (not redirected to login)
@@ -236,8 +236,8 @@ class BrowserManager {
 
         // Navigate to original URL after relogin
         await page.goto(url, {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000
+          waitUntil: 'networkidle2',
+          timeout: 40000
         });
       }
 
