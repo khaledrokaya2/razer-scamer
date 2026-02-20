@@ -1176,7 +1176,7 @@ class PurchaseService {
     const puppeteer = require('puppeteer');
 
     // Configuration - OPTIMIZED for low resource usage (more browsers, less memory each)
-    const MAX_BROWSERS = 10; // Increased from 5 - each browser uses ~50% less memory
+    const MAX_BROWSERS = 7; // Increased from 5 - each browser uses ~50% less memory
     const LAUNCH_STAGGER_MS = 400; // 400ms stagger - fast but safe against rate limiting
 
     // Determine number of browsers to use (min of quantity and max browsers)
@@ -1267,8 +1267,8 @@ class PurchaseService {
         });
 
         // Wait for login form (reduced timeouts)
-        await page.waitForSelector('#input-login-email', { visible: true, timeout: 10000 });
-        await page.waitForSelector('#input-login-password', { visible: true, timeout: 10000 });
+        await page.waitForSelector('#input-login-email', { visible: true, timeout: 20000 });
+        await page.waitForSelector('#input-login-password', { visible: true, timeout: 20000 });
 
         // Type credentials (faster typing = less waiting)
         await page.type('#input-login-email', credentials.email, { delay: 20 });
