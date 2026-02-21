@@ -317,7 +317,7 @@ class OrderFlowHandler {
 
     // Show loading message
     const loadingMsg = await bot.sendMessage(chatId,
-      `🔄 *LOADING CARDS*\n🎮 ${gameName}\n\n_Please wait..._`,
+      `🔄 *LOADING CARDS*\n${gameName}\n\n_Please wait..._`,
       { parse_mode: 'Markdown' }
     );
 
@@ -559,7 +559,7 @@ class OrderFlowHandler {
 
     // Show loading message
     const loadingMsg = await bot.sendMessage(chatId,
-      `🔄 *LOADING CARDS*\n🎮 ${game.name}\n\n_Please wait..._`,
+      `🔄 *LOADING CARDS*\n${game.name}\n\n_Please wait..._`,
       { parse_mode: 'Markdown' }
     );
 
@@ -605,7 +605,6 @@ class OrderFlowHandler {
 
       const cardMenuMsg = await bot.sendMessage(chatId,
         `💎 *SELECT CARD VALUE* \n` +
-        `💎 *SELECT CARD VALUE*\n` +
         `🎮 ${game.name}`,
         {
           parse_mode: 'Markdown',
@@ -682,9 +681,8 @@ class OrderFlowHandler {
     // Ask for quantity
     try {
       await bot.sendMessage(chatId,
-        `📦 *ENTER QUANTITY*\n` +
         `💎 ${cardName.replace(/_/g, ' ')}\n\n` +
-        `📊 Range: 1-100\n\n_Type number or /start to cancel_`,
+        `📦 *ENTER QUANTITY:*`,
         {
           parse_mode: 'Markdown',
         }
@@ -728,27 +726,8 @@ class OrderFlowHandler {
 
       if (backupCodeCount === 0) {
         await bot.sendMessage(chatId,
-          `⚠️ *NO BACKUP CODES*\n\nAdd codes in: ⚙️ Settings → 🔑 Backup Codes\n\n_Use /start to cancel_`,
+          `⚠️ *NO BACKUP CODES*`,
           { parse_mode: 'Markdown' }
-        );
-        return;
-      }
-
-      if (backupCodeCount < 5) {
-        await bot.sendMessage(chatId,
-          `⚠️ *LOW BACKUP CODES*\n\n` +
-          `You have ${backupCodeCount} codes. For ${quantity} cards, you may need ${Math.ceil(quantity / 15)} codes.\n\n` +
-          `Continue anyway?`,
-          {
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '✅ Continue Anyway', callback_data: 'order_confirm_continue' }],
-                [{ text: '🔑 Add More Codes', callback_data: 'settings_backup_codes' }],
-                [{ text: '❌ Cancel Order', callback_data: 'order_cancel' }]
-              ]
-            }
-          }
         );
         return;
       }
@@ -831,25 +810,26 @@ class OrderFlowHandler {
    */
   async _executeOrder({ bot, chatId, telegramUserId, gameName, gameUrl, cardName, cardIndex, quantity, isScheduled = false, scheduledOrderId = null }) {
     try {
-      // Show processing message with cancel button
-      const processingMsg = await bot.sendMessage(chatId,
-        `⏳ *${isScheduled ? 'SCHEDULED ORDER' : 'PROCESSING ORDER'}...*\n\n` +
-        `🎮 ${gameName}\n` +
-        `💳 ${cardName}\n` +
-        `🔢 Quantity: ${quantity}\n\n` +
-        `⏱️ This may take several minutes.\n` +
-        `Please wait...`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[
-              { text: '🛑 Cancel Order', callback_data: isScheduled ? `scheduled_cancel_${chatId}` : 'order_cancel_processing' }
-            ]]
-          }
-        }
-      );
+      // Send initial progress message immediately (0/total) with cancel button
+      const progressBar = this.createProgressBar(0, quantity);
+      const initialProgressText =
+        `${gameName}\n` +
+        `💎 ${cardName}\n` +
+        `📦 Quantity: ${quantity}\n\n` +
+        `⏳PROGRESS\n` +
+        `${progressBar}\n` +
+        `✅ 0/${quantity} (📊 0%)`;
 
-      this.orderSummaryMessages.set(chatId, processingMsg.message_id);
+      const progressMsg = await bot.sendMessage(chatId, initialProgressText, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '🛑 Cancel Order', callback_data: isScheduled ? `scheduled_cancel_${chatId}` : 'order_cancel_processing' }
+          ]]
+        }
+      });
+
+      this.progressMessages.set(chatId, progressMsg.message_id);
 
       // Progress update callback
       const sendProgressUpdate = async (completed, total) => {
@@ -972,7 +952,7 @@ class OrderFlowHandler {
           // Insufficient balance error
           await bot.sendMessage(
             chatId,
-            '❌ *Order Failed*\n\n💰 *Insufficient Razer Gold Balance*\n\nPlease reload your account and try again.\n\n' +
+            '❌ *Order Failed*\n\n💰 *Insufficient Razer Gold Balance*\n\n' +
             `Failed: ${failedCount}/${totalCount} cards`,
             { parse_mode: 'Markdown' }
           );
@@ -1012,6 +992,12 @@ class OrderFlowHandler {
         await fileGenerator.sendPinFiles(bot, chatId, result.order.id, result.pins, {
           formatPinsPlain: orderService.formatPinsPlain.bind(orderService)
         });
+
+        // Send failed cards report if any cards failed
+        if (failedCount > 0) {
+          await fileGenerator.sendFailedCardsReport(bot, chatId, result.order.id, result.pins);
+        }
+
         orderService.clearOrderPins(result.order.id);
       }
 
@@ -1454,11 +1440,10 @@ class OrderFlowHandler {
     const currentEgyptTime = `${String(nowEgypt.getUTCDate()).padStart(2, '0')}/${String(nowEgypt.getUTCMonth() + 1).padStart(2, '0')} ${String(nowEgypt.getUTCHours()).padStart(2, '0')}:${String(nowEgypt.getUTCMinutes()).padStart(2, '0')}`;
 
     await bot.sendMessage(chatId,
-      `⏰ *SCHEDULE ORDER*\n\n` +
+      `⏰ *Enter Time*\n\n` +
       `Format: DD/MM HH:MM\n` +
       `Example: 20/02 14:30\n\n` +
       `📍 Current Egypt time: \`${currentEgyptTime}\`\n\n` +
-      `_Use /start to cancel_`,
       { parse_mode: 'Markdown' }
     );
   }
@@ -1576,12 +1561,10 @@ class OrderFlowHandler {
       await bot.sendMessage(chatId,
         `✅ *ORDER SCHEDULED* #${scheduledOrderId}\n\n` +
         `📍 ${egyptTimeStr} (Egypt time)\n` +
-        `🌍 ${scheduledTime.toISOString().slice(0, 16).replace('T', ' ')} (UTC)\n\n` +
         `🎮 ${session.gameName}\n` +
         `💎 ${session.cardName}\n` +
         `🔢 ${session.quantity}\n\n` +
-        `You'll be notified when it starts.\n\n` +
-        `Use /start to return to menu.`,
+        `You'll be notified when it starts.\n\n`,
         { parse_mode: 'Markdown' }
       );
 

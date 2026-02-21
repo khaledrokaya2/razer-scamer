@@ -210,6 +210,51 @@ class FileGenerator {
   }
 
   /**
+   * Send a .txt file with only the failed cards and their failure reasons
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Telegram chat ID
+   * @param {number} orderId - Order ID
+   * @param {Array} pins - Array of pin objects (all pins, will filter to failed only)
+   */
+  async sendFailedCardsReport(bot, chatId, orderId, pins) {
+    try {
+      const failedPins = pins.filter(p => p.pinCode === 'FAILED');
+
+      if (failedPins.length === 0) return;
+
+      this.ensureDirectoryExists();
+
+      let content = `Failed Cards Report - Order #${orderId}\n`;
+      content += `${'='.repeat(45)}\n\n`;
+      content += `Total Failed: ${failedPins.length}\n\n`;
+
+      failedPins.forEach((pin, index) => {
+        content += `Card ${index + 1}:\n`;
+        content += `  Stage: ${pin.stage || 'Unknown'}\n`;
+        content += `  Error: ${pin.error || 'Unknown error'}\n`;
+        if (pin.transactionId) {
+          content += `  Transaction ID: ${pin.transactionId}\n`;
+        }
+        content += `\n`;
+      });
+
+      const fileName = `order_${orderId}_failed_cards.txt`;
+      const filePath = this.writeFile(fileName, content);
+
+      await bot.sendDocument(chatId, filePath, {
+        caption: `\u274c *Failed Cards Report*\nOrder #${orderId} — ${failedPins.length} card(s) failed`,
+        parse_mode: 'Markdown',
+        contentType: 'text/plain'
+      });
+
+      this.deleteFile(filePath);
+      logger.info(`FileGenerator: Sent failed cards report for order ${orderId}`);
+    } catch (err) {
+      logger.error('FileGenerator: Error sending failed cards report:', err);
+    }
+  }
+
+  /**
    * Get count of valid (non-FAILED) pins
    * @param {Array} pins - Array of pin objects
    * @returns {number} - Count of valid pins

@@ -938,8 +938,7 @@ class TelegramBotController {
     const keyboard = {
       inline_keyboard: [
         [{ text: '🔐 Razer ID', callback_data: 'settings_razer_id' }],
-        [{ text: '🔑 Backup Codes', callback_data: 'settings_backup_codes' }],
-        [{ text: '❌ Close', callback_data: 'close_menu' }]
+        [{ text: '🔑 Backup Codes', callback_data: 'settings_backup_codes' }]
       ]
     };
 
@@ -1050,7 +1049,7 @@ class TelegramBotController {
 
     this.bot.sendMessage(
       chatId,
-      '⚙️ *Update Credentials*\nEnter your Razer email:',
+      '*Email:*',
       { parse_mode: 'Markdown', reply_markup: keyboard }
     );
   }
@@ -1074,7 +1073,7 @@ class TelegramBotController {
       ]
     };
 
-    this.bot.sendMessage(chatId, '🔑 Enter your Razer password:', { reply_markup: keyboard });
+    this.bot.sendMessage(chatId, '*Password:*', { reply_markup: keyboard });
   }
 
   /**
@@ -1122,9 +1121,7 @@ class TelegramBotController {
 
       await this.safeSendMessage(
         chatId,
-        '✅ **Credentials Updated Successfully!**\n\n' +
-        'Your credentials have been encrypted and saved.\n' +
-        'You can now use automatic login! 🎉',
+        '✅ *Credentials Updated Successfully!*',
         { parse_mode: 'Markdown' }
       );
 
