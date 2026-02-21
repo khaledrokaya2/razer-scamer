@@ -1192,7 +1192,7 @@ class PurchaseService {
 
     // Configuration - OPTIMIZED for low resource usage (more browsers, less memory each)
     const MAX_BROWSERS = 10; // Increased to 10 for faster parallel processing
-    const LAUNCH_STAGGER_MS = 300; // 300ms stagger - fast parallel launch
+    const LAUNCH_STAGGER_MS = 800; // 300ms stagger - fast parallel launch
 
     // Retry configuration
     const MAX_BROWSER_LAUNCH_RETRIES = 3; // Retry browser launch up to 3 times

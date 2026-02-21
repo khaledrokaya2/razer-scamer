@@ -167,9 +167,8 @@ class FileGenerator {
 
       await bot.sendDocument(chatId, filePath1, {
         caption: this.generateCaption(orderId, 'with_serial', isPartial),
-        parse_mode: 'Markdown',
-        contentType: 'text/plain'
-      });
+        parse_mode: 'Markdown'
+      }, { contentType: 'text/plain' });
 
       this.deleteFile(filePath1);
 
@@ -180,9 +179,8 @@ class FileGenerator {
 
       await bot.sendDocument(chatId, filePath2, {
         caption: this.generateCaption(orderId, 'only', isPartial),
-        parse_mode: 'Markdown',
-        contentType: 'text/plain'
-      });
+        parse_mode: 'Markdown'
+      }, { contentType: 'text/plain' });
 
       this.deleteFile(filePath2);
 
@@ -243,9 +241,8 @@ class FileGenerator {
 
       await bot.sendDocument(chatId, filePath, {
         caption: `\u274c *Failed Cards Report*\nOrder #${orderId} — ${failedPins.length} card(s) failed`,
-        parse_mode: 'Markdown',
-        contentType: 'text/plain'
-      });
+        parse_mode: 'Markdown'
+      }, { contentType: 'text/plain' });
 
       this.deleteFile(filePath);
       logger.info(`FileGenerator: Sent failed cards report for order ${orderId}`);

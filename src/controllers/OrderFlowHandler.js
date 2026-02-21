@@ -368,7 +368,7 @@ class OrderFlowHandler {
       }
 
       // Show error message
-      await bot.sendMessage(chatId, `❌ *Error loading cards*\nInvalid URL or network error\n\nUse /start to retry.`, { parse_mode: 'Markdown' });
+      await bot.sendMessage(chatId, `❌ *Error loading cards*\nInvalid URL or network error`, { parse_mode: 'Markdown' });
 
       this.clearSession(chatId);
     }
@@ -628,10 +628,7 @@ class OrderFlowHandler {
       await bot.sendMessage(chatId,
         `❌ *ERROR*     \n` +
         `Failed to load available cards.\n\n` +
-        `Please try again later or\n` +
-        `contact support if the issue\n` +
-        `persists.\n\n` +
-        `Use /start to try again.`,
+        `Please try again later`,
         { parse_mode: 'Markdown' }
       );
       this.clearSession(chatId);
@@ -681,7 +678,6 @@ class OrderFlowHandler {
     // Ask for quantity
     try {
       await bot.sendMessage(chatId,
-        `💎 ${cardName.replace(/_/g, ' ')}\n\n` +
         `📦 *ENTER QUANTITY:*`,
         {
           parse_mode: 'Markdown',
@@ -745,8 +741,7 @@ class OrderFlowHandler {
       logger.error('Error checking backup codes:', err);
       await bot.sendMessage(chatId,
         `❌ *ERROR*\n\n` +
-        `Failed to check backup codes.\n` +
-        `Please try again or /start to cancel.`,
+        `Failed to check backup codes.`,
         { parse_mode: 'Markdown' }
       );
     }
@@ -1469,8 +1464,7 @@ class OrderFlowHandler {
       if (!match) {
         await bot.sendMessage(chatId,
           `❌ *INVALID FORMAT*\n\n` +
-          `Use: DD/MM HH:MM (Example: 20/02 14:30)\n\n` +
-          `_Try again or /start to cancel_`,
+          `Use: DD/MM HH:MM (Example: 20/02 14:30)`,
           { parse_mode: 'Markdown' }
         );
         return;
@@ -1491,8 +1485,7 @@ class OrderFlowHandler {
       if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
         await bot.sendMessage(chatId,
           `❌ *INVALID TIME*\n\n` +
-          `Hour must be 0-23, minute must be 0-59\n\n` +
-          `_Try again or /start to cancel_`,
+          `Hour must be 0-23, minute must be 0-59`,
           { parse_mode: 'Markdown' }
         );
         return;
@@ -1514,8 +1507,7 @@ class OrderFlowHandler {
 
         await bot.sendMessage(chatId,
           `❌ *INVALID TIME*\n\n` +
-          `Must be in future. Current Egypt time: ${displayTime}\n\n` +
-          `_Try again or /start to cancel_`,
+          `Must be in future. Current Egypt time: ${displayTime}`,
           { parse_mode: 'Markdown' }
         );
         return;
@@ -1526,7 +1518,7 @@ class OrderFlowHandler {
       const maxTime = new Date(Date.now() + maxDays * 24 * 60 * 60 * 1000);
       if (scheduledTime > maxTime) {
         await bot.sendMessage(chatId,
-          `❌ *TOO FAR AHEAD*\n\nMax: ${maxDays} days\n\n_Try again or /start to cancel_`,
+          `❌ *TOO FAR AHEAD*\n\nMax: ${maxDays} days`,
           { parse_mode: 'Markdown' }
         );
         return;
@@ -1575,8 +1567,7 @@ class OrderFlowHandler {
       logger.error('Schedule time input error:', err);
       await bot.sendMessage(chatId,
         `❌ *ERROR*\n\n` +
-        `Failed to schedule order.\n` +
-        `Please try again or /start to cancel.`,
+        `Failed to schedule order.`,
         { parse_mode: 'Markdown' }
       );
     }
