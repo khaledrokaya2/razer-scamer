@@ -177,11 +177,17 @@ class OrderService {
         }
       });
 
-      // Step 3: Handle failed cards (store in memory only)
+      // Step 3: Handle failed cards NOT already saved via onCardCompleted
+      // Cards saved via guaranteedDbSave during processing have savedToDb=true
+      // Only add cards that were NOT already saved (to prevent double-counting)
       let failedCardsCount = 0;
       for (const purchase of purchases) {
         if (purchase.success === false) {
           failedCardsCount++;
+          // Skip entries already saved to DB and already in orderData.pins via onCardCompleted
+          if (purchase.savedToDb) {
+            continue;
+          }
           // Store failed cards in memory for sending to user
           const orderData = this.orderPins.get(order.id);
           if (orderData && orderData.pins) {

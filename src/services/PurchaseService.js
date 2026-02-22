@@ -406,6 +406,11 @@ class PurchaseService {
       const currentGameId = currentUrl.split('/').pop();
       const isSameGame = currentGameId === targetGameId;
 
+      // Anti-rate-limit: random delay (1-4s) before navigation to stagger browser requests
+      // This prevents all 10 browsers from hitting Razer's CDN at the exact same moment
+      const navJitter = 1000 + Math.floor(Math.random() * 3000);
+      await new Promise(resolve => setTimeout(resolve, navJitter));
+
       if (!isSameGame) {
         logger.debug('Not on game page, navigating...');
         await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
@@ -420,32 +425,52 @@ class PurchaseService {
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
-      // Wait for cards with safe timeout and better error message
+      // Wait for cards with Access Denied retry logic (Akamai WAF rate-limiting)
       logger.debug('Waiting for interactive card tiles to load...');
-      try {
-        // First wait for the main content area to be visible
-        await page.waitForSelector('#webshop_step_sku', { visible: true, timeout: 25000 });
-        logger.debug('Main webshop area loaded');
+      const MAX_ACCESS_DENIED_RETRIES = 3;
+      for (let adRetry = 0; adRetry <= MAX_ACCESS_DENIED_RETRIES; adRetry++) {
+        try {
+          // Check for Access Denied page
+          const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 300));
+          if (bodyText.includes('Access Denied')) {
+            if (adRetry >= MAX_ACCESS_DENIED_RETRIES) {
+              throw new Error('Access Denied by Razer CDN after multiple retries - rate limited');
+            }
+            const backoffDelay = (adRetry + 1) * 10000 + Math.floor(Math.random() * 5000);
+            logger.warn(`Access Denied detected (attempt ${adRetry + 1}/${MAX_ACCESS_DENIED_RETRIES}). Waiting ${Math.round(backoffDelay / 1000)}s...`);
+            await new Promise(resolve => setTimeout(resolve, backoffDelay));
+            await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            continue; // Retry the check
+          }
 
-        // Wait for actual interactive card tiles (the ones with labels and radio inputs)
-        await page.waitForSelector('#webshop_step_sku .selection-tile', {
-          visible: true,
-          timeout: 25000
-        });
-        logger.debug('Card tile containers loaded');
+          // First wait for the main content area to be visible
+          await page.waitForSelector('#webshop_step_sku', { visible: true, timeout: 25000 });
+          logger.debug('Main webshop area loaded');
 
-        // Wait for radio inputs to be rendered inside the tiles
-        await page.waitForSelector('#webshop_step_sku .selection-tile input[type="radio"]', {
-          visible: true,
-          timeout: 25000
-        });
-        logger.success('Card tiles loaded successfully');
-      } catch (err) {
-        // Log page content for debugging
-        const bodyHTML = await page.evaluate(() => document.body.innerText.substring(0, 500));
-        logger.error(`Failed to find card tiles. Page content: ${bodyHTML}`);
-        logger.error(`Current URL: ${page.url()}`);
-        throw new Error('Card selection tiles not found - page may not have loaded correctly');
+          // Wait for actual interactive card tiles (the ones with labels and radio inputs)
+          await page.waitForSelector('#webshop_step_sku .selection-tile', {
+            visible: true,
+            timeout: 25000
+          });
+          logger.debug('Card tile containers loaded');
+
+          // Wait for radio inputs to be rendered inside the tiles
+          await page.waitForSelector('#webshop_step_sku .selection-tile input[type="radio"]', {
+            visible: true,
+            timeout: 25000
+          });
+          logger.success('Card tiles loaded successfully');
+          break; // Success - exit retry loop
+        } catch (err) {
+          // On last retry or non-Access-Denied error, fail
+          if (adRetry >= MAX_ACCESS_DENIED_RETRIES || !err.message?.includes('Access Denied')) {
+            const bodyHTML = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => 'Could not read page');
+            logger.error(`Failed to find card tiles. Page content: ${bodyHTML}`);
+            logger.error(`Current URL: ${page.url()}`);
+            throw new Error('Card selection tiles not found - page may not have loaded correctly');
+          }
+        }
       }
 
       // Check cancellation
@@ -1165,8 +1190,10 @@ class PurchaseService {
         }
 
       } else {
-        // Not on transaction page - something went wrong BEFORE reaching transaction
-        currentStage = this.STAGES.FAILED;
+        // Not on transaction page - something went wrong
+        // IMPORTANT: Do NOT override currentStage to FAILED here!
+        // The stage must reflect where we actually were (e.g., clicking_checkout)
+        // so the upstream error handler can detect if checkout was already clicked.
         logger.debug(`Stage: ${currentStage} - Did not reach transaction page`);
         throw new Error(`Did not reach transaction page. Current URL: ${currentUrl}`);
       }
@@ -1226,6 +1253,20 @@ class PurchaseService {
     // Configuration
     const MAX_BROWSERS = 10;
     const LAUNCH_STAGGER_MS = 800;
+
+    // User-Agent rotation to reduce fingerprint correlation across browsers
+    const USER_AGENTS = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    ];
     const MAX_BROWSER_LAUNCH_RETRIES = 3;
     const MAX_LOGIN_RETRIES = 3;
     const RETRY_DELAY_MS = 2000;
@@ -1318,7 +1359,9 @@ class PurchaseService {
           await page.setViewport({ width: 1280, height: 720 });
           await page.setDefaultTimeout(45000);
           await page.setDefaultNavigationTimeout(60000);
-          await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+          // Rotate User-Agent per browser to reduce fingerprint correlation
+          const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+          await page.setUserAgent(ua);
 
           await page.setRequestInterception(true);
           page.on('request', (request) => {
@@ -1551,6 +1594,7 @@ class PurchaseService {
 
               // GUARANTEED DB save - tracked and cannot be interrupted
               await guaranteedDbSave(result, cardNumber, label);
+              result.savedToDb = true;
             } else {
               sharedState.failedCount++;
               logger.warn(`${label} Card ${cardNumber}/${quantity} reached transaction but extraction FAILED`);
@@ -1559,6 +1603,7 @@ class PurchaseService {
               // This means money was spent - must be tracked for manual PIN recovery
               if (result.transactionId) {
                 await guaranteedDbSave(result, cardNumber, label);
+                result.savedToDb = true;
               }
             }
 
@@ -1602,6 +1647,7 @@ class PurchaseService {
                 };
                 sharedState.purchases.push(expiredResult);
                 await guaranteedDbSave(expiredResult, cardNumber, label);
+                expiredResult.savedToDb = true;
                 if (onProgress) {
                   try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
                 }
@@ -1656,6 +1702,7 @@ class PurchaseService {
                 };
                 sharedState.purchases.push(invalidCodeResult);
                 await guaranteedDbSave(invalidCodeResult, cardNumber, label);
+                invalidCodeResult.savedToDb = true;
                 if (onProgress) {
                   try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
                 }
@@ -1688,6 +1735,7 @@ class PurchaseService {
                 sharedState.processedCount++;
                 cardsProcessed++;
                 await guaranteedDbSave(rescuedResult, cardNumber, label);
+                rescuedResult.savedToDb = true;
               }
               sharedState.cancelled = true;
               logger.info(`${label} Order cancelled by user`);
@@ -1697,6 +1745,7 @@ class PurchaseService {
             // ===== OTHER ERRORS =====
             // CRITICAL: If error has transactionId, the purchase went through!
             // Save to DB immediately before doing anything else.
+            let otherErrorSavedToDb = false;
             if (purchaseErr.transactionId) {
               logger.warn(`${label} ⚠️ Error occurred but transaction ${purchaseErr.transactionId} was confirmed! Saving to DB...`);
               const rescuedResult = {
@@ -1710,6 +1759,7 @@ class PurchaseService {
                 cardValue: cardName
               };
               await guaranteedDbSave(rescuedResult, cardNumber, label);
+              otherErrorSavedToDb = true;
             } else if (checkoutAlreadyClicked) {
               // No transactionId but checkout WAS clicked - purchase may have gone through on Razer!
               // Save to DB so the user knows to check manually on Razer's transaction history.
@@ -1725,6 +1775,7 @@ class PurchaseService {
                 cardValue: cardName
               };
               await guaranteedDbSave(ghostResult, cardNumber, label);
+              otherErrorSavedToDb = true;
             }
 
             // Mark card as failed but continue with next card from queue
@@ -1738,7 +1789,8 @@ class PurchaseService {
               serial: 'FAILED',
               error: purchaseErr.message,
               stage: purchaseErr.stage,
-              requiresManualCheck: true
+              requiresManualCheck: true,
+              savedToDb: otherErrorSavedToDb
             });
             cardsProcessed++;
 
