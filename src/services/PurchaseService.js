@@ -1170,7 +1170,7 @@ class PurchaseService {
   /**
    * Process bulk purchases using parallel browsers (up to 10 simultaneous)
    * NEW LOGIC: 1 backup code per browser, each browser session lasts ~15 minutes
-   * - Pre-validates backup codes >= quantity
+   * - Pre-validates at least 1 backup code exists
    * - Distributes 1 code per browser upfront
    * - First purchase per browser triggers 2FA (uses assigned code)
    * - Subsequent purchases skip 2FA (session active ~15 min)
@@ -1195,14 +1195,9 @@ class PurchaseService {
       throw new Error('❌ No active backup codes available. Please add backup codes using /setbackupcodes before purchasing.');
     }
 
-    if (allBackupCodes.length < quantity) {
-      throw new Error(
-        `❌ Not enough backup codes!\n\n` +
-        `You have: ${allBackupCodes.length} backup codes\n` +
-        `You need: ${quantity} backup codes\n\n` +
-        `Please add more backup codes or reduce your order quantity.`
-      );
-    }
+    // NOTE: No need to check allBackupCodes.length >= quantity
+    // Each backup code gives a ~15 min browser session that can process many purchases.
+    // Even 1 backup code can handle dozens of cards sequentially.
 
     // Configuration
     const MAX_BROWSERS = 10;

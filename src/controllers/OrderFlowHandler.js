@@ -718,17 +718,8 @@ class OrderFlowHandler {
         return;
       }
 
-      // Validate: quantity must be <= available backup codes
-      if (quantity > backupCodeCount) {
-        await bot.sendMessage(chatId,
-          `⚠️ *NOT ENOUGH BACKUP CODES*\n\n` +
-          `You have: ${backupCodeCount} backup codes\n\n` +
-          `Each purchase needs a backup code. Please:\n` +
-          `Enter a new quantity:`,
-          { parse_mode: 'Markdown' }
-        );
-        return;
-      }
+      // NOTE: No quantity limit based on backup codes - each code gives a ~15 min browser session
+      // that can process many purchases. Even 1 backup code can handle dozens of cards.
 
       // Check if schedule mode or instant purchase
       if (session.isScheduleMode) {
