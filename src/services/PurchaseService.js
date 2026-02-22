@@ -381,12 +381,24 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters {userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber}
    * @returns {Promise<Object>} Purchase data
    */
-  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, checkCancellation, cardNumber = 1, gameName, cardName }) {
+  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, checkCancellation, cardNumber = 1, gameName, cardName, label = '' }) {
     let currentStage = this.STAGES.IDLE;
     let transactionId = null;
 
+    // Prefixed logger for browser-specific logs
+    const prefix = label ? `${label} ` : '';
+    const log = {
+      purchase: (msg) => logger.purchase(`${prefix}${msg}`),
+      debug: (msg, ...args) => logger.debug(`${prefix}${msg}`, ...args),
+      success: (msg) => logger.success(`${prefix}${msg}`),
+      warn: (msg) => logger.warn(`${prefix}${msg}`),
+      error: (msg, ...args) => logger.error(`${prefix}${msg}`, ...args),
+      info: (msg) => logger.info(`${prefix}${msg}`),
+      http: (msg) => logger.http(`${prefix}${msg}`),
+    };
+
     try {
-      logger.purchase('Starting purchase process...');
+      log.purchase('Starting purchase process...');
 
       // Check cancellation before starting
       if (checkCancellation && checkCancellation()) {
@@ -395,11 +407,11 @@ class PurchaseService {
 
       // STAGE 1: Navigate to game page (skip if already there - HUGE speed boost!)
       currentStage = this.STAGES.NAVIGATING;
-      logger.debug(`Stage: ${currentStage}`);
+      log.debug(`Stage: ${currentStage}`);
 
       let currentUrl = page.url();
-      logger.debug(`Current URL: ${currentUrl}`);
-      logger.debug(`Target game URL: ${gameUrl}`);
+      log.debug(`Current URL: ${currentUrl}`);
+      log.debug(`Target game URL: ${gameUrl}`);
 
       // Extract game identifier (last part of URL) to compare across different regions
       const targetGameId = gameUrl.split('/').pop();
@@ -412,21 +424,21 @@ class PurchaseService {
       await new Promise(resolve => setTimeout(resolve, navJitter));
 
       if (!isSameGame) {
-        logger.debug('Not on game page, navigating...');
+        log.debug('Not on game page, navigating...');
         await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
-        logger.debug(`Navigated to: ${page.url()}`);
+        log.debug(`Navigated to: ${page.url()}`);
         // Brief wait for JavaScript to start (we explicitly wait for interactive elements below)
         await new Promise(resolve => setTimeout(resolve, 2000));
       } else {
-        logger.debug('Already on correct game page, refreshing to ensure clean state...');
+        log.debug('Already on correct game page, refreshing to ensure clean state...');
         await page.reload({ waitUntil: 'load', timeout: 60000 });
-        logger.debug(`Page refreshed: ${page.url()}`);
+        log.debug(`Page refreshed: ${page.url()}`);
         // Brief wait for JavaScript to start (we explicitly wait for interactive elements below)
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       // Wait for cards with Access Denied retry logic (Akamai WAF rate-limiting)
-      logger.debug('Waiting for interactive card tiles to load...');
+      log.debug('Waiting for interactive card tiles to load...');
       const MAX_ACCESS_DENIED_RETRIES = 3;
       for (let adRetry = 0; adRetry <= MAX_ACCESS_DENIED_RETRIES; adRetry++) {
         try {
@@ -437,7 +449,7 @@ class PurchaseService {
               throw new Error('Access Denied by Razer CDN after multiple retries - rate limited');
             }
             const backoffDelay = (adRetry + 1) * 10000 + Math.floor(Math.random() * 5000);
-            logger.warn(`Access Denied detected (attempt ${adRetry + 1}/${MAX_ACCESS_DENIED_RETRIES}). Waiting ${Math.round(backoffDelay / 1000)}s...`);
+            log.warn(`Access Denied detected (attempt ${adRetry + 1}/${MAX_ACCESS_DENIED_RETRIES}). Waiting ${Math.round(backoffDelay / 1000)}s...`);
             await new Promise(resolve => setTimeout(resolve, backoffDelay));
             await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
             await new Promise(resolve => setTimeout(resolve, 2000));
@@ -446,28 +458,28 @@ class PurchaseService {
 
           // First wait for the main content area to be visible
           await page.waitForSelector('#webshop_step_sku', { visible: true, timeout: 25000 });
-          logger.debug('Main webshop area loaded');
+          log.debug('Main webshop area loaded');
 
           // Wait for actual interactive card tiles (the ones with labels and radio inputs)
           await page.waitForSelector('#webshop_step_sku .selection-tile', {
             visible: true,
             timeout: 25000
           });
-          logger.debug('Card tile containers loaded');
+          log.debug('Card tile containers loaded');
 
           // Wait for radio inputs to be rendered inside the tiles
           await page.waitForSelector('#webshop_step_sku .selection-tile input[type="radio"]', {
             visible: true,
             timeout: 25000
           });
-          logger.success('Card tiles loaded successfully');
+          log.success('Card tiles loaded successfully');
           break; // Success - exit retry loop
         } catch (err) {
           // On last retry or non-Access-Denied error, fail
           if (adRetry >= MAX_ACCESS_DENIED_RETRIES || !err.message?.includes('Access Denied')) {
             const bodyHTML = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => 'Could not read page');
-            logger.error(`Failed to find card tiles. Page content: ${bodyHTML}`);
-            logger.error(`Current URL: ${page.url()}`);
+            log.error(`Failed to find card tiles. Page content: ${bodyHTML}`);
+            log.error(`Current URL: ${page.url()}`);
             throw new Error('Card selection tiles not found - page may not have loaded correctly');
           }
         }
@@ -480,7 +492,7 @@ class PurchaseService {
 
       // STAGE 2: Select card
       currentStage = this.STAGES.SELECTING_CARD;
-      logger.debug(`Stage: ${currentStage}`);
+      log.debug(`Stage: ${currentStage}`);
 
       // Check if card is in stock, wait if not
       const isInStock = await page.evaluate((index) => {
@@ -489,12 +501,12 @@ class PurchaseService {
       }, cardIndex);
 
       if (!isInStock) {
-        logger.warn('Card is OUT OF STOCK, waiting for restock...');
+        log.warn('Card is OUT OF STOCK, waiting for restock...');
         await this.waitForCardInStock(page, cardIndex, checkCancellation);
       }
 
       // Select card - ensure we click the right one based on actual HTML structure
-      logger.purchase(`Selecting card at index ${cardIndex}...`);
+      log.purchase(`Selecting card at index ${cardIndex}...`);
 
       // Wait for card containers to be fully loaded and clickable
       await page.waitForSelector('#webshop_step_sku .selection-tile', {
@@ -504,7 +516,7 @@ class PurchaseService {
 
       // Get all card containers from the cards section
       const cardContainers = await page.$$('#webshop_step_sku .selection-tile');
-      logger.debug(`Found ${cardContainers.length} card containers`);
+      log.debug(`Found ${cardContainers.length} card containers`);
 
       if (cardIndex >= cardContainers.length) {
         throw new Error(`Card index ${cardIndex} is out of range. Available cards: ${cardContainers.length}`);
@@ -518,15 +530,15 @@ class PurchaseService {
 
       // Method 1: Click the label (most reliable for radio inputs)
       try {
-        logger.debug('Trying to click card label...');
+        log.debug('Trying to click card label...');
         const label = await selectedCardContainer.$('label');
         if (label) {
           await label.click();
-          logger.success('Clicked card label');
+          log.success('Clicked card label');
           cardSelected = true;
         }
       } catch (err) {
-        logger.debug('Label click failed, trying radio input...');
+        log.debug('Label click failed, trying radio input...');
       }
 
       // Method 2: Click the radio input directly
@@ -535,25 +547,25 @@ class PurchaseService {
           const radioInput = await selectedCardContainer.$('input[type="radio"][name="paymentAmountItem"]');
           if (radioInput) {
             await radioInput.click();
-            logger.success('Clicked card radio input');
+            log.success('Clicked card radio input');
             cardSelected = true;
           }
         } catch (err) {
-          logger.debug('Radio input click failed, trying container...');
+          log.debug('Radio input click failed, trying container...');
         }
       }
 
       // Method 3: Click the container itself
       if (!cardSelected) {
         await selectedCardContainer.click();
-        logger.success('Clicked card container');
+        log.success('Clicked card container');
         cardSelected = true;
       }
 
       // Wait for selection to register and page to update
       await new Promise(resolve => setTimeout(resolve, 300));
 
-      logger.success(`Card ${cardIndex} selected successfully`);
+      log.success(`Card ${cardIndex} selected successfully`);
 
       // Check cancellation
       if (checkCancellation && checkCancellation()) {
@@ -562,7 +574,7 @@ class PurchaseService {
 
       // STAGE 3: Select payment method
       currentStage = this.STAGES.SELECTING_PAYMENT;
-      logger.debug(`Stage: ${currentStage}`);
+      log.debug(`Stage: ${currentStage}`);
 
       // Wait for payment methods section to load and become interactive
       await page.waitForSelector("#webshop_step_payment_channels", {
@@ -574,7 +586,7 @@ class PurchaseService {
       await new Promise(resolve => setTimeout(resolve, 200));
 
       // Select Razer Gold as payment method
-      logger.purchase('Selecting Razer Gold payment...');
+      log.purchase('Selecting Razer Gold payment...');
 
       // Wait for payment methods container to load
       await page.waitForSelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']", {
@@ -593,14 +605,14 @@ class PurchaseService {
       // Wait after scroll
       await new Promise(resolve => setTimeout(resolve, 300));
 
-      logger.debug('Looking for Razer Gold payment method...');
+      log.debug('Looking for Razer Gold payment method...');
 
       // Try multiple selection methods with JavaScript clicks for reliability
       let paymentSelected = false;
 
       // Method 1: Direct JavaScript click on radio input (most reliable)
       try {
-        logger.debug('Method 1: Trying JavaScript click on radio input...');
+        log.debug('Method 1: Trying JavaScript click on radio input...');
         paymentSelected = await page.evaluate(() => {
           const container = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
           if (!container) return false;
@@ -618,16 +630,16 @@ class PurchaseService {
         });
 
         if (paymentSelected) {
-          logger.success('✓ Razer Gold radio input clicked via JavaScript');
+          log.success('✓ Razer Gold radio input clicked via JavaScript');
         }
       } catch (err) {
-        logger.debug('Method 1 failed:', err.message);
+        log.debug('Method 1 failed:', err.message);
       }
 
       // Method 2: JavaScript click on label
       if (!paymentSelected) {
         try {
-          logger.debug('Method 2: Trying JavaScript click on label...');
+          log.debug('Method 2: Trying JavaScript click on label...');
           paymentSelected = await page.evaluate(() => {
             const container = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
             if (!container) return false;
@@ -643,17 +655,17 @@ class PurchaseService {
           });
 
           if (paymentSelected) {
-            logger.success('✓ Razer Gold label clicked via JavaScript');
+            log.success('✓ Razer Gold label clicked via JavaScript');
           }
         } catch (err) {
-          logger.debug('Method 2 failed:', err.message);
+          log.debug('Method 2 failed:', err.message);
         }
       }
 
       // Method 3: Puppeteer click on label
       if (!paymentSelected) {
         try {
-          logger.debug('Method 3: Trying Puppeteer click on label...');
+          log.debug('Method 3: Trying Puppeteer click on label...');
           const container = await page.$("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
           if (container) {
             const label = await container.$('label');
@@ -666,19 +678,19 @@ class PurchaseService {
               });
 
               if (paymentSelected) {
-                logger.success('✓ Razer Gold label clicked via Puppeteer');
+                log.success('✓ Razer Gold label clicked via Puppeteer');
               }
             }
           }
         } catch (err) {
-          logger.debug('Method 3 failed:', err.message);
+          log.debug('Method 3 failed:', err.message);
         }
       }
 
       // Method 4: Puppeteer click on radio input
       if (!paymentSelected) {
         try {
-          logger.debug('Method 4: Trying Puppeteer click on radio input...');
+          log.debug('Method 4: Trying Puppeteer click on radio input...');
           const container = await page.$("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
           if (container) {
             const radioInput = await container.$('input[type="radio"][name="paymentChannelItem"]');
@@ -691,12 +703,12 @@ class PurchaseService {
               });
 
               if (paymentSelected) {
-                logger.success('✓ Razer Gold radio input clicked via Puppeteer');
+                log.success('✓ Razer Gold radio input clicked via Puppeteer');
               }
             }
           }
         } catch (err) {
-          logger.debug('Method 4 failed:', err.message);
+          log.debug('Method 4 failed:', err.message);
         }
       }
 
@@ -704,12 +716,12 @@ class PurchaseService {
         throw new Error('❌ Failed to select Razer Gold payment method - all methods failed');
       }
 
-      logger.success('✅ Razer Gold payment method selected successfully');
+      log.success('✅ Razer Gold payment method selected successfully');
 
       // Wait for selection to register
       await new Promise(resolve => setTimeout(resolve, 100));
 
-      logger.success('Razer Gold payment method selected successfully');
+      log.success('Razer Gold payment method selected successfully');
 
       // Check cancellation
       if (checkCancellation && checkCancellation()) {
@@ -718,10 +730,10 @@ class PurchaseService {
 
       // STAGE 4: Click checkout
       currentStage = this.STAGES.CLICKING_CHECKOUT;
-      logger.debug(`Stage: ${currentStage}`);
+      log.debug(`Stage: ${currentStage}`);
 
       // Click checkout
-      logger.purchase('Clicking checkout...');
+      log.purchase('Clicking checkout...');
 
       // Try multiple selectors for checkout button
       let checkoutButton = null;
@@ -741,11 +753,11 @@ class PurchaseService {
             timeout: 3000
           });
           if (checkoutButton) {
-            logger.success(`Found checkout button with selector: ${selector}`);
+            log.success(`Found checkout button with selector: ${selector}`);
             break;
           }
         } catch (err) {
-          logger.debug(`Checkout selector failed: ${selector}`);
+          log.debug(`Checkout selector failed: ${selector}`);
           continue;
         }
       }
@@ -769,12 +781,12 @@ class PurchaseService {
       }
 
       await checkoutButton.click();
-      logger.success('Checkout button clicked successfully');
+      log.success('Checkout button clicked successfully');
 
       // Wait for navigation after checkout (optimized timeout)
-      logger.http('Waiting for page to load after checkout...');
+      log.http('Waiting for page to load after checkout...');
       await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {
-        logger.debug('Navigation timeout - will check URL...');
+        log.debug('Navigation timeout - will check URL...');
       });
 
       // Wait for any redirects to complete
@@ -782,21 +794,21 @@ class PurchaseService {
 
       // Check URL after checkout
       const urlAfterCheckout = await page.url();
-      logger.debug('URL after checkout:', urlAfterCheckout);
+      log.debug('URL after checkout:', urlAfterCheckout);
 
       // Check if redirected to reload page (insufficient balance)
       if (urlAfterCheckout.includes('/gold/reload') || urlAfterCheckout.includes('gold.razer.com/global/en/gold/reload')) {
-        logger.error('Redirected to reload page - insufficient Razer Gold balance');
+        log.error('Redirected to reload page - insufficient Razer Gold balance');
         throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
       }
 
       // Check for unexpected redirects
       if (!urlAfterCheckout.includes(gameUrl) && !urlAfterCheckout.includes('/gold/purchase/')) {
-        logger.error(`Unexpected URL after checkout: ${urlAfterCheckout}`);
+        log.error(`Unexpected URL after checkout: ${urlAfterCheckout}`);
         throw new Error(`Unexpected redirect to: ${urlAfterCheckout}. Order processing cancelled.`);
       }
 
-      logger.success('Checkout successful, checking next step...');
+      log.success('Checkout successful, checking next step...');
 
       // Check cancellation
       if (checkCancellation && checkCancellation()) {
@@ -805,19 +817,19 @@ class PurchaseService {
 
       // STAGE 5: Process 2FA or direct transaction
       currentStage = this.STAGES.PROCESSING_2FA;
-      logger.debug(`Stage: ${currentStage}`);
+      log.debug(`Stage: ${currentStage}`);
 
       // OPTIMIZATION: Quick pre-check if already on transaction page (instant, no wait)
       let quickCheck = page.url();
       if (quickCheck.includes('/transaction/')) {
-        logger.success('Already on transaction page immediately - no 2FA needed');
+        log.success('Already on transaction page immediately - no 2FA needed');
         // Skip to transaction handling
       } else if (quickCheck.includes('/gold/reload')) {
-        logger.error('Already on reload page - insufficient balance');
+        log.error('Already on reload page - insufficient balance');
         throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
       } else {
         // Wait for either 2FA modal OR direct transaction page (two scenarios)
-        logger.debug('Checking if 2FA is required or direct processing...');
+        log.debug('Checking if 2FA is required or direct processing...');
 
         const checkoutResult = await Promise.race([
           // Scenario 1: 2FA modal appears (requires backup code)
@@ -847,13 +859,13 @@ class PurchaseService {
 
         // Handle reload page redirect
         if (checkoutResult.type === 'reload') {
-          logger.error('Redirected to reload page - insufficient balance');
+          log.error('Redirected to reload page - insufficient balance');
           throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
         }
 
         // Handle direct transaction (no 2FA required) - MOST COMMON after first purchase!
         if (checkoutResult.type === 'direct') {
-          logger.success('No 2FA required - proceeding directly to transaction page');
+          log.success('No 2FA required - proceeding directly to transaction page');
           // Skip 2FA section and go directly to transaction handling
         }
         // Handle 2FA flow  
@@ -861,15 +873,15 @@ class PurchaseService {
           // CHECK: If no backup code available, session has expired (~15 min limit)
           // This browser must close - another browser may pick up the remaining cards
           if (!backupCode) {
-            logger.warn('2FA requested but no backup code available - session expired');
+            log.warn('2FA requested but no backup code available - session expired');
             throw new BackupCodeExpiredError('2FA verification requested again but no backup code available. Session expired (~15 min limit). This browser will close.');
           }
 
-          logger.debug('2FA modal detected - processing backup code...');
+          log.debug('2FA modal detected - processing backup code...');
 
           // Step 2: Wait for OTP iframe inside the modal
           // The iframe is always id="otp-iframe-1" across all 2FA steps
-          logger.debug('Waiting for OTP iframe to appear...');
+          log.debug('Waiting for OTP iframe to appear...');
           await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 8000 });
           let frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
           let frame = await frameHandle.contentFrame();
@@ -878,7 +890,7 @@ class PurchaseService {
 
           // Step 3: Click "Choose another method" inside iframe
           // This button appears on the initial "Two-Step Verification" page inside the iframe
-          logger.debug('Clicking choose another method...');
+          log.debug('Clicking choose another method...');
           const chooseAnother = await frame.waitForSelector("button[class*='arrowed']", { visible: true, timeout: 20000 });
           await chooseAnother.click();
 
@@ -886,7 +898,7 @@ class PurchaseService {
           // After clicking "choose another method", the iframe content changes to show
           // alternative auth methods (backup codes, etc.). The iframe ID stays otp-iframe-1.
           // We wait for the alt-menu (method selection buttons) to appear inside the iframe.
-          logger.debug('Waiting for alternative method options...');
+          log.debug('Waiting for alternative method options...');
           await new Promise(resolve => setTimeout(resolve, 500)); // Brief wait for content transition
 
           // Re-acquire iframe reference (content may have changed)
@@ -896,7 +908,7 @@ class PurchaseService {
 
           // Step 5: Wait for and click "Backup Codes" button
           // The alt-menu contains buttons for different auth methods. Backup Codes is the second option (index 1).
-          logger.debug('Selecting backup code option...');
+          log.debug('Selecting backup code option...');
           await frame.waitForSelector("ul[class*='alt-menu'] button", { visible: true, timeout: 8000 });
           const backupButton = await frame.$$("ul[class*='alt-menu'] button");
           if (!backupButton || backupButton.length < 2) {
@@ -905,7 +917,7 @@ class PurchaseService {
           await backupButton[1].click();
 
           // Step 6: Enter backup code (8 digits)
-          logger.debug('Entering backup code...');
+          log.debug('Entering backup code...');
 
           if (!backupCode || backupCode.length !== 8) {
             throw new Error('Invalid backup code - must be 8 digits');
@@ -934,13 +946,13 @@ class PurchaseService {
 
           // After entering all digits, the form auto-submits and page navigates
           // We need to wait for navigation without trying to access the detached frame
-          logger.debug('Backup code entered, waiting for validation...');
+          log.debug('Backup code entered, waiting for validation...');
 
           // CRITICAL FIX: Check for error popup on main page (not inside iframe)
           // The error appears as: <div id="main-alert" class="show error notification">
           try {
             // Quick check for error alert popup (3 seconds max)
-            logger.debug('Checking for error alert popup...');
+            log.debug('Checking for error alert popup...');
             await page.waitForFunction(() => {
               const errorAlert = document.querySelector('#main-alert.show.error');
               if (errorAlert) {
@@ -953,12 +965,12 @@ class PurchaseService {
             }, { timeout: 3000, polling: 300 });
 
             // If we reach here, error alert was found
-            logger.error('Invalid backup code - error alert detected');
+            log.error('Invalid backup code - error alert detected');
             throw new InvalidBackupCodeError('The backup code you entered is incorrect or expired. Please enter another valid backup code.');
           } catch (errorCheckErr) {
             // No error alert found within 3 seconds - this is GOOD
             if (errorCheckErr.name === 'TimeoutError') {
-              logger.success('No error alert detected - waiting for navigation...');
+              log.success('No error alert detected - waiting for navigation...');
 
               // Now wait for navigation (give it up to 45 seconds for slow networks)
               try {
@@ -972,19 +984,19 @@ class PurchaseService {
                   gameUrl
                 );
 
-                logger.success('Navigation detected - backup code accepted');
+                log.success('Navigation detected - backup code accepted');
               } catch (navErr) {
                 // Navigation timeout - check where we are
-                logger.debug('Navigation timeout - checking current URL...');
+                log.debug('Navigation timeout - checking current URL...');
                 const currentUrl = page.url();
 
                 if (currentUrl.includes('/transaction/')) {
-                  logger.success('Already on transaction page - backup code accepted');
+                  log.success('Already on transaction page - backup code accepted');
                 } else if (currentUrl.includes(gameUrl)) {
-                  logger.error('Still on game page after 45 seconds - backup code likely invalid');
+                  log.error('Still on game page after 45 seconds - backup code likely invalid');
                   throw new InvalidBackupCodeError('The backup code validation timed out. The code may be incorrect or expired. Please enter another valid backup code.');
                 } else {
-                  logger.info('Navigated to unknown page - continuing...');
+                  log.info('Navigated to unknown page - continuing...');
                 }
               }
             } else {
@@ -995,7 +1007,7 @@ class PurchaseService {
         }
         else {
           // Unknown state - check current URL
-          logger.warn('Unknown state after checkout, checking current URL...');
+          log.warn('Unknown state after checkout, checking current URL...');
           const currentCheckUrl = page.url();
 
           if (!currentCheckUrl.includes('/transaction/') && !currentCheckUrl.includes(gameUrl)) {
@@ -1005,14 +1017,14 @@ class PurchaseService {
       }
 
       // Navigation successful - check where we landed
-      logger.success('Proceeding to check transaction result');
+      log.success('Proceeding to check transaction result');
 
       currentUrl = page.url();
-      logger.debug('Current URL:', currentUrl);
+      log.debug('Current URL:', currentUrl);
 
       // Check if redirected to reload page (insufficient balance)
       if (currentUrl.includes('/gold/reload')) {
-        logger.error('Redirected to reload page - insufficient Razer Gold balance');
+        log.error('Redirected to reload page - insufficient Razer Gold balance');
         throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
       }
 
@@ -1020,12 +1032,12 @@ class PurchaseService {
       // Check if successful transaction page (URL contains /transaction/)
       if (currentUrl.includes('/transaction/')) {
         currentStage = this.STAGES.REACHED_TRANSACTION;
-        logger.debug(`Stage: ${currentStage}`);
-        logger.success('Reached transaction page!');
+        log.debug(`Stage: ${currentStage}`);
+        log.success('Reached transaction page!');
 
         // Extract transaction ID from URL
         transactionId = currentUrl.split('/transaction/')[1];
-        logger.info('Transaction ID:', transactionId);
+        log.info('Transaction ID:', transactionId);
 
         // CRITICAL: Do NOT check cancellation here!
         // Money is already spent - we MUST extract the PIN data regardless of cancel/crash.
@@ -1035,11 +1047,11 @@ class PurchaseService {
         // Once we have the transaction ID, the purchase is confirmed.
         // We MUST return data even if browser dies during extraction.
         currentStage = this.STAGES.EXTRACTING_DATA;
-        logger.debug(`Stage: ${currentStage}`);
+        log.debug(`Stage: ${currentStage}`);
 
         try {
           // Wait for the "Order processing..." page to finish
-          logger.debug('Waiting for order to complete processing...');
+          log.debug('Waiting for order to complete processing...');
 
           try {
             await Promise.race([
@@ -1049,21 +1061,21 @@ class PurchaseService {
               }, { timeout: 5000 }),
               new Promise((resolve) => setTimeout(resolve, 5000))
             ]);
-            logger.success('Order processing completed - "Congratulations!" page loaded');
+            log.success('Order processing completed - "Congratulations!" page loaded');
           } catch (waitErr) {
-            logger.warn('Timeout (5s) waiting for congratulations message, will try extraction anyway...');
+            log.warn('Timeout (5s) waiting for congratulations message, will try extraction anyway...');
           }
 
           // Additional wait for PIN block to be visible with shorter timeout
           try {
             await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 3000 });
-            logger.success('PIN block is visible');
+            log.success('PIN block is visible');
           } catch (pinWaitErr) {
-            logger.warn('PIN block not found with selector, will try extraction anyway...');
+            log.warn('PIN block not found with selector, will try extraction anyway...');
           }
 
           // Check transaction status from the page with 3-second timeout
-          logger.debug('Checking transaction status...');
+          log.debug('Checking transaction status...');
 
           let statusCheck;
           try {
@@ -1084,18 +1096,18 @@ class PurchaseService {
               )
             ]);
           } catch (evalErr) {
-            logger.warn('Error checking status:', evalErr.message);
+            log.warn('Error checking status:', evalErr.message);
             statusCheck = { status: 'unknown', message: 'Error during status check' };
           }
 
-          logger.info(`Transaction Status: ${statusCheck.status} - ${statusCheck.message}`);
+          log.info(`Transaction Status: ${statusCheck.status} - ${statusCheck.message}`);
 
           if (statusCheck.status === 'unknown' || statusCheck.status === 'timeout') {
-            logger.warn('Could not extract status clearly, but we are on transaction page');
+            log.warn('Could not extract status clearly, but we are on transaction page');
           }
 
           // Extract pin and serial from the success page
-          logger.debug('Extracting purchase data from success page...');
+          log.debug('Extracting purchase data from success page...');
 
           let purchaseData;
           try {
@@ -1127,7 +1139,7 @@ class PurchaseService {
               )
             ]);
           } catch (extractErr) {
-            logger.error('Error during extraction:', extractErr.message);
+            log.error('Error during extraction:', extractErr.message);
             purchaseData = { pinCode: '', serial: '', transactionId: '', productName: '' };
           }
 
@@ -1136,10 +1148,10 @@ class PurchaseService {
 
           if (purchaseData.pinCode && purchaseData.serial) {
             currentStage = this.STAGES.COMPLETED;
-            logger.success('Transaction completed successfully!');
-            logger.info(`Product: ${purchaseData.productName}`);
-            logger.info(`Transaction ID: ${finalTransactionId}`);
-            logger.debug(`Stage: ${currentStage}`);
+            log.success('Transaction completed successfully!');
+            log.info(`Product: ${purchaseData.productName}`);
+            log.info(`Transaction ID: ${finalTransactionId}`);
+            log.debug(`Stage: ${currentStage}`);
 
             return {
               success: true,
@@ -1152,8 +1164,8 @@ class PurchaseService {
             };
           } else {
             currentStage = this.STAGES.FAILED;
-            logger.error('Could not extract PIN or Serial - marking as FAILED');
-            logger.debug(`Stage: ${currentStage}`);
+            log.error('Could not extract PIN or Serial - marking as FAILED');
+            log.debug(`Stage: ${currentStage}`);
 
             return {
               success: false,
@@ -1172,8 +1184,8 @@ class PurchaseService {
           // CRITICAL SAFETY NET: Browser died during extraction (force-close, crash, etc.)
           // The purchase IS confirmed (we have transactionId from the URL).
           // Return partial data so it gets saved to DB rather than being lost.
-          logger.error(`⚠️ Browser died during PIN extraction! Transaction ${transactionId} is confirmed but PIN could not be extracted.`);
-          logger.error(`Extraction error: ${extractionErr.message}`);
+          log.error(`⚠️ Browser died during PIN extraction! Transaction ${transactionId} is confirmed but PIN could not be extracted.`);
+          log.error(`Extraction error: ${extractionErr.message}`);
 
           currentStage = this.STAGES.FAILED;
           return {
@@ -1194,17 +1206,17 @@ class PurchaseService {
         // IMPORTANT: Do NOT override currentStage to FAILED here!
         // The stage must reflect where we actually were (e.g., clicking_checkout)
         // so the upstream error handler can detect if checkout was already clicked.
-        logger.debug(`Stage: ${currentStage} - Did not reach transaction page`);
+        log.debug(`Stage: ${currentStage} - Did not reach transaction page`);
         throw new Error(`Did not reach transaction page. Current URL: ${currentUrl}`);
       }
 
     } catch (err) {
       // Log cancellations as info, other errors as error
       if (err.message && err.message.includes('cancelled by user')) {
-        logger.info(`Purchase cancelled at stage: ${currentStage}`);
+        log.info(`Purchase cancelled at stage: ${currentStage}`);
       } else {
-        logger.error(`Purchase failed at stage: ${currentStage}`);
-        logger.error(`Error: ${err.message}`);
+        log.error(`Purchase failed at stage: ${currentStage}`);
+        log.error(`Error: ${err.message}`);
       }
 
       // Add stage information to error (NO DB SAVE - will be handled upstream)
@@ -1575,7 +1587,8 @@ class PurchaseService {
               checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
               cardNumber,
               gameName,
-              cardName
+              cardName,
+              label
             });
 
             // First purchase done successfully - backup code session now active!
