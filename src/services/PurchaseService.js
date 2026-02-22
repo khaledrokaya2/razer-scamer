@@ -34,6 +34,17 @@ class InvalidBackupCodeError extends Error {
   }
 }
 
+/**
+ * Custom error for expired backup code session (~15 min limit)
+ * Browser should be closed - no more codes available for this session
+ */
+class BackupCodeExpiredError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'BackupCodeExpiredError';
+  }
+}
+
 class PurchaseService {
   constructor() {
     this.DEFAULT_TIMEOUT = 30000; // 30 seconds
@@ -816,6 +827,13 @@ class PurchaseService {
         }
         // Handle 2FA flow  
         else if (checkoutResult.type === '2fa') {
+          // CHECK: If no backup code available, session has expired (~15 min limit)
+          // This browser must close - another browser may pick up the remaining cards
+          if (!backupCode) {
+            logger.warn('2FA requested but no backup code available - session expired');
+            throw new BackupCodeExpiredError('2FA verification requested again but no backup code available. Session expired (~15 min limit). This browser will close.');
+          }
+
           logger.debug('2FA modal detected - processing backup code...');
 
           // Step 2: Wait for any OTP iframe (first one)
@@ -960,191 +978,167 @@ class PurchaseService {
         transactionId = currentUrl.split('/transaction/')[1];
         logger.info('Transaction ID:', transactionId);
 
-        // Check cancellation before proceeding to extraction
-        if (checkCancellation && checkCancellation()) {
-          logger.warn('Order cancelled after reaching transaction page');
-          const error = new Error('Order cancelled by user');
-          error.transactionId = transactionId;
-          throw error;
-        }
+        // CRITICAL: Do NOT check cancellation here!
+        // Money is already spent - we MUST extract the PIN data regardless of cancel/crash.
+        // The DB save will happen immediately after this function returns.
 
-        // STAGE 7: Extract PIN data
+        // STAGE 7: Extract PIN data - RESILIENT to browser crashes
+        // Once we have the transaction ID, the purchase is confirmed.
+        // We MUST return data even if browser dies during extraction.
         currentStage = this.STAGES.EXTRACTING_DATA;
         logger.debug(`Stage: ${currentStage}`);
 
-        // Wait for the "Order processing..." page to finish
-        logger.debug('Waiting for order to complete processing...');
-
         try {
-          // OPTIMIZATION: Reduced to 5s (safe because transaction ID already captured)
-          await Promise.race([
-            page.waitForFunction(() => {
-              const h2 = document.querySelector('h2[data-v-621e38f9]');
-              return h2 && h2.textContent.includes('Congratulations');
-            }, { timeout: 5000 }),  // 5 seconds max
-            new Promise((resolve) => setTimeout(resolve, 5000))  // Fallback timeout
-          ]);
+          // Wait for the "Order processing..." page to finish
+          logger.debug('Waiting for order to complete processing...');
 
-          logger.success('Order processing completed - "Congratulations!" page loaded');
-        } catch (waitErr) {
-          logger.warn('Timeout (5s) waiting for congratulations message, will try extraction anyway...');
-        }
+          try {
+            await Promise.race([
+              page.waitForFunction(() => {
+                const h2 = document.querySelector('h2[data-v-621e38f9]');
+                return h2 && h2.textContent.includes('Congratulations');
+              }, { timeout: 5000 }),
+              new Promise((resolve) => setTimeout(resolve, 5000))
+            ]);
+            logger.success('Order processing completed - "Congratulations!" page loaded');
+          } catch (waitErr) {
+            logger.warn('Timeout (5s) waiting for congratulations message, will try extraction anyway...');
+          }
 
-        // Additional wait for PIN block to be visible with shorter timeout
-        try {
-          await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 3000 });
-          logger.success('PIN block is visible');
-        } catch (pinWaitErr) {
-          logger.warn('PIN block not found with selector, will try extraction anyway...');
-        }
+          // Additional wait for PIN block to be visible with shorter timeout
+          try {
+            await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 3000 });
+            logger.success('PIN block is visible');
+          } catch (pinWaitErr) {
+            logger.warn('PIN block not found with selector, will try extraction anyway...');
+          }
 
+          // Check transaction status from the page with 3-second timeout
+          logger.debug('Checking transaction status...');
 
-        // Check transaction status from the page with 3-second timeout
-        logger.debug('Checking transaction status...');
-
-        let statusCheck;
-        try {
-          // OPTIMIZATION: Reduced to 3s (safe because transaction ID already captured)
-          statusCheck = await Promise.race([
-            page.evaluate(() => {
-              // Look for status in the order summary section
-              const statusElement = document.querySelector('.status-success');
-              if (statusElement) {
-                return { status: 'success', message: statusElement.textContent.trim() };
-              }
-
-              // Fallback: check for "Congratulations!" heading
-              const h2 = document.querySelector('h2[data-v-621e38f9]');
-              if (h2 && h2.textContent.includes('Congratulations')) {
-                return { status: 'success', message: 'Successful' };
-              }
-
-              return { status: 'unknown', message: 'Unknown status' };
-            }),
-            new Promise((resolve) =>
-              setTimeout(() => resolve({ status: 'timeout', message: 'Status check timed out' }), 3000)
-            )
-          ]);
-        } catch (evalErr) {
-          logger.warn('Error checking status:', evalErr.message);
-          statusCheck = { status: 'unknown', message: 'Error during status check' };
-        }
-
-        logger.info(`Transaction Status: ${statusCheck.status} - ${statusCheck.message}`);
-
-        // If status is still unknown, assume success since we're on the transaction page
-        if (statusCheck.status === 'unknown' || statusCheck.status === 'timeout') {
-          logger.warn('Could not extract status clearly, but we are on transaction page');
-          // Don't retry - just mark for manual verification
-        }
-
-        // Extract pin and serial from the success page
-        logger.debug('Extracting purchase data from success page...');
-
-        let purchaseData;
-        try {
-          // OPTIMIZATION: Reduced to 3s with parallel extraction
-          purchaseData = await Promise.race([
-            page.evaluate(() => {
-              // PARALLEL EXTRACTION: Extract all data in one pass
-              const pinCodeElement = document.querySelector('div.pin-code');
-              const serialElement = document.querySelector('div.pin-serial-number');
-              const productElement = document.querySelector('strong[data-v-621e38f9].text--white');
-              const transactionElements = document.querySelectorAll('span[data-v-175ddd8f]');
-
-              const pinCode = pinCodeElement ? pinCodeElement.textContent.trim() : '';
-              const serialRaw = serialElement ? serialElement.textContent.trim() : '';
-              const serial = serialRaw.replace('S/N:', '').trim();
-              const productName = productElement ? productElement.textContent.trim() : '';
-
-              // Extract transaction ID
-              let transactionNumber = '';
-              for (let i = 0; i < transactionElements.length; i++) {
-                const text = transactionElements[i].textContent.trim();
-                if (text.length > 15 && /^[A-Z0-9]+$/i.test(text) && !text.includes('/') && !text.includes('.')) {
-                  transactionNumber = text;
-                  break;
+          let statusCheck;
+          try {
+            statusCheck = await Promise.race([
+              page.evaluate(() => {
+                const statusElement = document.querySelector('.status-success');
+                if (statusElement) {
+                  return { status: 'success', message: statusElement.textContent.trim() };
                 }
-              }
+                const h2 = document.querySelector('h2[data-v-621e38f9]');
+                if (h2 && h2.textContent.includes('Congratulations')) {
+                  return { status: 'success', message: 'Successful' };
+                }
+                return { status: 'unknown', message: 'Unknown status' };
+              }),
+              new Promise((resolve) =>
+                setTimeout(() => resolve({ status: 'timeout', message: 'Status check timed out' }), 3000)
+              )
+            ]);
+          } catch (evalErr) {
+            logger.warn('Error checking status:', evalErr.message);
+            statusCheck = { status: 'unknown', message: 'Error during status check' };
+          }
 
-              return {
-                pinCode,
-                serial,
-                transactionId: transactionNumber,
-                productName
-              };
-            }),
-            new Promise((resolve) =>
-              setTimeout(() => resolve({
-                pinCode: '',
-                serial: '',
-                transactionId: '',
-                productName: ''
-              }), 3000)  // OPTIMIZATION: 3s timeout
-            )
-          ]);
-        } catch (extractErr) {
-          logger.error('Error during extraction:', extractErr.message);
-          purchaseData = {
-            pinCode: '',
-            serial: '',
-            transactionId: '',
-            productName: ''
-          };
-        }
+          logger.info(`Transaction Status: ${statusCheck.status} - ${statusCheck.message}`);
 
-        // OPTIMIZATION #2: Determine final status and save ONCE
-        let finalStatus, purchaseSuccess, finalTransactionId;
+          if (statusCheck.status === 'unknown' || statusCheck.status === 'timeout') {
+            logger.warn('Could not extract status clearly, but we are on transaction page');
+          }
 
-        if (purchaseData.pinCode && purchaseData.serial) {
-          finalStatus = 'success';
-          purchaseSuccess = true;
-          currentStage = this.STAGES.COMPLETED;
-        } else {
-          finalStatus = 'failed';
-          purchaseSuccess = false;
+          // Extract pin and serial from the success page
+          logger.debug('Extracting purchase data from success page...');
+
+          let purchaseData;
+          try {
+            purchaseData = await Promise.race([
+              page.evaluate(() => {
+                const pinCodeElement = document.querySelector('div.pin-code');
+                const serialElement = document.querySelector('div.pin-serial-number');
+                const productElement = document.querySelector('strong[data-v-621e38f9].text--white');
+                const transactionElements = document.querySelectorAll('span[data-v-175ddd8f]');
+
+                const pinCode = pinCodeElement ? pinCodeElement.textContent.trim() : '';
+                const serialRaw = serialElement ? serialElement.textContent.trim() : '';
+                const serial = serialRaw.replace('S/N:', '').trim();
+                const productName = productElement ? productElement.textContent.trim() : '';
+
+                let transactionNumber = '';
+                for (let i = 0; i < transactionElements.length; i++) {
+                  const text = transactionElements[i].textContent.trim();
+                  if (text.length > 15 && /^[A-Z0-9]+$/i.test(text) && !text.includes('/') && !text.includes('.')) {
+                    transactionNumber = text;
+                    break;
+                  }
+                }
+
+                return { pinCode, serial, transactionId: transactionNumber, productName };
+              }),
+              new Promise((resolve) =>
+                setTimeout(() => resolve({ pinCode: '', serial: '', transactionId: '', productName: '' }), 3000)
+              )
+            ]);
+          } catch (extractErr) {
+            logger.error('Error during extraction:', extractErr.message);
+            purchaseData = { pinCode: '', serial: '', transactionId: '', productName: '' };
+          }
+
+          // Determine final status
+          let finalTransactionId = purchaseData.transactionId || transactionId || '';
+
+          if (purchaseData.pinCode && purchaseData.serial) {
+            currentStage = this.STAGES.COMPLETED;
+            logger.success('Transaction completed successfully!');
+            logger.info(`Product: ${purchaseData.productName}`);
+            logger.info(`Transaction ID: ${finalTransactionId}`);
+            logger.debug(`Stage: ${currentStage}`);
+
+            return {
+              success: true,
+              transactionId: finalTransactionId,
+              pinCode: purchaseData.pinCode,
+              serialNumber: purchaseData.serial,
+              stage: currentStage,
+              gameName: gameName,
+              cardValue: cardName
+            };
+          } else {
+            currentStage = this.STAGES.FAILED;
+            logger.error('Could not extract PIN or Serial - marking as FAILED');
+            logger.debug(`Stage: ${currentStage}`);
+
+            return {
+              success: false,
+              transactionId: finalTransactionId,
+              pinCode: 'FAILED',
+              serialNumber: 'FAILED',
+              requiresManualCheck: true,
+              error: 'Could not extract PIN or Serial - please check transaction manually',
+              stage: currentStage,
+              gameName: gameName,
+              cardValue: cardName
+            };
+          }
+
+        } catch (extractionErr) {
+          // CRITICAL SAFETY NET: Browser died during extraction (force-close, crash, etc.)
+          // The purchase IS confirmed (we have transactionId from the URL).
+          // Return partial data so it gets saved to DB rather than being lost.
+          logger.error(`⚠️ Browser died during PIN extraction! Transaction ${transactionId} is confirmed but PIN could not be extracted.`);
+          logger.error(`Extraction error: ${extractionErr.message}`);
+
           currentStage = this.STAGES.FAILED;
-        }
-
-        finalTransactionId = purchaseData.transactionId || transactionId || '';
-
-        // SOLUTION #2: Don't throw error if extraction fails - mark as FAILED
-        // Transaction ID is already saved, so no retry will happen
-        if (!purchaseSuccess) {
-          logger.error('Could not extract PIN or Serial - marking as FAILED');
-          logger.debug(`Stage: ${currentStage}`);
-
-          // Return result with FAILED markers - user will check manually
-          // NO DB SAVE - will be saved after sending to user
           return {
             success: false,
-            transactionId: finalTransactionId,
+            transactionId: transactionId || '',
             pinCode: 'FAILED',
             serialNumber: 'FAILED',
             requiresManualCheck: true,
-            error: 'Could not extract PIN or Serial - please check transaction manually',
+            error: `Browser crashed during extraction - Transaction ${transactionId} confirmed but PIN not extracted. Check manually.`,
             stage: currentStage,
             gameName: gameName,
-            cardValue: cardName  // Use cardName as cardValue
+            cardValue: cardName
           };
         }
-
-        logger.success('Transaction completed successfully!');
-        logger.info(`Product: ${purchaseData.productName}`);
-        logger.info(`Transaction ID: ${finalTransactionId}`);
-        logger.debug(`Stage: ${currentStage}`);
-        // 🔒 SECURITY: PIN and Serial not logged to console
-
-        // Return data - NO DB SAVE yet, will be saved after sending to user
-        return {
-          success: true,
-          transactionId: finalTransactionId,
-          pinCode: purchaseData.pinCode,
-          serialNumber: purchaseData.serial,
-          stage: currentStage,
-          gameName: gameName,
-          cardValue: cardName  // Use cardName as cardValue
-        };
 
       } else {
         // Not on transaction page - something went wrong BEFORE reaching transaction
@@ -1174,41 +1168,59 @@ class PurchaseService {
   }
 
   /**
-   * Process multiple purchases with NO RETRY logic
-   * If transaction page reached, skip to next card (no retry)
-   * If error before transaction page, also skip to next card (no retry)
-   * IMMEDIATE DB SAVE: Calls onCardCompleted after each successful purchase
-   * @param {Object} params - Purchase parameters
-   * @returns {Promise<Array>} Array of purchase results (including failed ones)
-   */
-  /**
    * Process bulk purchases using parallel browsers (up to 10 simultaneous)
-   * Based on test.js pipeline pattern for maximum speed
-   * WITH RETRY LOGIC: Handles browser crashes, login failures, and purchase errors
+   * NEW LOGIC: 1 backup code per browser, each browser session lasts ~15 minutes
+   * - Pre-validates backup codes >= quantity
+   * - Distributes 1 code per browser upfront
+   * - First purchase per browser triggers 2FA (uses assigned code)
+   * - Subsequent purchases skip 2FA (session active ~15 min)
+   * - If 2FA requested again = session expired → close browser
+   * - If ALL browsers expired and order not complete → stop, return partial
    */
   async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, onProgress, onCardCompleted, checkCancellation }) {
     const db = require('./DatabaseService');
     const puppeteer = require('puppeteer');
 
-    // Configuration - OPTIMIZED for low resource usage (more browsers, less memory each)
-    const MAX_BROWSERS = 10; // Increased to 10 for faster parallel processing
-    const LAUNCH_STAGGER_MS = 800; // 300ms stagger - fast parallel launch
-
-    // Retry configuration
-    const MAX_BROWSER_LAUNCH_RETRIES = 3; // Retry browser launch up to 3 times
-    const MAX_LOGIN_RETRIES = 3; // Retry login up to 3 times
-    const MAX_PURCHASE_RETRIES = 2; // Retry each card purchase up to 2 times
-    const RETRY_DELAY_MS = 2000; // Base delay between retries (exponential backoff)
-
-    // Determine number of browsers to use (min of quantity and max browsers)
-    const browserCount = Math.min(quantity, MAX_BROWSERS);
-
-    // Fetch user credentials from database by telegram ID
+    // ===== STEP 0: VALIDATE CREDENTIALS =====
     const credentials = await db.getUserCredentials(telegramUserId);
     if (!credentials || !credentials.email || !credentials.password) {
       throw new Error('No Razer credentials found for your account. Please use /setcredentials to save your email and password first.');
     }
     logger.purchase(`Using credentials for user ${telegramUserId}: ${credentials.email}`);
+
+    // ===== STEP 1: VALIDATE & DISTRIBUTE BACKUP CODES =====
+    const allBackupCodes = await db.getAllActiveBackupCodes(telegramUserId);
+
+    if (allBackupCodes.length === 0) {
+      throw new Error('❌ No active backup codes available. Please add backup codes using /setbackupcodes before purchasing.');
+    }
+
+    if (allBackupCodes.length < quantity) {
+      throw new Error(
+        `❌ Not enough backup codes!\n\n` +
+        `You have: ${allBackupCodes.length} backup codes\n` +
+        `You need: ${quantity} backup codes\n\n` +
+        `Please add more backup codes or reduce your order quantity.`
+      );
+    }
+
+    // Configuration
+    const MAX_BROWSERS = 10;
+    const LAUNCH_STAGGER_MS = 800;
+    const MAX_BROWSER_LAUNCH_RETRIES = 3;
+    const MAX_LOGIN_RETRIES = 3;
+    const RETRY_DELAY_MS = 2000;
+
+    // Determine browser count: 1 code per browser, max 10
+    const browserCount = Math.min(quantity, MAX_BROWSERS, allBackupCodes.length);
+
+    // Distribute 1 backup code per browser (first N codes)
+    const browserBackupCodes = allBackupCodes.slice(0, browserCount);
+
+    // Mark distributed codes as used in database (Razer consumes them once entered in 2FA)
+    const codeIds = browserBackupCodes.map(c => c.id);
+    await db.markBackupCodesAsUsedByIds(codeIds);
+    logger.purchase(`Distributed ${browserCount} backup codes to ${browserCount} browsers`);
 
     const sharedState = {
       cardQueue: Array.from({ length: quantity }, (_, i) => i + 1), // [1, 2, 3, ..., quantity]
@@ -1217,12 +1229,40 @@ class PurchaseService {
       failedCount: 0,
       processedCount: 0,
       cancelled: false,
-      browsers: [] // Track all browser instances for forceful cancellation
+      browsers: [], // Track all browser instances for forceful cancellation
+      activeBrowserCount: browserCount, // Track how many browsers are still running
+      allBrowsersExpired: false, // Flag when all browsers closed due to expired sessions
+      pendingDbSaves: [] // Track all DB save promises to ensure they complete before exit
+    };
+
+    /**
+     * Guaranteed DB save wrapper - tracks the promise so it completes even during shutdown
+     * @param {Object} result - Purchase result
+     * @param {number} cardNum - Card number
+     * @param {string} lbl - Browser label for logging
+     */
+    const guaranteedDbSave = async (result, cardNum, lbl) => {
+      if (!onCardCompleted) return;
+      const savePromise = (async () => {
+        try {
+          await onCardCompleted(result, cardNum);
+          if (result.success) {
+            logger.database(`${lbl} Card ${cardNum} saved to database`);
+          } else {
+            logger.database(`${lbl} ⚠️ Card ${cardNum} saved to DB (TX: ${result.transactionId || 'N/A'} - needs manual check)`);
+          }
+        } catch (saveErr) {
+          logger.error(`${lbl} CRITICAL: Failed to save card ${cardNum} to database: ${saveErr.message}`);
+        }
+      })();
+      sharedState.pendingDbSaves.push(savePromise);
+      return savePromise;
     };
 
     logger.purchase(`\n${'='.repeat(60)}`);
     logger.purchase(`Starting PARALLEL bulk purchase: ${quantity} x ${cardName}`);
-    logger.purchase(`Using ${browserCount} simultaneous browsers`);
+    logger.purchase(`Using ${browserCount} browsers with 1 backup code each`);
+    logger.purchase(`Each backup code session lasts ~15 minutes`);
     logger.purchase(`${'='.repeat(60)}\n`);
 
     /**
@@ -1230,7 +1270,6 @@ class PurchaseService {
      */
     const launchBrowserWithRetry = async (label) => {
       for (let attempt = 1; attempt <= MAX_BROWSER_LAUNCH_RETRIES; attempt++) {
-        // Check cancellation before each attempt
         if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
           sharedState.cancelled = true;
           throw new Error('Purchase cancelled by user');
@@ -1257,14 +1296,11 @@ class PurchaseService {
           });
 
           const page = await browser.newPage();
-
-          // Configure page
           await page.setViewport({ width: 1280, height: 720 });
           await page.setDefaultTimeout(45000);
           await page.setDefaultNavigationTimeout(60000);
           await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-          // Request interception
           await page.setRequestInterception(true);
           page.on('request', (request) => {
             const resourceType = request.resourceType();
@@ -1280,15 +1316,12 @@ class PurchaseService {
 
         } catch (err) {
           logger.error(`${label} Browser launch failed (attempt ${attempt}/${MAX_BROWSER_LAUNCH_RETRIES}): ${err.message}`);
-
           if (attempt < MAX_BROWSER_LAUNCH_RETRIES) {
-            // Check cancellation before retry wait
             if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
               sharedState.cancelled = true;
               throw new Error('Purchase cancelled by user');
             }
-            const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1); // Exponential backoff
-            logger.debug(`${label} Retrying in ${delay}ms...`);
+            const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
             await new Promise(resolve => setTimeout(resolve, delay));
           } else {
             throw new Error(`Failed to launch browser after ${MAX_BROWSER_LAUNCH_RETRIES} attempts: ${err.message}`);
@@ -1298,11 +1331,10 @@ class PurchaseService {
     };
 
     /**
-     * Login to Razer with retry logic (handles login failures)
+     * Login to Razer with retry logic
      */
     const loginWithRetry = async (label, page) => {
       for (let attempt = 1; attempt <= MAX_LOGIN_RETRIES; attempt++) {
-        // Check cancellation before each login attempt
         if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
           sharedState.cancelled = true;
           throw new Error('Purchase cancelled by user');
@@ -1310,17 +1342,14 @@ class PurchaseService {
         try {
           logger.debug(`${label} Logging in to Razer (attempt ${attempt}/${MAX_LOGIN_RETRIES})...`);
 
-          // Navigate to login page
           await page.goto('https://razerid.razer.com', {
             waitUntil: 'load',
             timeout: 60000
           });
 
-          // Wait for login form
           await page.waitForSelector('#input-login-email', { visible: true, timeout: 15000 });
           await page.waitForSelector('#input-login-password', { visible: true, timeout: 15000 });
 
-          // Clear any existing values
           await page.evaluate(() => {
             const emailInput = document.querySelector('#input-login-email');
             const passwordInput = document.querySelector('#input-login-password');
@@ -1328,11 +1357,9 @@ class PurchaseService {
             if (passwordInput) passwordInput.value = '';
           });
 
-          // Type credentials
           await page.type('#input-login-email', credentials.email, { delay: 20 });
           await page.type('#input-login-password', credentials.password, { delay: 20 });
 
-          // Handle cookie consent
           try {
             await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 1500 });
             await page.click('button[aria-label="Accept All"]');
@@ -1340,13 +1367,11 @@ class PurchaseService {
             // No cookie banner
           }
 
-          // Submit and wait for navigation
           await Promise.all([
             page.click('button[type="submit"]'),
             page.waitForNavigation({ waitUntil: 'load', timeout: 60000 })
           ]);
 
-          // Verify login success
           const currentUrl = page.url();
           if (currentUrl === 'https://razerid.razer.com' || currentUrl === 'https://razerid.razer.com/') {
             throw new Error('Login failed - still on login page');
@@ -1354,7 +1379,6 @@ class PurchaseService {
 
           logger.success(`${label} Logged in successfully`);
 
-          // Navigate to gold.razer.com
           logger.debug(`${label} Establishing session on gold.razer.com...`);
           await page.goto('https://gold.razer.com/global/en', {
             waitUntil: 'domcontentloaded',
@@ -1366,15 +1390,12 @@ class PurchaseService {
 
         } catch (err) {
           logger.error(`${label} Login failed (attempt ${attempt}/${MAX_LOGIN_RETRIES}): ${err.message}`);
-
           if (attempt < MAX_LOGIN_RETRIES) {
-            // Check cancellation before retry wait
             if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
               sharedState.cancelled = true;
               throw new Error('Purchase cancelled by user');
             }
-            const delay = RETRY_DELAY_MS * attempt; // Linear backoff for login
-            logger.debug(`${label} Retrying login in ${delay}ms...`);
+            const delay = RETRY_DELAY_MS * attempt;
             await new Promise(resolve => setTimeout(resolve, delay));
           } else {
             throw new Error(`Failed to login after ${MAX_LOGIN_RETRIES} attempts: ${err.message}`);
@@ -1384,29 +1405,18 @@ class PurchaseService {
     };
 
     /**
-     * Check if browser is still alive and responsive
-     */
-    const isBrowserAlive = async (browser, page) => {
-      try {
-        if (!browser || !browser.isConnected()) return false;
-        if (!page || page.isClosed()) return false;
-
-        // Try a simple operation to verify responsiveness
-        await page.evaluate(() => true);
-        return true;
-      } catch (err) {
-        return false;
-      }
-    };
-
-    /**
-     * Single browser session that processes cards from the shared queue
-     * WITH RETRY LOGIC: Automatically relaunches browser/re-login if needed
+     * Single browser session - processes cards from queue using ONE backup code
+     * The backup code is used ONCE at the first 2FA prompt.
+     * After that, the session stays active for ~15 minutes.
+     * If 2FA is requested again, session expired → close browser.
      */
     const runPurchaseSession = async (sessionIndex) => {
       const label = `[Browser ${sessionIndex + 1}]`;
+      const assignedCode = browserBackupCodes[sessionIndex].code;
       let browser = null;
       let page = null;
+      let isFirstPurchase = true;
+      let cardsProcessed = 0;
 
       try {
         // Check cancellation before launching
@@ -1416,7 +1426,7 @@ class PurchaseService {
           return;
         }
 
-        // Step 1: Launch browser with retry
+        // Step 1: Launch browser
         const launchResult = await launchBrowserWithRetry(label);
         browser = launchResult.browser;
         page = launchResult.page;
@@ -1428,205 +1438,113 @@ class PurchaseService {
         }
         this.activeBrowsers.get(telegramUserId).push(browser);
 
-        // Step 2: Login with retry
+        // Step 2: Login
         await loginWithRetry(label, page);
 
-        // Step 3: Process cards from queue until empty
-        let cardsProcessed = 0;
+        logger.purchase(`${label} Ready with backup code. Session will last ~15 minutes after first purchase.`);
+
+        // Step 3: Process cards from queue
         while (true) {
-          // Check if cancelled
+          // Check cancellation
           if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
             sharedState.cancelled = true;
             logger.info(`${label} Order cancelled - stopping`);
             break;
           }
 
-          // CRITICAL: Check if browser is still alive before processing next card
-          const browserAlive = await isBrowserAlive(browser, page);
-          if (!browserAlive) {
-            logger.warn(`${label} Browser crashed or disconnected.`);
-            // If cancelled, do not relaunch browser, exit immediately
-            if (sharedState.cancelled) {
-              logger.info(`${label} Order cancelled - not relaunching browser.`);
-              break;
+          // Check if browser is still alive
+          let browserDead = false;
+          try {
+            if (!browser || !browser.isConnected() || !page || page.isClosed()) {
+              browserDead = true;
+            } else {
+              await page.evaluate(() => true); // Quick responsiveness check
             }
-            try {
-              // Close dead browser if possible
-              if (browser) {
-                try { await browser.close(); } catch (e) { }
+          } catch (aliveErr) {
+            browserDead = true;
+          }
+
+          if (browserDead) {
+            if (isFirstPurchase) {
+              // Backup code NOT yet used on Razer → safe to relaunch and retry with same code
+              logger.warn(`${label} Browser crashed BEFORE using backup code - relaunching...`);
+              try {
+                if (browser) { try { await browser.close(); } catch (e) { } }
+                const relaunchResult = await launchBrowserWithRetry(label);
+                browser = relaunchResult.browser;
+                page = relaunchResult.page;
+                sharedState.browsers.push(browser);
+                if (this.activeBrowsers.has(telegramUserId)) {
+                  this.activeBrowsers.get(telegramUserId).push(browser);
+                }
+                await loginWithRetry(label, page);
+                logger.success(`${label} Browser relaunched - backup code still available for 2FA`);
+                continue; // Retry the loop (will pick next card from queue)
+              } catch (relaunchErr) {
+                logger.error(`${label} Failed to relaunch browser: ${relaunchErr.message}`);
+                break; // Give up on this browser session
               }
-              // Relaunch browser and re-login
-              const launchResult = await launchBrowserWithRetry(label);
-              browser = launchResult.browser;
-              page = launchResult.page;
-              // Re-register browser
-              sharedState.browsers.push(browser);
-              if (this.activeBrowsers.has(telegramUserId)) {
-                this.activeBrowsers.get(telegramUserId).push(browser);
-              }
-              // Re-login
-              await loginWithRetry(label, page);
-              logger.success(`${label} Browser relaunched and logged in`);
-            } catch (relaunchErr) {
-              logger.error(`${label} Failed to relaunch browser: ${relaunchErr.message}`);
-              logger.error(`${label} Stopping this session - other browsers will continue`);
+            } else {
+              // Backup code already consumed by Razer → no point relaunching
+              logger.warn(`${label} Browser crashed AFTER backup code was used - no relaunch (code already consumed)`);
               break;
             }
           }
 
-          // Get next card from queue (thread-safe due to Node.js single-threaded)
+          // Get next card from queue
           const cardNumber = sharedState.cardQueue.shift();
           if (cardNumber === undefined) {
-            // Queue is empty
-            logger.debug(`${label} No more cards in queue - finished processing ${cardsProcessed} cards`);
+            logger.debug(`${label} Queue empty - finished after ${cardsProcessed} cards`);
             break;
           }
 
           logger.purchase(`${label} Processing card ${cardNumber}/${quantity}...`);
 
-          // RETRY LOGIC for individual card purchase
-          let purchaseSuccess = false;
-          let lastError = null;
-          let result = null;
+          try {
+            // Complete the purchase
+            // First purchase: pass backup code for 2FA
+            // Subsequent purchases: pass null (no 2FA expected, session active)
+            const result = await this.completePurchase({
+              telegramUserId,
+              page,
+              gameUrl,
+              cardIndex,
+              backupCode: isFirstPurchase ? assignedCode : null,
+              checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+              cardNumber,
+              gameName,
+              cardName
+            });
 
-          for (let purchaseAttempt = 1; purchaseAttempt <= MAX_PURCHASE_RETRIES + 1; purchaseAttempt++) {
-            try {
-              // Get backup code from database
-              const backupCode = await db.getNextBackupCode(telegramUserId);
-
-              if (!backupCode) {
-                logger.error(`${label} No more backup codes available`);
-                // Put card back in queue (at the front) so another browser can try
-                sharedState.cardQueue.unshift(cardNumber);
-                throw new Error('No more backup codes available');
-              }
-
-              if (purchaseAttempt > 1) {
-                logger.debug(`${label} Retry ${purchaseAttempt - 1}/${MAX_PURCHASE_RETRIES} for card ${cardNumber}`);
-              }
-
-              logger.debug(`${label} Using backup code for card ${cardNumber}`);
-
-              // Complete the purchase
-              result = await this.completePurchase({
-                telegramUserId,
-                page,
-                gameUrl,
-                cardIndex,
-                backupCode,
-                checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                cardNumber,
-                gameName,
-                cardName
-              });
-
-              // Mark backup code as used
-              await db.markBackupCodeAsUsed(telegramUserId);
-
-              // Purchase completed (success or failed extraction)
-              purchaseSuccess = true;
-              break; // Exit retry loop
-
-            } catch (purchaseErr) {
-              lastError = purchaseErr;
-
-              // Mark backup code as used if it was invalid
-              if (purchaseErr instanceof InvalidBackupCodeError) {
-                await db.markBackupCodeAsUsed(telegramUserId);
-                logger.debug(`${label} Backup code marked as used (was invalid)`);
-              }
-
-              // Don't retry for these critical errors
-              if (purchaseErr instanceof InsufficientBalanceError ||
-                purchaseErr instanceof InvalidBackupCodeError ||
-                (purchaseErr.message && purchaseErr.message.includes('cancelled by user')) ||
-                (purchaseErr.message && purchaseErr.message.includes('No more backup codes'))) {
-                logger.error(`${label} Critical error - no retry: ${purchaseErr.message}`);
-                break; // Don't retry
-              }
-
-              // Check if this is a network/temporary error that we should retry
-              const isRetryableError = purchaseErr.message && (
-                purchaseErr.message.includes('timeout') ||
-                purchaseErr.message.includes('Navigation') ||
-                purchaseErr.message.includes('disconnected') ||
-                purchaseErr.message.includes('Protocol error') ||
-                purchaseErr.message.includes('Execution context')
-              );
-
-              if (isRetryableError && purchaseAttempt <= MAX_PURCHASE_RETRIES) {
-                logger.warn(`${label} Retryable error for card ${cardNumber}: ${purchaseErr.message}`);
-                logger.debug(`${label} Will retry (attempt ${purchaseAttempt + 1}/${MAX_PURCHASE_RETRIES + 1})...`);
-
-                // Check if browser crashed during purchase
-                const stillAlive = await isBrowserAlive(browser, page);
-                if (!stillAlive) {
-                  logger.warn(`${label} Browser died during purchase.`);
-                  // If cancelled, do not relaunch browser, exit immediately
-                  if (sharedState.cancelled) {
-                    logger.info(`${label} Order cancelled - not relaunching browser.`);
-                    break;
-                  }
-                  try {
-                    if (browser) {
-                      try { await browser.close(); } catch (e) { }
-                    }
-                    const launchResult = await launchBrowserWithRetry(label);
-                    browser = launchResult.browser;
-                    page = launchResult.page;
-                    sharedState.browsers.push(browser);
-                    if (this.activeBrowsers.has(telegramUserId)) {
-                      this.activeBrowsers.get(telegramUserId).push(browser);
-                    }
-                    await loginWithRetry(label, page);
-                    logger.success(`${label} Browser relaunched for retry`);
-                  } catch (relaunchErr) {
-                    logger.error(`${label} Failed to relaunch for retry: ${relaunchErr.message}`);
-                    break; // Can't retry without browser
-                  }
-                }
-
-                // Wait before retry
-                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
-                continue; // Retry
-              } else {
-                // Not retryable or out of retries
-                logger.error(`${label} Purchase failed (no more retries): ${purchaseErr.message}`);
-                break;
-              }
+            // First purchase done successfully - backup code session now active!
+            if (isFirstPurchase) {
+              isFirstPurchase = false;
+              logger.success(`${label} ✅ Backup code accepted! Session active for ~15 minutes.`);
             }
-          }
 
-          // Handle purchase result
-          if (purchaseSuccess && result) {
-
-            // Add to shared purchases array
+            // Handle result
             sharedState.purchases.push(result);
             cardsProcessed++;
 
             if (result.success) {
               sharedState.successCount++;
-              logger.success(`${label} Card ${cardNumber}/${quantity} completed successfully!`);
-              logger.info(`${label} Transaction ID: ${result.transactionId}`);
+              logger.success(`${label} Card ${cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
 
-              // Immediate DB save
-              if (onCardCompleted) {
-                try {
-                  await onCardCompleted(result, cardNumber);
-                  logger.database(`${label} Card ${cardNumber} saved to database`);
-                } catch (saveErr) {
-                  logger.error(`${label} Failed to save card ${cardNumber}:`, saveErr.message);
-                }
-              }
+              // GUARANTEED DB save - tracked and cannot be interrupted
+              await guaranteedDbSave(result, cardNumber, label);
             } else {
               sharedState.failedCount++;
-              logger.warn(`${label} Card ${cardNumber}/${quantity} reached transaction page but extraction FAILED`);
+              logger.warn(`${label} Card ${cardNumber}/${quantity} reached transaction but extraction FAILED`);
+
+              // CRITICAL: If extraction failed but we have a transaction ID, save to DB anyway
+              // This means money was spent - must be tracked for manual PIN recovery
+              if (result.transactionId) {
+                await guaranteedDbSave(result, cardNumber, label);
+              }
             }
 
-            // Update shared progress counter
+            // Update progress
             sharedState.processedCount++;
-
-            // Update progress UI
             if (onProgress) {
               try {
                 await onProgress(sharedState.processedCount, quantity);
@@ -1635,81 +1553,183 @@ class PurchaseService {
               }
             }
 
-          } else if (lastError) {
-            // Purchase failed after all retries
+          } catch (purchaseErr) {
+            // ===== BACKUP CODE SESSION EXPIRED =====
+            // 2FA was requested again but we have no more codes for this browser
+            if (purchaseErr instanceof BackupCodeExpiredError) {
+              // Put card back in queue for another browser to pick up
+              sharedState.cardQueue.unshift(cardNumber);
+              logger.warn(`${label} 🔒 Backup code session expired! Card ${cardNumber} returned to queue. Closing browser.`);
+              break; // Exit this browser's loop
+            }
+
+            // ===== INSUFFICIENT BALANCE =====
+            if (purchaseErr instanceof InsufficientBalanceError) {
+              logger.error(`${label} 💰 Insufficient balance - stopping ALL browsers`);
+              sharedState.cancelled = true;
+              sharedState.failedCount++;
+              sharedState.processedCount++;
+              sharedState.purchases.push({
+                success: false,
+                transactionId: purchaseErr.transactionId || null,
+                pinCode: 'FAILED',
+                serial: 'FAILED',
+                error: purchaseErr.message,
+                stage: purchaseErr.stage,
+                requiresManualCheck: false
+              });
+              if (onProgress) {
+                try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
+              }
+              break;
+            }
+
+            // ===== INVALID BACKUP CODE =====
+            if (purchaseErr instanceof InvalidBackupCodeError) {
+              // Code was wrong - this browser can't proceed
+              sharedState.cardQueue.unshift(cardNumber);
+              logger.error(`${label} ❌ Invalid backup code - closing browser. Card ${cardNumber} returned to queue.`);
+              break;
+            }
+
+            // ===== CANCELLED BY USER =====
+            if (purchaseErr.message && purchaseErr.message.includes('cancelled by user')) {
+              // CRITICAL: If purchase had a transactionId, it went through!
+              // Save it to DB before stopping, even though user cancelled.
+              if (purchaseErr.transactionId) {
+                logger.warn(`${label} ⚠️ Order cancelled but transaction ${purchaseErr.transactionId} was confirmed! Saving to DB...`);
+                const rescuedResult = {
+                  success: false,
+                  transactionId: purchaseErr.transactionId,
+                  pinCode: 'FAILED',
+                  serialNumber: 'FAILED',
+                  requiresManualCheck: true,
+                  error: 'Purchase confirmed but cancelled before PIN extraction',
+                  gameName: gameName,
+                  cardValue: cardName
+                };
+                sharedState.purchases.push(rescuedResult);
+                sharedState.failedCount++;
+                sharedState.processedCount++;
+                cardsProcessed++;
+                await guaranteedDbSave(rescuedResult, cardNumber, label);
+              }
+              sharedState.cancelled = true;
+              logger.info(`${label} Order cancelled by user`);
+              break;
+            }
+
+            // ===== OTHER ERRORS =====
+            // CRITICAL: If error has transactionId, the purchase went through!
+            // Save to DB immediately before doing anything else.
+            if (purchaseErr.transactionId) {
+              logger.warn(`${label} ⚠️ Error occurred but transaction ${purchaseErr.transactionId} was confirmed! Saving to DB...`);
+              const rescuedResult = {
+                success: false,
+                transactionId: purchaseErr.transactionId,
+                pinCode: 'FAILED',
+                serialNumber: 'FAILED',
+                requiresManualCheck: true,
+                error: `Purchase confirmed but error during processing: ${purchaseErr.message}`,
+                gameName: gameName,
+                cardValue: cardName
+              };
+              await guaranteedDbSave(rescuedResult, cardNumber, label);
+            }
+
+            // Mark card as failed but continue with next card from queue
+            logger.error(`${label} Card ${cardNumber} failed: ${purchaseErr.message}`);
             sharedState.failedCount++;
             sharedState.processedCount++;
-
-            // Log error
-            if (lastError.message && lastError.message.includes('cancelled by user')) {
-              logger.info(`${label} Card ${cardNumber}/${quantity} cancelled`);
-              sharedState.cancelled = true;
-            } else {
-              logger.error(`${label} Card ${cardNumber}/${quantity} failed after retries: ${lastError.message}`);
-            }
-
-            // Add failed purchase to array
-            const failedPurchase = {
+            sharedState.purchases.push({
               success: false,
-              transactionId: lastError.transactionId || null,
+              transactionId: purchaseErr.transactionId || null,
               pinCode: 'FAILED',
               serial: 'FAILED',
-              error: lastError.message,
-              stage: lastError.stage,
+              error: purchaseErr.message,
+              stage: purchaseErr.stage,
               requiresManualCheck: true
-            };
-            sharedState.purchases.push(failedPurchase);
+            });
             cardsProcessed++;
 
-            // Update progress even for failed cards
             if (onProgress) {
-              try {
-                await onProgress(sharedState.processedCount, quantity);
-              } catch (progressErr) {
-                logger.debug(`${label} Progress callback error:`, progressErr.message);
+              try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
+            }
+
+            // Check if browser is still alive after error
+            let browserCrashed = false;
+            try {
+              if (!browser.isConnected() || page.isClosed()) {
+                browserCrashed = true;
+              }
+            } catch (checkErr) {
+              browserCrashed = true;
+            }
+
+            if (browserCrashed) {
+              if (isFirstPurchase) {
+                // Backup code NOT consumed → relaunch and retry
+                logger.warn(`${label} Browser crashed during first purchase (before 2FA) - relaunching...`);
+                try {
+                  if (browser) { try { await browser.close(); } catch (e) { } }
+                  const relaunchResult = await launchBrowserWithRetry(label);
+                  browser = relaunchResult.browser;
+                  page = relaunchResult.page;
+                  sharedState.browsers.push(browser);
+                  if (this.activeBrowsers.has(telegramUserId)) {
+                    this.activeBrowsers.get(telegramUserId).push(browser);
+                  }
+                  await loginWithRetry(label, page);
+                  logger.success(`${label} Browser relaunched - will retry with same backup code`);
+                  continue; // Continue loop, pick next card from queue
+                } catch (relaunchErr) {
+                  logger.error(`${label} Failed to relaunch: ${relaunchErr.message}`);
+                  break;
+                }
+              } else {
+                // Backup code already consumed → cannot relaunch
+                logger.warn(`${label} Browser crashed after backup code was used - stopping`);
+                break;
               }
             }
 
-            // Stop processing if insufficient balance or no more backup codes
-            if (lastError instanceof InsufficientBalanceError ||
-              (lastError.message && lastError.message.includes('No more backup codes'))) {
-              logger.error(`${label} Critical error - stopping this browser`);
-              break;
-            }
-
-            // Stop if cancelled
-            if (sharedState.cancelled) {
-              logger.info(`${label} Cancelled - stopping`);
-              break;
+            // If first purchase failed but browser is alive, it might be a page-level error
+            // (not a crash). The backup code hasn't been entered yet, so we can retry.
+            if (isFirstPurchase) {
+              logger.warn(`${label} First purchase failed but browser alive - will retry with same backup code`);
+              continue; // Retry, will pick next card and use the same backup code
             }
           }
         }
 
-        logger.debug(`${label} Session completed - processed ${cardsProcessed} cards`);
+        logger.debug(`${label} Session ended - processed ${cardsProcessed} cards`);
 
       } catch (err) {
-        logger.error(`${label} Browser session error:`, err.message);
+        logger.error(`${label} Browser session fatal error: ${err.message}`);
       } finally {
-        // Close browser with timeout to prevent hanging
+        // Decrement active browser count
+        sharedState.activeBrowserCount--;
+        logger.debug(`${label} Closed. Active browsers remaining: ${sharedState.activeBrowserCount}`);
+
+        // Check if all browsers are dead but queue still has items
+        if (sharedState.activeBrowserCount === 0 && sharedState.cardQueue.length > 0 && !sharedState.cancelled) {
+          sharedState.allBrowsersExpired = true;
+          const remaining = sharedState.cardQueue.length;
+          logger.error(`⚠️ ALL BROWSERS CLOSED! ${remaining} cards remaining in queue.`);
+          logger.error('All backup code sessions have expired (~15 min limit). Cannot complete remaining purchases.');
+        }
+
+        // Close browser and remove from tracking
         if (browser) {
           try {
-            // Remove from tracking before closing
             const index = sharedState.browsers.indexOf(browser);
-            if (index > -1) {
-              sharedState.browsers.splice(index, 1);
-            }
+            if (index > -1) sharedState.browsers.splice(index, 1);
             if (this.activeBrowsers.has(telegramUserId)) {
               const userBrowsers = this.activeBrowsers.get(telegramUserId);
               const userIndex = userBrowsers.indexOf(browser);
-              if (userIndex > -1) {
-                userBrowsers.splice(userIndex, 1);
-              }
-              // Clean up empty array
-              if (userBrowsers.length === 0) {
-                this.activeBrowsers.delete(telegramUserId);
-              }
+              if (userIndex > -1) userBrowsers.splice(userIndex, 1);
+              if (userBrowsers.length === 0) this.activeBrowsers.delete(telegramUserId);
             }
-
             await Promise.race([
               browser.close(),
               new Promise(resolve => setTimeout(resolve, 5000))
@@ -1723,12 +1743,10 @@ class PurchaseService {
     };
 
     try {
-      // Launch all browser sessions with minimal stagger for speed
+      // Launch all browser sessions with stagger
       const sessionPromises = [];
 
-      // Launch browsers with minimal delay (more parallel, faster overall)
       for (let i = 0; i < browserCount; i++) {
-        // Check cancellation before spawning each browser
         if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
           sharedState.cancelled = true;
           logger.info(`Cancellation detected - skipping browser ${i + 1}/${browserCount}`);
@@ -1736,14 +1754,13 @@ class PurchaseService {
         }
         logger.debug(`Spawning browser ${i + 1}/${browserCount}...`);
 
-        // Launch browser session immediately (parallel launch)
         sessionPromises.push(
           (async () => {
-            // Small stagger to avoid spike but much faster than sequential
             await new Promise(resolve => setTimeout(resolve, i * LAUNCH_STAGGER_MS));
-            // Check cancellation again after stagger wait
             if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
               sharedState.cancelled = true;
+              // Still decrement active count since this browser never started
+              sharedState.activeBrowserCount--;
               return;
             }
             return runPurchaseSession(i);
@@ -1756,25 +1773,44 @@ class PurchaseService {
       // Wait for all browsers to complete
       await Promise.all(sessionPromises);
 
+      // ===== FINAL SUMMARY =====
       logger.purchase(`\n${'='.repeat(60)}`);
-      logger.success(`All cards processed! Success: ${sharedState.successCount}, Failed: ${sharedState.failedCount}, Total: ${quantity}`);
+
+      if (sharedState.allBrowsersExpired) {
+        const remaining = sharedState.cardQueue.length;
+        logger.error(`⚠️ ORDER INCOMPLETE: ${remaining} cards could NOT be purchased`);
+        logger.error('Reason: All backup code sessions expired (~15 min limit)');
+        logger.error('Tip: Purchase fewer cards per order, or ensure faster processing');
+      }
+
+      logger.success(`Results: ✅ Success: ${sharedState.successCount} | ❌ Failed: ${sharedState.failedCount} | Total: ${sharedState.processedCount}/${quantity}`);
       logger.purchase(`${'='.repeat(60)}\n`);
 
       return sharedState.purchases;
 
     } catch (err) {
-      // Log error
       if (err.message && err.message.includes('cancelled by user')) {
         logger.info('Parallel bulk purchase cancelled:', err.message);
       } else {
         logger.error('Parallel bulk purchase error:', err.message);
       }
 
-      // Return what we have so far
       err.purchases = sharedState.purchases;
       throw err;
     } finally {
-      // CRITICAL: Force close any remaining browsers on exit (cancellation, error, or completion)
+      // CRITICAL SAFETY NET: Wait for ALL pending DB saves to complete before exit
+      // This ensures no purchase data is lost even during cancel/crash/force-close
+      if (sharedState.pendingDbSaves.length > 0) {
+        logger.system(`⏳ Waiting for ${sharedState.pendingDbSaves.length} pending DB saves to complete...`);
+        try {
+          await Promise.allSettled(sharedState.pendingDbSaves);
+          logger.system(`✅ All ${sharedState.pendingDbSaves.length} DB saves completed`);
+        } catch (dbErr) {
+          logger.error(`⚠️ Error waiting for DB saves: ${dbErr.message}`);
+        }
+      }
+
+      // THEN close browsers (after DB saves are done)
       if (sharedState.browsers && sharedState.browsers.length > 0) {
         logger.system(`Cleaning up ${sharedState.browsers.length} remaining browsers...`);
         const closePromises = sharedState.browsers.map(browser => {

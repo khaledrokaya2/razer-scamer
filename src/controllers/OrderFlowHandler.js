@@ -718,6 +718,18 @@ class OrderFlowHandler {
         return;
       }
 
+      // Validate: quantity must be <= available backup codes
+      if (quantity > backupCodeCount) {
+        await bot.sendMessage(chatId,
+          `⚠️ *NOT ENOUGH BACKUP CODES*\n\n` +
+          `You have: ${backupCodeCount} backup codes\n\n` +
+          `Each purchase needs a backup code. Please:\n` +
+          `Enter a new quantity:`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
       // Check if schedule mode or instant purchase
       if (session.isScheduleMode) {
         // Schedule mode: go directly to schedule time entry
@@ -951,12 +963,27 @@ class OrderFlowHandler {
 
         await bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
 
-        // Add warning about failed cards
-        await bot.sendMessage(
-          chatId,
-          `⚠️ *Partial Success*\n\n✅ Success: ${validPinCount}/${totalCount}\n❌ Failed: ${failedCount}/${totalCount}`,
-          { parse_mode: 'Markdown' }
-        );
+        // Check if order was incomplete due to backup code expiry
+        const totalProcessed = validPinCount + failedCount;
+        if (totalProcessed < quantity) {
+          const unprocessed = quantity - totalProcessed;
+          await bot.sendMessage(
+            chatId,
+            `⚠️ *Partial Success*\n\n` +
+            `✅ Success: ${validPinCount}/${quantity}\n` +
+            `❌ Failed: ${failedCount}/${quantity}\n` +
+            `⏳ Not processed: ${unprocessed}/${quantity}\n\n` +
+            `🔒 Backup code sessions expired (~15 min limit).`,
+            { parse_mode: 'Markdown' }
+          );
+        } else {
+          // Add warning about failed cards
+          await bot.sendMessage(
+            chatId,
+            `⚠️ *Partial Success*\n\n✅ Success: ${validPinCount}/${totalCount}\n❌ Failed: ${failedCount}/${totalCount}`,
+            { parse_mode: 'Markdown' }
+          );
+        }
       } else {
         // All cards succeeded
         const statusMessage = isScheduled

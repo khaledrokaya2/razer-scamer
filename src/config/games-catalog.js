@@ -13,6 +13,12 @@ const gamesCatalog = [
     description: 'Free Fire'
   },
   {
+    id: 'soho101',
+    name: 'Soho 101',
+    link: 'https://gold.razer.com/global/en/gold/catalog/soho-101-okey',
+    description: 'Soho 101'
+  },
+  {
     id: 'yalla-ludo',
     name: '🎲 Yalla Ludo',
     link: 'https://gold.razer.com/global/en/gold/catalog/yalla-ludo',

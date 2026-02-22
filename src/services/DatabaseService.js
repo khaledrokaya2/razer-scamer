@@ -667,6 +667,64 @@ class DatabaseService {
   }
 
   /**
+   * Get ALL active backup codes for a user (decrypted)
+   * Used to distribute 1 code per browser before purchase starts
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<Array<{id: number, code: string}>>} Array of {id, decrypted_code}
+   */
+  async getAllActiveBackupCodes(telegramUserId) {
+    try {
+      await this.connect();
+
+      const result = await this.pool.request()
+        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .query(`
+          SELECT id, code_encrypted 
+          FROM backup_codes 
+          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+          ORDER BY id ASC
+        `);
+
+      return result.recordset.map(row => ({
+        id: row.id,
+        code: encryptionService.decrypt(row.code_encrypted)
+      }));
+    } catch (err) {
+      logger.error('Error getting all active backup codes:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Mark specific backup codes as used by their IDs
+   * Used when distributing codes to browsers at purchase start
+   * @param {Array<number>} codeIds - Array of backup code IDs to mark as used
+   * @returns {Promise<number>} Number of codes marked
+   */
+  async markBackupCodesAsUsedByIds(codeIds) {
+    try {
+      await this.connect();
+      if (!codeIds || codeIds.length === 0) return 0;
+
+      // Safe: IDs are integers from our own database
+      const idList = codeIds.map(id => parseInt(id)).join(',');
+
+      const result = await this.pool.request()
+        .query(`
+          UPDATE backup_codes
+          SET status = 'used', used_at = SYSUTCDATETIME()
+          WHERE id IN (${idList})
+        `);
+
+      logger.database(`Marked ${result.rowsAffected[0]} backup codes as used (IDs: ${idList})`);
+      return result.rowsAffected[0];
+    } catch (err) {
+      logger.error('Error marking backup codes as used by IDs:', err);
+      throw err;
+    }
+  }
+
+  /**
    * Get count of active backup codes
    * @param {string} telegramUserId - Telegram user ID
    * @returns {Promise<number>} Count of active codes

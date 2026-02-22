@@ -133,9 +133,13 @@ class OrderService {
         quantity,
         onProgress,  // Telegram progress update
         checkCancellation,
-        // IMMEDIATE DB SAVE: Called after each successful card purchase
+        // IMMEDIATE DB SAVE: Called after each card purchase (success or confirmed-but-failed)
         onCardCompleted: async (purchaseResult, cardNumber) => {
           try {
+            // Determine if this is a true success or a confirmed-but-failed purchase
+            const isSuccess = purchaseResult.success === true;
+            const dbStatus = isSuccess ? 'success' : 'failed';
+
             // 1. Save purchase to database immediately
             await databaseService.createPurchaseWithEncryptedPin({
               orderId: order.id,
@@ -143,7 +147,7 @@ class OrderService {
               serialNumber: purchaseResult.serialNumber || null,
               transactionId: purchaseResult.transactionId || null,
               cardNumber: cardNumber,
-              status: 'success',
+              status: dbStatus,
               gameName: gameName,
               cardValue: cardName
             });
@@ -159,8 +163,9 @@ class OrderService {
                 pinCode: purchaseResult.pinCode,
                 serialNumber: purchaseResult.serialNumber,
                 transactionId: purchaseResult.transactionId,
-                success: true,
-                requiresManualCheck: false,
+                success: isSuccess,
+                requiresManualCheck: purchaseResult.requiresManualCheck || !isSuccess,
+                error: purchaseResult.error || null,
                 gameName: gameName,
                 cardValue: cardName
               });
