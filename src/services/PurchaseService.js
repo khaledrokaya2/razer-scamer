@@ -796,11 +796,17 @@ class PurchaseService {
 
         const checkoutResult = await Promise.race([
           // Scenario 1: 2FA modal appears (requires backup code)
+          // Detection: Bootstrap adds .show class + style="display: block;" when modal is visible
+          // The #purchaseOtpModal element ALWAYS exists in the DOM (even before checkout) but is hidden.
+          // When 2FA is required, Bootstrap adds the 'show' class and an iframe appears inside it.
           page.waitForFunction(() => {
             const modal = document.querySelector('#purchaseOtpModal');
             if (!modal) return false;
+            // Check for Bootstrap's .show class (definitive indicator) AND display:block
+            const hasShowClass = modal.classList.contains('show');
             const style = window.getComputedStyle(modal);
-            return style.display !== 'none' && style.visibility !== 'hidden';
+            const isDisplayed = style.display !== 'none';
+            return hasShowClass && isDisplayed;
           }, { polling: 'mutation', timeout: 4000 }).then(() => ({ type: '2fa' })).catch(() => null),
 
           // Scenario 2: Direct redirect to transaction page (no 2FA) - FASTER polling for common case!
@@ -836,51 +842,69 @@ class PurchaseService {
 
           logger.debug('2FA modal detected - processing backup code...');
 
-          // Step 2: Wait for any OTP iframe (first one)
+          // Step 2: Wait for OTP iframe inside the modal
+          // The iframe is always id="otp-iframe-1" across all 2FA steps
+          logger.debug('Waiting for OTP iframe to appear...');
           await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 8000 });
           let frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
           let frame = await frameHandle.contentFrame();
 
+          if (!frame) throw new Error('Could not access OTP iframe content');
+
           // Step 3: Click "Choose another method" inside iframe
+          // This button appears on the initial "Two-Step Verification" page inside the iframe
           logger.debug('Clicking choose another method...');
           const chooseAnother = await frame.waitForSelector("button[class*='arrowed']", { visible: true, timeout: 20000 });
           await chooseAnother.click();
 
-          // Step 4: Wait for the new iframe (otp-iframe-4) to appear after clicking
-          await page.waitForFunction(() => {
-            const newIframe = document.querySelector('#purchaseOtpModal iframe[id^="otp-iframe-"]');
-            return newIframe && newIframe.id !== 'otp-iframe-3';
-          }, { polling: 'mutation', timeout: 8000 });
+          // Step 4: Wait for the "choose method" options to appear inside the iframe
+          // After clicking "choose another method", the iframe content changes to show
+          // alternative auth methods (backup codes, etc.). The iframe ID stays otp-iframe-1.
+          // We wait for the alt-menu (method selection buttons) to appear inside the iframe.
+          logger.debug('Waiting for alternative method options...');
+          await new Promise(resolve => setTimeout(resolve, 500)); // Brief wait for content transition
 
-          // Step 5: Switch to the new iframe
+          // Re-acquire iframe reference (content may have changed)
           frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
           frame = await frameHandle.contentFrame();
+          if (!frame) throw new Error('Lost iframe context after choosing another method');
 
-          // Step 6: Wait for and click "Backup Codes" button
-          // Try clicking the one with "Backup" in its text
+          // Step 5: Wait for and click "Backup Codes" button
+          // The alt-menu contains buttons for different auth methods. Backup Codes is the second option (index 1).
           logger.debug('Selecting backup code option...');
+          await frame.waitForSelector("ul[class*='alt-menu'] button", { visible: true, timeout: 8000 });
           const backupButton = await frame.$$("ul[class*='alt-menu'] button");
+          if (!backupButton || backupButton.length < 2) {
+            throw new Error('Could not find backup code option in auth method list');
+          }
           await backupButton[1].click();
 
-          // Enter backup code (8 digits)
+          // Step 6: Enter backup code (8 digits)
           logger.debug('Entering backup code...');
 
           if (!backupCode || backupCode.length !== 8) {
             throw new Error('Invalid backup code - must be 8 digits');
           }
 
-          // Wait for iframe and get its frame context
-          await page.waitForSelector('iframe[id^="otp-iframe-"]', { visible: true, timeout: 6000 });
-          const otpFrameElement = await page.$('iframe[id^="otp-iframe-"]');
+          // Wait for iframe content to update with OTP input fields
+          await new Promise(resolve => setTimeout(resolve, 500)); // Brief wait for content transition
+
+          // Re-acquire iframe reference for the backup code input page
+          await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 6000 });
+          const otpFrameElement = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
           const otpFrame = await otpFrameElement.contentFrame();
 
-          if (!otpFrame) throw new Error('❌ Could not access OTP iframe');
+          if (!otpFrame) throw new Error('❌ Could not access OTP iframe for backup code entry');
 
-          // Type digits into inputs inside iframe
+          // Wait for the first OTP input to be ready, then type all 8 digits
+          await otpFrame.waitForSelector('#otp-input-0', { visible: true, timeout: 8000 });
+
           for (let i = 0; i < 8; i++) {
             const inputSelector = `#otp-input-${i}`;
-            await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 3000 });
+            await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 5000 });
             await otpFrame.type(inputSelector, backupCode[i]);
+            // Small delay between digits to avoid input race conditions
+            await new Promise(resolve => setTimeout(resolve, 50));
           }
 
           // After entering all digits, the form auto-submits and page navigates
@@ -1549,12 +1573,44 @@ class PurchaseService {
             }
 
           } catch (purchaseErr) {
+            // Helper: determine if checkout was already clicked (point of no return)
+            // If checkout was clicked, the purchase MAY have gone through on Razer's side
+            // even if we got an error. NEVER retry/return card to queue after checkout!
+            const postCheckoutStages = ['clicking_checkout', 'processing_2fa', 'reached_transaction_page', 'extracting_pin_data'];
+            const checkoutAlreadyClicked = postCheckoutStages.includes(purchaseErr.stage);
+
             // ===== BACKUP CODE SESSION EXPIRED =====
             // 2FA was requested again but we have no more codes for this browser
             if (purchaseErr instanceof BackupCodeExpiredError) {
-              // Put card back in queue for another browser to pick up
-              sharedState.cardQueue.unshift(cardNumber);
-              logger.warn(`${label} 🔒 Backup code session expired! Card ${cardNumber} returned to queue. Closing browser.`);
+              if (checkoutAlreadyClicked) {
+                // CRITICAL: Checkout was already clicked! Razer may have processed the purchase.
+                // Do NOT return card to queue - that would cause a DUPLICATE purchase.
+                logger.warn(`${label} 🔒 Session expired AFTER checkout was clicked! Card ${cardNumber} marked as requires manual check (possible duplicate risk).`);
+                sharedState.failedCount++;
+                sharedState.processedCount++;
+                cardsProcessed++;
+                const expiredResult = {
+                  success: false,
+                  transactionId: purchaseErr.transactionId || null,
+                  pinCode: 'FAILED',
+                  serialNumber: 'FAILED',
+                  requiresManualCheck: true,
+                  error: `Session expired after checkout - purchase may have gone through on Razer. DO NOT RETRY.`,
+                  gameName: gameName,
+                  cardValue: cardName,
+                  stage: purchaseErr.stage
+                };
+                sharedState.purchases.push(expiredResult);
+                await guaranteedDbSave(expiredResult, cardNumber, label);
+                if (onProgress) {
+                  try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
+                }
+              } else {
+                // Checkout was NOT clicked yet - safe to return card to queue
+                sharedState.cardQueue.unshift(cardNumber);
+                logger.warn(`${label} 🔒 Backup code session expired BEFORE checkout. Card ${cardNumber} returned to queue.`);
+              }
+              logger.warn(`${label} Closing browser (session expired).`);
               break; // Exit this browser's loop
             }
 
@@ -1581,9 +1637,33 @@ class PurchaseService {
 
             // ===== INVALID BACKUP CODE =====
             if (purchaseErr instanceof InvalidBackupCodeError) {
-              // Code was wrong - this browser can't proceed
-              sharedState.cardQueue.unshift(cardNumber);
-              logger.error(`${label} ❌ Invalid backup code - closing browser. Card ${cardNumber} returned to queue.`);
+              if (checkoutAlreadyClicked) {
+                // CRITICAL: Checkout was already clicked! Do NOT return card to queue.
+                logger.warn(`${label} ❌ Invalid backup code AFTER checkout! Card ${cardNumber} marked as requires manual check.`);
+                sharedState.failedCount++;
+                sharedState.processedCount++;
+                cardsProcessed++;
+                const invalidCodeResult = {
+                  success: false,
+                  transactionId: purchaseErr.transactionId || null,
+                  pinCode: 'FAILED',
+                  serialNumber: 'FAILED',
+                  requiresManualCheck: true,
+                  error: `Invalid backup code after checkout - purchase may have gone through. DO NOT RETRY.`,
+                  gameName: gameName,
+                  cardValue: cardName,
+                  stage: purchaseErr.stage
+                };
+                sharedState.purchases.push(invalidCodeResult);
+                await guaranteedDbSave(invalidCodeResult, cardNumber, label);
+                if (onProgress) {
+                  try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
+                }
+              } else {
+                // Checkout was NOT clicked yet - safe to return card to queue
+                sharedState.cardQueue.unshift(cardNumber);
+                logger.error(`${label} ❌ Invalid backup code BEFORE checkout. Card ${cardNumber} returned to queue.`);
+              }
               break;
             }
 
@@ -1630,6 +1710,21 @@ class PurchaseService {
                 cardValue: cardName
               };
               await guaranteedDbSave(rescuedResult, cardNumber, label);
+            } else if (checkoutAlreadyClicked) {
+              // No transactionId but checkout WAS clicked - purchase may have gone through on Razer!
+              // Save to DB so the user knows to check manually on Razer's transaction history.
+              logger.warn(`${label} ⚠️ Error AFTER checkout was clicked (stage: ${purchaseErr.stage})! No TX ID but purchase may have gone through. Saving to DB for manual check...`);
+              const ghostResult = {
+                success: false,
+                transactionId: null,
+                pinCode: 'FAILED',
+                serialNumber: 'FAILED',
+                requiresManualCheck: true,
+                error: `Error after checkout clicked (${purchaseErr.stage}): ${purchaseErr.message}. Purchase may have gone through - check Razer transaction history.`,
+                gameName: gameName,
+                cardValue: cardName
+              };
+              await guaranteedDbSave(ghostResult, cardNumber, label);
             }
 
             // Mark card as failed but continue with next card from queue
