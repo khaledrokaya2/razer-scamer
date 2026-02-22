@@ -1229,6 +1229,11 @@ class PurchaseService {
      */
     const launchBrowserWithRetry = async (label) => {
       for (let attempt = 1; attempt <= MAX_BROWSER_LAUNCH_RETRIES; attempt++) {
+        // Check cancellation before each attempt
+        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+          sharedState.cancelled = true;
+          throw new Error('Purchase cancelled by user');
+        }
         try {
           logger.debug(`${label} Launching browser (attempt ${attempt}/${MAX_BROWSER_LAUNCH_RETRIES})...`);
 
@@ -1276,6 +1281,11 @@ class PurchaseService {
           logger.error(`${label} Browser launch failed (attempt ${attempt}/${MAX_BROWSER_LAUNCH_RETRIES}): ${err.message}`);
 
           if (attempt < MAX_BROWSER_LAUNCH_RETRIES) {
+            // Check cancellation before retry wait
+            if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+              sharedState.cancelled = true;
+              throw new Error('Purchase cancelled by user');
+            }
             const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1); // Exponential backoff
             logger.debug(`${label} Retrying in ${delay}ms...`);
             await new Promise(resolve => setTimeout(resolve, delay));
@@ -1291,6 +1301,11 @@ class PurchaseService {
      */
     const loginWithRetry = async (label, page) => {
       for (let attempt = 1; attempt <= MAX_LOGIN_RETRIES; attempt++) {
+        // Check cancellation before each login attempt
+        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+          sharedState.cancelled = true;
+          throw new Error('Purchase cancelled by user');
+        }
         try {
           logger.debug(`${label} Logging in to Razer (attempt ${attempt}/${MAX_LOGIN_RETRIES})...`);
 
@@ -1352,6 +1367,11 @@ class PurchaseService {
           logger.error(`${label} Login failed (attempt ${attempt}/${MAX_LOGIN_RETRIES}): ${err.message}`);
 
           if (attempt < MAX_LOGIN_RETRIES) {
+            // Check cancellation before retry wait
+            if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+              sharedState.cancelled = true;
+              throw new Error('Purchase cancelled by user');
+            }
             const delay = RETRY_DELAY_MS * attempt; // Linear backoff for login
             logger.debug(`${label} Retrying login in ${delay}ms...`);
             await new Promise(resolve => setTimeout(resolve, delay));
@@ -1388,6 +1408,13 @@ class PurchaseService {
       let page = null;
 
       try {
+        // Check cancellation before launching
+        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+          sharedState.cancelled = true;
+          logger.info(`${label} Order already cancelled - skipping`);
+          return;
+        }
+
         // Step 1: Launch browser with retry
         const launchResult = await launchBrowserWithRetry(label);
         browser = launchResult.browser;
@@ -1416,28 +1443,28 @@ class PurchaseService {
           // CRITICAL: Check if browser is still alive before processing next card
           const browserAlive = await isBrowserAlive(browser, page);
           if (!browserAlive) {
-            logger.warn(`${label} Browser crashed or disconnected - relaunching...`);
-
+            logger.warn(`${label} Browser crashed or disconnected.`);
+            // If cancelled, do not relaunch browser, exit immediately
+            if (sharedState.cancelled) {
+              logger.info(`${label} Order cancelled - not relaunching browser.`);
+              break;
+            }
             try {
               // Close dead browser if possible
               if (browser) {
                 try { await browser.close(); } catch (e) { }
               }
-
               // Relaunch browser and re-login
               const launchResult = await launchBrowserWithRetry(label);
               browser = launchResult.browser;
               page = launchResult.page;
-
               // Re-register browser
               sharedState.browsers.push(browser);
               if (this.activeBrowsers.has(telegramUserId)) {
                 this.activeBrowsers.get(telegramUserId).push(browser);
               }
-
               // Re-login
               await loginWithRetry(label, page);
-
               logger.success(`${label} Browser relaunched and logged in`);
             } catch (relaunchErr) {
               logger.error(`${label} Failed to relaunch browser: ${relaunchErr.message}`);
@@ -1533,21 +1560,23 @@ class PurchaseService {
                 // Check if browser crashed during purchase
                 const stillAlive = await isBrowserAlive(browser, page);
                 if (!stillAlive) {
-                  logger.warn(`${label} Browser died during purchase - relaunching...`);
+                  logger.warn(`${label} Browser died during purchase.`);
+                  // If cancelled, do not relaunch browser, exit immediately
+                  if (sharedState.cancelled) {
+                    logger.info(`${label} Order cancelled - not relaunching browser.`);
+                    break;
+                  }
                   try {
                     if (browser) {
                       try { await browser.close(); } catch (e) { }
                     }
-
                     const launchResult = await launchBrowserWithRetry(label);
                     browser = launchResult.browser;
                     page = launchResult.page;
-
                     sharedState.browsers.push(browser);
                     if (this.activeBrowsers.has(telegramUserId)) {
                       this.activeBrowsers.get(telegramUserId).push(browser);
                     }
-
                     await loginWithRetry(label, page);
                     logger.success(`${label} Browser relaunched for retry`);
                   } catch (relaunchErr) {
@@ -1698,6 +1727,12 @@ class PurchaseService {
 
       // Launch browsers with minimal delay (more parallel, faster overall)
       for (let i = 0; i < browserCount; i++) {
+        // Check cancellation before spawning each browser
+        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+          sharedState.cancelled = true;
+          logger.info(`Cancellation detected - skipping browser ${i + 1}/${browserCount}`);
+          break;
+        }
         logger.debug(`Spawning browser ${i + 1}/${browserCount}...`);
 
         // Launch browser session immediately (parallel launch)
@@ -1705,6 +1740,11 @@ class PurchaseService {
           (async () => {
             // Small stagger to avoid spike but much faster than sequential
             await new Promise(resolve => setTimeout(resolve, i * LAUNCH_STAGGER_MS));
+            // Check cancellation again after stagger wait
+            if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+              sharedState.cancelled = true;
+              return;
+            }
             return runPurchaseSession(i);
           })()
         );

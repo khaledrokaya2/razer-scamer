@@ -197,7 +197,7 @@ class OrderFlowHandler {
 
     // Create inline keyboard with game buttons (2 per row)
     const keyboard = [];
-    for (let i = 0; i < games.length; i += 2) {
+    for (let i = 0; i < games.length; i++) {
       const row = [
         {
           text: games[i].name,
@@ -205,21 +205,13 @@ class OrderFlowHandler {
         }
       ];
 
-      if (i + 1 < games.length) {
-        row.push({
-          text: games[i + 1].name,
-          callback_data: `order_game_${games[i + 1].id}`
-        });
-      }
-
       keyboard.push(row);
     }
 
     // Add "Others" button for custom URL
     keyboard.push([{ text: '🔗 Others (Custom URL)', callback_data: 'order_game_custom' }]);
 
-    // UX FIX #15: Add cancel button
-    keyboard.push([{ text: '❌ Cancel Order', callback_data: 'order_cancel' }]);
+    // Removed cancel button
 
     try {
       const gameMenuMsg = await bot.sendMessage(chatId,
@@ -344,10 +336,9 @@ class OrderFlowHandler {
         }
       ]);
 
-      // Add back and cancel buttons
+      // Add only back button
       keyboard.push([
-        { text: '⬅️ Back to Games', callback_data: 'order_back_to_games' },
-        { text: '❌ Cancel', callback_data: 'order_cancel' }
+        { text: '⬅️ Back to Games', callback_data: 'order_back_to_games' }
       ]);
 
       const cardMenuMsg = await bot.sendMessage(chatId,
@@ -599,8 +590,7 @@ class OrderFlowHandler {
 
       // UX FIX #15: Add back and cancel buttons
       keyboard.push([
-        { text: '⬅️ Back to Games', callback_data: 'order_back_to_games' },
-        { text: '❌ Cancel', callback_data: 'order_cancel' }
+        { text: '⬅️ Back to Games', callback_data: 'order_back_to_games' }
       ]);
 
       const cardMenuMsg = await bot.sendMessage(chatId,
@@ -816,14 +806,8 @@ class OrderFlowHandler {
         `✅ 0/${quantity} (📊 0%)`;
 
       const progressMsg = await bot.sendMessage(chatId, initialProgressText, {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '🛑 Cancel Order', callback_data: isScheduled ? `scheduled_cancel_${chatId}` : 'order_cancel_processing' }
-          ]]
-        }
+        parse_mode: 'Markdown'
       });
-
       this.progressMessages.set(chatId, progressMsg.message_id);
 
       // Progress update callback
@@ -1438,7 +1422,7 @@ class OrderFlowHandler {
       `⏰ *Enter Time*\n\n` +
       `Format: DD/MM HH:MM\n` +
       `Example: 20/02 14:30\n\n` +
-      `📍 Current Egypt time: \`${currentEgyptTime}\`\n\n` +
+      `📍 Current Egypt time: \`${currentEgyptTime}\`\n\n`,
       { parse_mode: 'Markdown' }
     );
   }

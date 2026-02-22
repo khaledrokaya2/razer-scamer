@@ -828,9 +828,9 @@ class TelegramBotController {
         logger.debug('Could not delete loading message');
       }
 
-      // Only send error message if not cancelled
+      // Only send error message if NOT cancelled by user
       // If user was removed from balanceCheckInProgress, it means /cancel was used
-      if (this.balanceCheckInProgress.has(telegramUserId)) {
+      if (err.message !== 'Balance check cancelled by user' && this.balanceCheckInProgress.has(telegramUserId)) {
         await this.bot.sendMessage(chatId, '❌ Failed to check balance. Try /settings');
       }
 
@@ -1073,7 +1073,7 @@ class TelegramBotController {
       ]
     };
 
-    this.bot.sendMessage(chatId, '*Password:*', { reply_markup: keyboard });
+    this.bot.sendMessage(chatId, '*Password:*', { reply_markup: keyboard, parse_mode: 'Markdown' });
   }
 
   /**
