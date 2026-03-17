@@ -68,7 +68,7 @@ class TelegramBotController {
 
   /**
    * Install a global fallback for Telegram Markdown parse errors.
-   * If Telegram rejects Markdown entities, resend as plain text to avoid crashes.
+   * If Telegram rejects Markdown entities, resend plain text to avoid crashes.
    */
   installTelegramSendFallback() {
     if (!this.bot || this.bot.__sendFallbackInstalled) {
