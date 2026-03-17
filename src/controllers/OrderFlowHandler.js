@@ -9,7 +9,13 @@
  * - Sends results to user
  */
 
-const { getAllGames, getGameById } = require('../config/games-catalog');
+const {
+  getAllGames,
+  getGameById,
+  getCachedCardsByGameId,
+  getCachedCardsByUrl,
+  setRuntimeCachedCardsByUrl
+} = require('../config/games-catalog');
 const purchaseService = require('../services/PurchaseService');
 const orderService = require('../services/OrderService');
 const logger = require('../utils/logger');
@@ -316,8 +322,13 @@ class OrderFlowHandler {
     try {
       logger.http(`Scraping cards from custom URL: ${urlTrimmed}`);
 
-      // Get available cards from Razer using global browser (no login)
-      const cards = await purchaseService.getAvailableCards(null, urlTrimmed, true);
+      // Fast path: use locally cached cards first.
+      let cards = getCachedCardsByUrl(urlTrimmed);
+
+      if (cards.length === 0) {
+        cards = await purchaseService.getAvailableCards(telegramUserId, urlTrimmed);
+        setRuntimeCachedCardsByUrl(urlTrimmed, cards);
+      }
 
       logger.success(`Found ${cards.length} cards`);
 
@@ -557,8 +568,13 @@ class OrderFlowHandler {
     try {
       logger.http(`Scraping cards from: ${game.link}`);
 
-      // Get available cards from Razer using global browser (no login)
-      const cards = await purchaseService.getAvailableCards(null, game.link, true);
+      // Fast path: use locally cached cards first.
+      let cards = getCachedCardsByGameId(game.id);
+
+      if (cards.length === 0) {
+        cards = await purchaseService.getAvailableCards(telegramUserId, game.link);
+        setRuntimeCachedCardsByUrl(game.link, cards);
+      }
 
       logger.success(`Found ${cards.length} cards`);
 
@@ -1390,6 +1406,13 @@ class OrderFlowHandler {
   async handleBuyNow(bot, chatId, telegramUserId) {
     const session = this.getSession(chatId);
     if (!session) return;
+
+    const db = require('../services/DatabaseService');
+    const credentials = await db.getUserCredentials(telegramUserId);
+    if (!credentials || !credentials.email || !credentials.password) {
+      await bot.sendMessage(chatId, '⚠️ *No credentials found*\nUse /settings first.', { parse_mode: 'Markdown' });
+      return;
+    }
 
     // Store telegram user ID in session
     session.telegramUserId = telegramUserId;

@@ -154,58 +154,22 @@ class ScheduledOrderService {
       // Update status to 'processing'
       await db.updateScheduledOrderStatus(id, 'processing');
 
-      // Auto-login if no browser session exists
-      const browserManager = require('./BrowserManager');
-      const hasActiveBrowser = browserManager.hasActiveBrowser(telegram_user_id);
-
-      if (!hasActiveBrowser) {
-        logger.info(`ScheduledOrderService: No active browser session for user ${telegram_user_id}, performing auto-login`);
-
-        // Get user credentials
-        const credentials = await db.getUserCredentials(telegram_user_id);
-
-        if (!credentials || !credentials.email || !credentials.password) {
-          logger.error(`ScheduledOrderService: No credentials found for user ${telegram_user_id}`);
-
-          // Update order status to failed
-          await db.updateScheduledOrderStatus(id, 'failed');
-
-          // Notify user
-          try {
-            await this.bot.sendMessage(chat_id,
-              `❌ *Scheduled Order Failed*\n🆔 #${id}\n\n⚠️ No credentials found\nAdd credentials in /settings`,
-              { parse_mode: 'Markdown' }
-            );
-          } catch (notifyErr) {
-            logger.error(`Could not send notification to user ${telegram_user_id}`);
-          }
-          return;
-        }
-
-        // Perform auto-login
-        const scraperService = require('./RazerScraperService');
+      // Scheduled flow must use prewarmed browsers from /start.
+      const purchaseService = require('./PurchaseService');
+      const readySessions = purchaseService.getReadySessions(telegram_user_id);
+      if (readySessions.length === 0) {
+        logger.error(`ScheduledOrderService: No prewarmed browsers for user ${telegram_user_id}`);
+        await db.updateScheduledOrderStatus(id, 'failed');
 
         try {
-          logger.info(`ScheduledOrderService: Logging in user ${telegram_user_id}`);
-          await scraperService.login(telegram_user_id, credentials.email, credentials.password);
-          logger.success(`ScheduledOrderService: Auto-login successful for user ${telegram_user_id}`);
-        } catch (loginErr) {
-          logger.error(`ScheduledOrderService: Auto-login failed for user ${telegram_user_id}:`, loginErr);
-
-          // Update order status to failed
-          await db.updateScheduledOrderStatus(id, 'failed');
-
-          // Notify user
-          try {
-            await this.bot.sendMessage(chat_id,
-              `❌ *Scheduled Order Failed*\n🆔 #${id}\n\n⚠️ Login failed\nCheck credentials in /settings`,
-              { parse_mode: 'Markdown' }
-            );
-          } catch (notifyErr) {
-            logger.error(`Could not send notification to user ${telegram_user_id}`);
-          }
-          return;
+          await this.bot.sendMessage(chat_id,
+            `❌ *Scheduled Order Failed*\n🆔 #${id}\n\n⚠️ No ready browser pool found.\nSend /start first to prepare browsers.`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch (notifyErr) {
+          logger.error(`Could not send notification to user ${telegram_user_id}`);
         }
+        return;
       }
 
       // Delete initial notification if it exists
@@ -242,9 +206,7 @@ class ScheduledOrderService {
         orderFlowHandler.clearCancellation(chat_id);
         this.processingMessageIds.delete(chat_id);
 
-        // Close browser after successful scheduled order (FIX: was missing, causing browser to stay open)
-        await browserManager.closeBrowser(telegram_user_id);
-        logger.info(`Browser closed after successful scheduled order for user ${telegram_user_id}`);
+        logger.info(`Scheduled order ${id} finished. Ready browser pool remains active for user ${telegram_user_id}`);
 
       } catch (err) {
         // Unified method handles UI/messages - just update database status
@@ -260,9 +222,7 @@ class ScheduledOrderService {
         orderFlowHandler.clearCancellation(chat_id);
         this.processingMessageIds.delete(chat_id);
 
-        // Close browser on error or cancellation (FIX: was missing)
-        await browserManager.closeBrowser(telegram_user_id);
-        logger.info(`Browser closed after scheduled order error/cancellation for user ${telegram_user_id}`);
+        logger.info(`Scheduled order ${id} failed/cancelled. Ready browser pool kept active for user ${telegram_user_id}`);
       }
 
     } catch (err) {
@@ -288,10 +248,7 @@ class ScheduledOrderService {
       orderFlowHandler.clearCancellation(chat_id);
       this.processingMessageIds.delete(chat_id);
 
-      // Close browser on pre-processing errors (FIX: was missing)
-      const browserManager = require('./BrowserManager');
-      await browserManager.closeBrowser(telegram_user_id);
-      logger.info(`Browser closed after scheduled order pre-processing error for user ${telegram_user_id}`);
+      logger.info(`Scheduled order pre-processing error handled without touching ready browser pool for user ${telegram_user_id}`);
     }
   }
 }

@@ -32,7 +32,6 @@ const logger = require('./src/utils/logger');
 const authService = require('./src/services/AuthorizationService');
 const botController = require('./src/controllers/TelegramBotController');
 const getScheduledOrderService = require('./src/services/ScheduledOrderService');
-const browserManager = require('./src/services/BrowserManager');
 
 // Global scheduled order service instance
 let scheduledOrderService = null;
@@ -101,9 +100,6 @@ function validateEnvironment() {
  */
 async function initializeServices(config) {
   logger.system('Initializing services...');
-
-  // Initialize global browser for catalog browsing (shared by all users)
-  await browserManager.initializeGlobalBrowser();
 
   // Initialize authorization service (whitelist check only - no database)
   await authService.initialize();

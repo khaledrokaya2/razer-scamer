@@ -12,6 +12,7 @@ const sessionManager = require('../services/SessionManager');
 const scraperService = require('../services/RazerScraperService');
 const orderFlowHandler = require('./OrderFlowHandler');
 const orderHistoryHandler = require('./OrderHistoryHandler');
+const fileGenerator = require('../utils/FileGenerator');
 const logger = require('../utils/logger');
 
 class TelegramBotController {
@@ -26,6 +27,8 @@ class TelegramBotController {
     this.usersLoggingIn = new Set();
     // Track ongoing balance checks for cancellation support
     this.balanceCheckInProgress = new Set();
+    // Track ongoing /transactions fetch operations for cancellation support
+    this.transactionsFetchControllers = new Map(); // userId -> { cancelled: boolean }
     // Cleanup rate limit map periodically
     this.startRateLimitCleanup();
   }
@@ -80,6 +83,34 @@ class TelegramBotController {
   }
 
   /**
+   * Build a compact progress bar for browser warm-up.
+   * @param {number} ready - Number of ready browsers
+   * @param {number} target - Target browser count
+   * @returns {string}
+   */
+  createWarmupProgressBar(ready, target) {
+    const total = Math.max(1, target);
+    const safeReady = Math.max(0, Math.min(ready, total));
+    const barLength = 10;
+    const filledLength = Math.round((safeReady / total) * barLength);
+    return `[${'█'.repeat(filledLength)}${'░'.repeat(barLength - filledLength)}]`;
+  }
+
+  /**
+   * Build a compact progress bar for transaction PIN fetching.
+   * @param {number} done - Completed detail fetches
+   * @param {number} total - Total detail fetches
+   * @returns {string}
+   */
+  createTransactionsProgressBar(done, total) {
+    const safeTotal = Math.max(1, total);
+    const safeDone = Math.max(0, Math.min(done, safeTotal));
+    const barLength = 10;
+    const filledLength = Math.round((safeDone / safeTotal) * barLength);
+    return `[${'█'.repeat(filledLength)}${'░'.repeat(barLength - filledLength)}]`;
+  }
+
+  /**
    * Ensure user has active browser session
    * @param {Object} user - User object (not needed, included for compatibility)
    * @param {string} chatId - Chat ID
@@ -123,6 +154,31 @@ class TelegramBotController {
         logger.error(`   Telegram Error: ${err.response.body.description}`);
       }
       return null;
+    }
+  }
+
+  /**
+   * Send one or more Telegram messages without exceeding message length limits.
+   * @param {string} chatId - Chat ID
+   * @param {string[]} lines - Message lines
+   * @param {string} header - Header line
+   */
+  async sendChunkedLines(chatId, lines, header) {
+    const maxLength = 3500;
+    let current = header;
+
+    for (const line of lines) {
+      const candidate = `${current}\n${line}`;
+      if (candidate.length > maxLength) {
+        await this.safeSendMessage(chatId, current);
+        current = `${header}\n${line}`;
+      } else {
+        current = candidate;
+      }
+    }
+
+    if (current.trim()) {
+      await this.safeSendMessage(chatId, current);
     }
   }
 
@@ -172,11 +228,54 @@ class TelegramBotController {
       const credentials = await db.getUserCredentials(telegramUserId);
 
       if (!credentials || !credentials.email || !credentials.password) {
-        return this.bot.sendMessage(chatId, '⚠️ *No credentials*\nUse /settings', { parse_mode: 'Markdown' });
+        return this.bot.sendMessage(
+          chatId,
+          '⚠️ *No credentials found*\n\nAdd your Razer credentials first using /settings.',
+          { parse_mode: 'Markdown' }
+        );
       }
 
+      // Pre-warm maximum browsers on /start for instant purchase execution.
+      const purchaseService = require('../services/PurchaseService');
+      const warmingMsg = await this.bot.sendMessage(chatId, '⏳ Preparing browsers and logging in...');
+      let lastProgressText = '';
+
+      const warmResult = await purchaseService.ensureReadyBrowsers(telegramUserId, {
+        forceRestart: false,
+        onProgress: async ({ ready, target, phase }) => {
+          try {
+            const percent = Math.round((Math.max(0, Math.min(ready, target)) / Math.max(target, 1)) * 100);
+            const bar = this.createWarmupProgressBar(ready, target);
+            const status = phase === 'complete' ? 'Finalizing' : 'Logging in browsers';
+            const progressText =
+              `⏳ *Preparing Browsers*\n` +
+              `${status}\n` +
+              `${bar}\n` +
+              `✅ ${ready}/${target} (${percent}%)`;
+
+            if (progressText === lastProgressText) return;
+            lastProgressText = progressText;
+
+            await this.bot.editMessageText(progressText, {
+              chat_id: chatId,
+              message_id: warmingMsg.message_id,
+              parse_mode: 'Markdown'
+            });
+          } catch (editErr) {
+            logger.debug(`Could not update warm-up progress message: ${editErr.message}`);
+          }
+        }
+      });
+      if (!warmResult.ready) {
+        await this.bot.deleteMessage(chatId, warmingMsg.message_id).catch(() => { });
+        return this.bot.sendMessage(chatId, '⚠️ Could not prepare browsers. Check credentials in /settings.');
+      }
+
+      await this.bot.deleteMessage(chatId, warmingMsg.message_id).catch(() => { });
+      await this.bot.sendMessage(chatId, `✅ Browsers ready: ${warmResult.count}/${warmResult.target || purchaseService.MAX_READY_BROWSERS}`);
+
       // Initialize order flow and show game selection directly
-      // No browser session needed yet - global browser will be used for catalog browsing
+      // Cards are loaded from local catalog cache first, then user browser when needed.
       orderFlowHandler.initSession(chatId);
       await orderFlowHandler.showGameSelection(this.bot, chatId);
     } catch (err) {
@@ -275,6 +374,9 @@ class TelegramBotController {
   async handleTransactionsCommand(msg) {
     const chatId = msg.chat.id.toString();
     const telegramUserId = msg.from.id.toString();
+    const purchaseService = require('../services/PurchaseService');
+    const rawText = String(msg.text || '').trim();
+    const dateInput = rawText.replace(/^\/transactions\b/i, '').trim();
 
     try {
       // Check authorization
@@ -283,23 +385,121 @@ class TelegramBotController {
         return this.bot.sendMessage(chatId, '⛔ Access denied.');
       }
 
-      // Delete previous history message if exists
-      const historyMsgId = orderHistoryHandler.historyMessages.get(chatId);
-      if (historyMsgId) {
-        try {
-          await this.bot.deleteMessage(chatId, historyMsgId);
-          orderHistoryHandler.historyMessages.delete(chatId);
-        } catch (delErr) {
-          logger.debug('Could not delete previous history message');
-        }
+      if (this.transactionsFetchControllers.has(telegramUserId)) {
+        return this.bot.sendMessage(chatId, '⏳ Transactions fetch already running. Use /cancel to stop it.');
       }
 
-      // Reset to first page (newest order)
-      orderHistoryHandler.setCurrentPage(chatId, 0);
-      await orderHistoryHandler.showOrderHistory(this.bot, chatId, telegramUserId);
+      if (!dateInput) {
+        return this.bot.sendMessage(chatId, 'Use /transactions D/M\nExample: /transactions 2/9');
+      }
+
+      const fetchController = { cancelled: false };
+      this.transactionsFetchControllers.set(telegramUserId, fetchController);
+
+      const loadingMsg = await this.bot.sendMessage(chatId, `⏳ Fetching transactions for ${dateInput}...`);
+      let lastProgressText = '';
+
+      const onProgress = async (progress) => {
+        try {
+          if (!progress) return;
+
+          const phase = progress.phase || 'working';
+          const total = progress.total || 0;
+          const processed = progress.processed || 0;
+          const matched = progress.matched || 0;
+          const failures = progress.failures || 0;
+          const bar = this.createTransactionsProgressBar(processed, total);
+
+          let statusLine = 'Preparing...';
+          if (phase === 'loading_history') statusLine = 'Loading transactions history';
+          if (phase === 'filtering') statusLine = 'Filtering successful webshop transactions';
+          if (phase === 'fetching') statusLine = 'Fetching transaction details in parallel';
+          if (phase === 'complete') statusLine = 'Finalizing results';
+
+          const progressText =
+            `⏳ *Fetching transactions for ${dateInput}*\n` +
+            `${statusLine}\n` +
+            `${bar}\n` +
+            `✅ ${processed}/${Math.max(1, total)} | 🎯 Matched: ${matched} | ⚠️ Failed: ${failures}`;
+
+          if (progressText === lastProgressText) return;
+          lastProgressText = progressText;
+
+          await this.bot.editMessageText(progressText, {
+            chat_id: chatId,
+            message_id: loadingMsg.message_id,
+            parse_mode: 'Markdown'
+          });
+        } catch (editErr) {
+          logger.debug(`Could not update transactions progress message: ${editErr.message}`);
+        }
+      };
+
+      try {
+        const result = await purchaseService.fetchTransactionPinsForDate(telegramUserId, dateInput, {
+          checkCancellation: () => fetchController.cancelled === true,
+          onProgress
+        });
+
+        try {
+          await this.bot.deleteMessage(chatId, loadingMsg.message_id);
+        } catch (delErr) {
+          logger.debug('Could not delete transactions loading message');
+        }
+
+        if (!result.matchedTransactions || result.matchedTransactions.length === 0) {
+          if (result.cancelled) {
+            await this.bot.sendMessage(chatId, '🛑 Transactions fetching cancelled. No PINs were collected before stopping.');
+          } else {
+            await this.bot.sendMessage(chatId, `📭 No successful webshop transactions found for ${result.dateLabel}.`);
+          }
+          return;
+        }
+
+        const groupedEntries = Object.entries(result.groupedPins || {});
+        const totalPins = groupedEntries.reduce((sum, [, pins]) => sum + pins.length, 0);
+
+        await this.bot.sendMessage(
+          chatId,
+          `${result.cancelled ? '🛑 Partial results (cancelled)' : '📦 Transactions'} for ${result.dateLabel}\nMatched: ${result.matchedTransactions.length}\nPINs fetched: ${totalPins}\nFiles: ${groupedEntries.length}`
+        );
+
+        await fileGenerator.sendGroupedPinFiles(this.bot, chatId, result.groupedPins, {
+          dateLabel: result.dateLabel
+        });
+
+        if (result.failures && result.failures.length > 0) {
+          const failureLines = result.failures.map(failure => {
+            const description = failure.description || 'Unknown Product';
+            const error = failure.error || 'Unknown error';
+            return `${description} | ${failure.txnNum} | ${error}`;
+          });
+
+          await this.sendChunkedLines(chatId, failureLines, '⚠️ Failed to fetch PIN for these transactions. Review them manually:');
+        }
+      } catch (innerErr) {
+        try {
+          await this.bot.deleteMessage(chatId, loadingMsg.message_id);
+        } catch (delErr) {
+          logger.debug('Could not delete transactions loading message');
+        }
+        throw innerErr;
+      } finally {
+        this.transactionsFetchControllers.delete(telegramUserId);
+      }
     } catch (err) {
       logger.error('Error in /transactions command:', err);
-      this.bot.sendMessage(chatId, '❌ Error.');
+      if (err.message && err.message.includes('No ready browser session available')) {
+        this.bot.sendMessage(chatId, '⚠️ No ready browser available. Use /start first, then run /transactions D/M.');
+        return;
+      }
+
+      if (err.message && err.message.includes('Invalid date')) {
+        this.bot.sendMessage(chatId, `${err.message}\nExample: /transactions 2/9`);
+        return;
+      }
+
+      this.bot.sendMessage(chatId, '❌ Failed to fetch transactions.');
     }
   }
 
@@ -349,7 +549,6 @@ class TelegramBotController {
       }
 
       // Initialize order flow and show game selection
-      // No browser session needed yet - global browser will be used for catalog browsing
       orderFlowHandler.initSession(chatId);
       // Mark session as schedule mode
       orderFlowHandler.updateSession(chatId, { isScheduleMode: true });
@@ -436,13 +635,16 @@ class TelegramBotController {
       if (this.balanceCheckInProgress.has(telegramUserId)) {
         this.balanceCheckInProgress.delete(telegramUserId);
 
-        // Close browser if it was opened for balance check (only if no purchase session)
-        if (!hasActiveSession) {
-          const browserManager = require('../services/BrowserManager');
-          await browserManager.closeBrowser(telegramUserId);
-        }
-
         logger.info(`Cancelled balance check for user ${telegramUserId}`);
+      }
+
+      // Cancel any ongoing transactions fetch
+      if (this.transactionsFetchControllers.has(telegramUserId)) {
+        const controller = this.transactionsFetchControllers.get(telegramUserId);
+        if (controller) {
+          controller.cancelled = true;
+        }
+        logger.info(`Cancelled transactions fetch for user ${telegramUserId}`);
       }
 
       // Clear order flow session
@@ -751,7 +953,7 @@ class TelegramBotController {
    */
   async handleCheckBalanceButton(chatId, telegramUserId) {
     const db = require('../services/DatabaseService');
-    const browserManager = require('../services/BrowserManager');
+    const purchaseService = require('../services/PurchaseService');
 
     // Check if user has credentials first
     const credentials = await db.getUserCredentials(telegramUserId);
@@ -766,25 +968,14 @@ class TelegramBotController {
     const loadingMsg = await this.bot.sendMessage(chatId, '⏳ Checking balance...');
 
     try {
-      // Auto-login: Create browser session if doesn't exist
-      let page;
-      const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
-
-      if (!hasActiveBrowser) {
-        logger.info(`Auto-login for balance check: User ${telegramUserId}`);
-
-        // Check if cancelled before login
-        if (!this.balanceCheckInProgress.has(telegramUserId)) {
-          throw new Error('Balance check cancelled by user');
-        }
-
-        // Login using scraper service (creates browser automatically)
-        const result = await scraperService.login(telegramUserId, credentials.email, credentials.password);
-        page = result.page;
-      } else {
-        // Reuse existing browser session
-        page = browserManager.getPage(telegramUserId);
+      // Reuse one of the pre-warmed ready browsers only (no new browser creation).
+      const readySessions = purchaseService.getReadySessions(telegramUserId);
+      if (!readySessions || readySessions.length === 0) {
+        throw new Error('No ready browser session available. Please run /start to warm browsers first.');
       }
+
+      const page = readySessions[0].page;
+      logger.info(`Using ready browser for balance check: User ${telegramUserId}, slot ${readySessions[0].slot}`);
 
       // Check if cancelled before getting balance
       if (!this.balanceCheckInProgress.has(telegramUserId)) {
@@ -797,12 +988,6 @@ class TelegramBotController {
       // Check if cancelled before sending result
       if (!this.balanceCheckInProgress.has(telegramUserId)) {
         throw new Error('Balance check cancelled by user');
-      }
-
-      // Close browser if we created it just for balance check
-      if (!hasActiveBrowser) {
-        await browserManager.closeBrowser(telegramUserId);
-        logger.info(`Browser closed after balance check for user ${telegramUserId}`);
       }
 
       // Delete loading message
@@ -831,11 +1016,12 @@ class TelegramBotController {
       // Only send error message if NOT cancelled by user
       // If user was removed from balanceCheckInProgress, it means /cancel was used
       if (err.message !== 'Balance check cancelled by user' && this.balanceCheckInProgress.has(telegramUserId)) {
-        await this.bot.sendMessage(chatId, '❌ Failed to check balance. Try /settings');
+        if (err.message.includes('No ready browser session available')) {
+          await this.bot.sendMessage(chatId, '⚠️ No ready browser available. Use /start first, then try /check_balance again.');
+        } else {
+          await this.bot.sendMessage(chatId, '❌ Failed to check balance. Try /settings');
+        }
       }
-
-      // Close browser on error (if not already closed by cancel)
-      await browserManager.closeBrowser(telegramUserId);
     } finally {
       // Always remove from in-progress set
       this.balanceCheckInProgress.delete(telegramUserId);
@@ -1113,6 +1299,11 @@ class TelegramBotController {
       // Save to database
       await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
 
+      // Credentials changed: close all existing browsers and rebuild ready pool.
+      const purchaseService = require('../services/PurchaseService');
+      await purchaseService.resetUserBrowsers(telegramUserId);
+      await purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: true });
+
       // Clear credentials from memory
       sessionManager.clearCredentials(chatId);
 
@@ -1121,7 +1312,7 @@ class TelegramBotController {
 
       await this.safeSendMessage(
         chatId,
-        '✅ *Credentials Updated Successfully!*',
+        `✅ *Credentials Updated*\n${purchaseService.MAX_READY_BROWSERS} browsers re-logged and ready.`,
         { parse_mode: 'Markdown' }
       );
 
@@ -1187,6 +1378,11 @@ class TelegramBotController {
           const passwordEncrypted = encryptionService.encrypt(session.password);
           await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
           logger.success(`Saved encrypted credentials for user ${telegramUserId}`);
+
+          // New credentials added: reset old browsers and build fresh ready pool.
+          const purchaseService = require('../services/PurchaseService');
+          await purchaseService.resetUserBrowsers(telegramUserId);
+          await purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: true });
         } catch (saveErr) {
           logger.error('Failed to save credentials (login still successful):', saveErr);
           // Continue anyway - login was successful
@@ -1206,7 +1402,8 @@ class TelegramBotController {
             logger.warn('Could not delete loading message');
           }
         }
-        await this.safeSendMessage(chatId, '✅ Logged in!\n💾 Credentials saved.');
+        const purchaseService = require('../services/PurchaseService');
+        await this.safeSendMessage(chatId, `✅ Logged in!\n💾 Credentials saved.\n🚀 ${purchaseService.MAX_READY_BROWSERS} browsers are ready.`);
 
       } catch (err) {
         logger.error('Login error:', err);

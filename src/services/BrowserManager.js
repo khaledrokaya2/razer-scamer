@@ -7,17 +7,146 @@
  * - Auto-closes after inactivity
  */
 
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+// ANTI-BAN
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const logger = require('../utils/logger');
+
+// ANTI-BAN
+puppeteer.use(StealthPlugin());
+
+// ANTI-BAN
+const PROXY_LIST = [];
+
+// ANTI-BAN
+const getProxy = (i) => PROXY_LIST.length ? PROXY_LIST[i % PROXY_LIST.length] : null;
+
+// ANTI-BAN
+const humanDelay = (min = 1200, max = 3500) => new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
+
+// ANTI-BAN
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36'
+];
+
+// ANTI-BAN
+const setupPage = async (page) => {
+  const userAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+  const width = 1280 + Math.floor(Math.random() * 201);
+  const height = 800 + Math.floor(Math.random() * 201);
+
+  await page.setUserAgent(userAgent);
+  await page.setViewport({ width, height });
+
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    window.chrome = { runtime: {} };
+  });
+
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br'
+  });
+
+  if (!page.__antiBanRequestHooked) {
+    await page.setRequestInterception(true);
+    const requestHandler = (request) => {
+      const resourceType = request.resourceType();
+      if (resourceType === 'image' || resourceType === 'media' || resourceType === 'font' ) {
+        request.abort();
+      } else {
+        request.continue();
+      }
+    };
+    page.__antiBanRequestHooked = true;
+    page.on('request', requestHandler);
+  }
+
+  if (!page.__antiBanMethodPatched) {
+    const originalGoto = page.goto.bind(page);
+    const originalClick = page.click.bind(page);
+    const originalKeyboardType = page.keyboard.type.bind(page.keyboard);
+
+    page.goto = async (url, options) => {
+      const runGoto = async () => {
+        const result = await originalGoto(url, options);
+        await humanDelay();
+        if (await isBanned(page)) throw new Error('rate limited');
+        return result;
+      };
+
+      const isTransactionUrl = typeof url === 'string' && (url.includes('/transaction/') || url.includes('/transactions'));
+      if (isTransactionUrl) {
+        return withRetry(runGoto, 3);
+      }
+
+      return runGoto();
+    };
+
+    page.click = async (...args) => {
+      const result = await originalClick(...args);
+      await humanDelay();
+      return result;
+    };
+
+    page.keyboard.type = async (text, options = {}) => {
+      const result = await originalKeyboardType(text, {
+        ...options,
+        delay: options.delay ?? (80 + Math.random() * 60)
+      });
+      await humanDelay();
+      return result;
+    };
+
+    page.__antiBanMethodPatched = true;
+  }
+};
+
+// ANTI-BAN
+const isBanned = async (page) => {
+  const title = (await page.title().catch(() => '')) || '';
+  const url = page.url() || '';
+  const bodyText = await page.evaluate(() => (document.body && document.body.innerText) ? document.body.innerText : '').catch(() => '');
+
+  const titleLower = title.toLowerCase();
+  const urlLower = url.toLowerCase();
+  const bodyLower = String(bodyText || '').toLowerCase();
+
+  return titleLower.includes('access denied')
+    || titleLower.includes('too many requests')
+    || urlLower.includes('captcha')
+    || bodyLower.includes('you have been blocked')
+    || bodyLower.includes('rate limit')
+    || bodyLower.includes('access denied');
+};
+
+// ANTI-BAN
+const withRetry = async (fn, retries = 3) => {
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt >= retries) break;
+      const backoff = 8000 * (2 ** (attempt - 1));
+      await new Promise(resolve => setTimeout(resolve, backoff));
+    }
+  }
+  throw lastError;
+};
 
 class BrowserManager {
   constructor() {
     // Map of userId -> { browser, page, lastActivity, inUse }
     this.userBrowsers = new Map();
-
-    // Global browser for anonymous catalog browsing (shared by all users)
-    this.globalBrowser = null;
-    this.globalPage = null;
+    this.recoveryInProgress = new Set();
 
     // OPTIMIZATION: Keep browser open for 1 day (users don't want to re-login frequently)
     this.INACTIVITY_TIMEOUT = 1 * 24 * 60 * 60 * 1000; // 1 day
@@ -27,102 +156,6 @@ class BrowserManager {
     // this.startCleanupInterval();
   }
 
-  /**
-   * Initialize global browser for catalog browsing (with login)
-   * Should be called once when bot starts
-   * @returns {Promise<void>}
-   */
-  async initializeGlobalBrowser() {
-    try {
-      logger.system('Initializing global browser for catalog browsing...');
-
-      const browser = await this.launchBrowser();
-      const page = await browser.newPage();
-
-      // Configure page with safe timeouts for reliability
-      await page.setViewport({ width: 1280, height: 720 }); // Larger viewport for better rendering
-      await page.setDefaultTimeout(45000); // Increased for reliability
-      await page.setDefaultNavigationTimeout(60000); // Increased for reliability
-      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-      // Block ONLY images to save bandwidth but allow everything else for proper rendering
-      await page.setRequestInterception(true);
-      page.on('request', (request) => {
-        const resourceType = request.resourceType();
-        // Block ONLY images - allow fonts, stylesheets, scripts for proper page rendering
-        if (resourceType === 'image' || resourceType === 'media') {
-          request.abort();
-        } else {
-          request.continue();
-        }
-      });
-
-      // Login to Razer to access global region content
-      logger.system('Logging in to global browser...');
-      const LOGIN_URL = 'https://razerid.razer.com';
-      const email = 'mostloda14@gmail.com';
-      const password = 'vvt?Zr54S%Xe+Wp';
-
-      await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 45000 });
-
-      // Wait for login form
-      await page.waitForSelector('#input-login-email', { visible: true, timeout: 15000 });
-      await page.waitForSelector('#input-login-password', { visible: true, timeout: 15000 });
-
-      // Type credentials (faster typing)
-      await page.type('#input-login-email', email, { delay: 20 });
-      await page.type('#input-login-password', password, { delay: 20 });
-
-      // Handle cookie consent if present (no delay after click)
-      try {
-        await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 1500 });
-        await page.click('button[aria-label="Accept All"]');
-      } catch (err) {
-        // No cookie banner - that's fine
-      }
-
-      // Submit login form
-      await Promise.all([
-        page.click('button[type="submit"]'),
-        page.waitForNavigation({ waitUntil: 'load', timeout: 60000 })
-      ]);
-
-      // Verify login success
-      const currentUrl = page.url();
-      if (currentUrl === 'https://razerid.razer.com' || currentUrl === 'https://razerid.razer.com/') {
-        throw new Error('Global browser login failed - check credentials');
-      }
-
-      logger.success('Global browser logged in successfully');
-
-      this.globalBrowser = browser;
-      this.globalPage = page;
-
-      logger.success('Global browser initialized and ready');
-
-      // Auto-restart if browser crashes
-      browser.on('disconnected', () => {
-        logger.warn('Global browser disconnected, restarting...');
-        setTimeout(() => this.initializeGlobalBrowser(), 2000);
-      });
-
-    } catch (err) {
-      logger.error('Failed to initialize global browser:', err);
-      // Retry after 5 seconds
-      setTimeout(() => this.initializeGlobalBrowser(), 5000);
-    }
-  }
-
-  /**
-   * Get global browser and page (for catalog browsing)
-   * @returns {{browser: Browser, page: Page}} Global browser and page
-   */
-  getGlobalBrowser() {
-    if (!this.globalBrowser || !this.globalBrowser.isConnected()) {
-      throw new Error('Global browser not initialized or disconnected');
-    }
-    return { browser: this.globalBrowser, page: this.globalPage };
-  }
 
   /**
    * Get or create browser for user
@@ -141,28 +174,15 @@ class BrowserManager {
 
     // Create new browser
     logger.system(`Creating new browser for user ${userId}`);
-    const browser = await this.launchBrowser();
-    const page = await browser.newPage();
+    const browser = await this.launchBrowser(userId);
+    const existingPages = await browser.pages();
+    const page = existingPages[0] || await browser.newPage();
 
     // Configure page with safe timeouts for reliability
-    await page.setViewport({ width: 1280, height: 720 }); // Larger viewport for better rendering
+    // ANTI-BAN
+    await setupPage(page);
     await page.setDefaultTimeout(45000); // Increased for reliability
     await page.setDefaultNavigationTimeout(60000); // Increased for reliability
-
-    // Set user agent to avoid detection
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-    // Block ONLY images to save bandwidth but allow everything else for proper rendering
-    await page.setRequestInterception(true);
-    page.on('request', (request) => {
-      const resourceType = request.resourceType();
-      // Block ONLY images - allow fonts, stylesheets, scripts for proper page rendering
-      if (resourceType === 'image' || resourceType === 'media') {
-        request.abort();
-      } else {
-        request.continue();
-      }
-    });
 
     // Store in map
     this.userBrowsers.set(userId, {
@@ -172,66 +192,94 @@ class BrowserManager {
       inUse: false  // Track if browser is currently being used
     });
 
+    // Auto-recover if browser dies unexpectedly.
+    browser.on('disconnected', () => {
+      this.handleUnexpectedDisconnect(userId).catch(err => {
+        logger.error(`Browser recovery failed for user ${userId}:`, err.message);
+      });
+    });
+
     return { browser, page };
+  }
+
+  /**
+   * Recover a user's browser after unexpected disconnect.
+   * @param {number|string} userId
+   */
+  async handleUnexpectedDisconnect(userId) {
+    if (this.recoveryInProgress.has(userId)) {
+      return;
+    }
+
+    this.recoveryInProgress.add(userId);
+    try {
+      const existing = this.userBrowsers.get(userId);
+      if (existing && existing.browser && existing.browser.isConnected()) {
+        return;
+      }
+
+      this.userBrowsers.delete(userId);
+      logger.warn(`Browser disconnected for user ${userId}. Re-launching session...`);
+
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      const { page } = await this.getBrowser(userId);
+
+      try {
+        await this.autoRelogin(userId, page);
+        await page.goto('https://gold.razer.com/global/en', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // ANTI-BAN
+        await humanDelay();
+        // ANTI-BAN
+        if (await isBanned(page)) throw new Error('rate limited');
+        logger.success(`Recovered browser session for user ${userId}`);
+      } catch (loginErr) {
+        logger.warn(`Recovered browser for user ${userId}, but auto-relogin failed: ${loginErr.message}`);
+      }
+    } finally {
+      this.recoveryInProgress.delete(userId);
+    }
   }
 
   /**
    * Launch browser based on environment
    * @returns {Promise<Browser>} Puppeteer browser instance
    */
-  async launchBrowser() {
+  async launchBrowser(workerIndex = 0) {
     const isDevelopment = process.env.NODE_ENV === 'development';
 
+    // ANTI-BAN
+    const proxy = getProxy(workerIndex);
+    const launchArgs = [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--disable-sync',
+      '--disable-translate',
+      '--no-first-run',
+      '--mute-audio',
+      '--disable-blink-features=AutomationControlled',
+      // Use incognito mode for clean sessions (like anonymous browsing)
+      '--incognito',
+      // Memory optimization (reasonable limits)
+      '--js-flags=--max-old-space-size=256'
+    ];
+
+    // ANTI-BAN
+    if (proxy) {
+      launchArgs.push(`--proxy-server=${proxy}`);
+    }
+
     const browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-extensions',
-        '--disable-sync',
-        '--disable-translate',
-        '--no-first-run',
-        '--mute-audio',
-        '--disable-blink-features=AutomationControlled',
-        // Use incognito mode for clean sessions (like anonymous browsing)
-        '--incognito',
-        // Memory optimization (reasonable limits)
-        '--js-flags=--max-old-space-size=256'
-      ]
+      headless: false,
+      protocolTimeout: 180000,
+      args: launchArgs
     });
 
     return browser;
   }
 
-  /**
-   * Navigate to URL using global browser (no login)
-   * @param {string} url - URL to navigate to
-   * @returns {Promise<Page>} Page instance
-   */
-  async navigateToUrlGlobal(url) {
-    const { page } = this.getGlobalBrowser();
-
-    logger.http(`[Global] Navigating to: ${url}`);
-
-    try {
-      await page.goto(url, {
-        waitUntil: 'load',
-        timeout: 60000
-      });
-      return page;
-    } catch (err) {
-      logger.error(`[Global] Navigation failed to ${url}:`, err.message);
-      // Retry once
-      logger.http('[Global] Retrying navigation...');
-      await page.goto(url, {
-        waitUntil: 'load',
-        timeout: 45000
-      });
-      return page;
-    }
-  }
 
   /**
    * Navigate to URL (reusing page or creating new tab)
@@ -241,14 +289,22 @@ class BrowserManager {
    */
   async navigateToUrl(userId, url) {
     const { page } = await this.getBrowser(userId);
+    // ANTI-BAN
+    await setupPage(page);
 
     logger.http(`Navigating to: ${url}`);
 
     try {
       // Navigate with reliable loading strategy
-      await page.goto(url, {
-        waitUntil: 'load',
-        timeout: 60000
+      await withRetry(async () => {
+        await page.goto(url, {
+          waitUntil: 'load',
+          timeout: 60000
+        });
+        // ANTI-BAN
+        await humanDelay();
+        // ANTI-BAN
+        if (await isBanned(page)) throw new Error('rate limited');
       });
 
       // Check if session is still valid (not redirected to login)
@@ -258,9 +314,15 @@ class BrowserManager {
         await this.autoRelogin(userId, page);
 
         // Navigate to original URL after relogin
-        await page.goto(url, {
-          waitUntil: 'load',
-          timeout: 60000
+        await withRetry(async () => {
+          await page.goto(url, {
+            waitUntil: 'load',
+            timeout: 60000
+          });
+          // ANTI-BAN
+          await humanDelay();
+          // ANTI-BAN
+          if (await isBanned(page)) throw new Error('rate limited');
         });
       }
 
@@ -273,9 +335,15 @@ class BrowserManager {
 
       // If navigation fails, try one more time
       logger.http('Retrying navigation...');
-      await page.goto(url, {
-        waitUntil: 'load',
-        timeout: 45000
+      await withRetry(async () => {
+        await page.goto(url, {
+          waitUntil: 'load',
+          timeout: 45000
+        });
+        // ANTI-BAN
+        await humanDelay();
+        // ANTI-BAN
+        if (await isBanned(page)) throw new Error('rate limited');
       });
 
       this.updateActivity(userId);
@@ -320,6 +388,8 @@ class BrowserManager {
    */
   async autoRelogin(userId, page) {
     try {
+      // ANTI-BAN
+      await setupPage(page);
       // Get user credentials from database
       const db = require('./DatabaseService');
       const credentials = await db.getUserCredentials(userId);
@@ -331,9 +401,15 @@ class BrowserManager {
       logger.system(`Auto-relogin for user ${userId}...`);
 
       // Navigate to Razer login page
-      await page.goto('https://razerid.razer.com/account/login', {
-        waitUntil: 'load',
-        timeout: 45000
+      await withRetry(async () => {
+        await page.goto('https://razerid.razer.com/account/login', {
+          waitUntil: 'load',
+          timeout: 25000
+        });
+        // ANTI-BAN
+        await humanDelay();
+        // ANTI-BAN
+        if (await isBanned(page)) throw new Error('rate limited');
       });
 
       // Wait for login form
@@ -341,15 +417,21 @@ class BrowserManager {
 
       // Enter email
       await page.type('input[type="email"]', credentials.email, { delay: 50 });
+      // ANTI-BAN
+      await humanDelay();
 
       // Enter password
       await page.type('input[type="password"]', credentials.password, { delay: 50 });
+      // ANTI-BAN
+      await humanDelay();
 
       // Click login button
       await page.click('button[type="submit"]');
+      // ANTI-BAN
+      await humanDelay();
 
       // Wait for navigation after login
-      await page.waitForNavigation({ waitUntil: 'load', timeout: 60000 });
+      await page.waitForNavigation({ waitUntil: 'load', timeout: 20000 });
 
       logger.success(`Auto-relogin successful for user ${userId}`);
     } catch (err) {
@@ -483,19 +565,8 @@ class BrowserManager {
       );
     }
 
-    // Close global browser
-    if (this.globalBrowser && this.globalBrowser.isConnected()) {
-      promises.push(
-        this.globalBrowser.close().catch(err =>
-          logger.error('Error closing global browser:', err.message)
-        )
-      );
-    }
-
     await Promise.all(promises);
     this.userBrowsers.clear();
-    this.globalBrowser = null;
-    this.globalPage = null;
     logger.success('All browsers closed');
   }
 

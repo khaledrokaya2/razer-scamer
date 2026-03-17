@@ -72,6 +72,21 @@ class FileGenerator {
   }
 
   /**
+   * Generate safe filename fragment from a transaction description.
+   * @param {string} description
+   * @returns {string}
+   * @private
+   */
+  sanitizeDescriptionForFileName(description) {
+    const normalized = String(description || 'Unknown_Product')
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return (normalized || 'Unknown_Product').slice(0, 80);
+  }
+
+  /**
    * Generate filename with optional partial suffix
    * @param {number} orderId - Order ID
    * @param {string} format - File format ('with_serial' or 'only')
@@ -258,6 +273,46 @@ class FileGenerator {
    */
   getValidPinCount(pins) {
     return this.filterValidPins(pins).length;
+  }
+
+  /**
+   * Send one pin-only TXT file per transaction description.
+   * @param {Object} bot - Telegram bot instance
+   * @param {number|string} chatId - Telegram chat ID
+   * @param {Object} groupedPins - { description: [{pinCode, txnNum, ...}] }
+   * @param {Object} options - Optional metadata
+   * @param {string} options.dateLabel - User requested date label
+   */
+  async sendGroupedPinFiles(bot, chatId, groupedPins, options = {}) {
+    const { dateLabel = '' } = options;
+    const entries = Object.entries(groupedPins || {});
+
+    if (entries.length === 0) {
+      return;
+    }
+
+    this.ensureDirectoryExists();
+
+    for (const [description, pins] of entries) {
+      const filteredPins = this.filterValidPins(pins);
+      if (filteredPins.length === 0) {
+        continue;
+      }
+
+      const safeName = this.sanitizeDescriptionForFileName(description);
+      const fileName = `${safeName}_${Date.now()}.txt`;
+      const content = filteredPins.map(pin => pin.pinCode).join('\n') + '\n';
+      const filePath = this.writeFile(fileName, content);
+
+      try {
+        const dateSuffix = dateLabel ? `\nDate: ${dateLabel}` : '';
+        await bot.sendDocument(chatId, filePath, {
+          caption: `${description}\nPINs: ${filteredPins.length}${dateSuffix}`
+        }, { contentType: 'text/plain' });
+      } finally {
+        this.deleteFile(filePath);
+      }
+    }
   }
 }
 

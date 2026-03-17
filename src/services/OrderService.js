@@ -5,7 +5,6 @@
  * Coordinates between database and purchase service
  */
 
-const databaseService = require('./DatabaseService');
 const purchaseService = require('./PurchaseService');
 const logger = require('../utils/logger');
 
@@ -14,12 +13,23 @@ class OrderService {
     // In-memory storage for pins (not saved to database)
     this.orderPins = new Map(); // orderId -> {pins: [...], timestamp: Date.now()}
     this.ORDER_PIN_TTL = 2 * 60 * 60 * 1000; // 2 hours
+    this.nextOrderId = Date.now();
 
     // CONCURRENCY FIX: Track active orders to prevent cleanup during processing
     this.activeOrders = new Set(); // Set of order IDs currently being processed
 
     // Start automatic cleanup
     this.startPinCleanup();
+  }
+
+  /**
+   * Generate an in-memory order ID.
+   * Orders are no longer persisted in the database.
+   * @returns {number}
+   */
+  generateOrderId() {
+    this.nextOrderId += 1;
+    return this.nextOrderId;
   }
 
   /**
@@ -56,20 +66,24 @@ class OrderService {
   }
 
   /**
-   * Create new order in database (simplified for telegram users)
+   * Create new in-memory order for telegram users.
    * @param {Object} orderData - Order data
    * @returns {Promise<Object>} Created order
    */
   async createOrderSimple({ telegramUserId, gameName, cardName, cardsCount }) {
     try {
-      logger.order('Creating order in database...');
+      logger.order('Creating in-memory order...');
 
-      const order = await databaseService.createOrder(
-        telegramUserId,  // Pass telegram user ID directly
-        cardsCount,
-        cardName,
-        gameName
-      );
+      const order = {
+        id: this.generateOrderId(),
+        telegram_user_id: telegramUserId,
+        cards_count: cardsCount,
+        card_value: cardName,
+        game_name: gameName,
+        status: 'pending',
+        completed_purchases: 0,
+        created_at: new Date().toISOString()
+      };
 
       // Initialize empty pins array for this order WITH TIMESTAMP
       this.orderPins.set(order.id, {
@@ -77,7 +91,7 @@ class OrderService {
         timestamp: Date.now()
       });
 
-      logger.success(`Order created: ID ${order.id}`);
+      logger.success(`In-memory order created: ID ${order.id}`);
       return order;
 
     } catch (err) {
@@ -123,7 +137,7 @@ class OrderService {
       logger.order(`   Quantity: ${quantity}`);
       logger.order(`${'='.repeat(60)}\n`);
 
-      // Step 2: Process purchases with IMMEDIATE database save after each card
+      // Step 2: Process purchases and keep per-card details in memory only.
       const purchases = await purchaseService.processBulkPurchases({
         telegramUserId,
         gameUrl,
@@ -133,30 +147,17 @@ class OrderService {
         quantity,
         onProgress,  // Telegram progress update
         checkCancellation,
-        // IMMEDIATE DB SAVE: Called after each card purchase (success or confirmed-but-failed)
+        // Called after each card purchase (success or confirmed-but-failed)
         onCardCompleted: async (purchaseResult, cardNumber) => {
           try {
             // Determine if this is a true success or a confirmed-but-failed purchase
             const isSuccess = purchaseResult.success === true;
-            const dbStatus = isSuccess ? 'success' : 'failed';
 
-            // 1. Save purchase to database immediately
-            await databaseService.createPurchaseWithEncryptedPin({
-              orderId: order.id,
-              pinCode: purchaseResult.pinCode,
-              serialNumber: purchaseResult.serialNumber || null,
-              transactionId: purchaseResult.transactionId || null,
-              cardNumber: cardNumber,
-              status: dbStatus,
-              gameName: gameName,
-              cardValue: cardName
-            });
+            // Keep aggregate progress in memory only.
+            order.completed_purchases += 1;
+            logger.order(`   Order progress: ${order.completed_purchases}/${order.cards_count}`);
 
-            // 2. Increment order progress in database
-            const updatedOrder = await databaseService.incrementOrderProgress(order.id);
-            logger.order(`   Order progress: ${updatedOrder.completed_purchases}/${updatedOrder.cards_count}`);
-
-            // 3. Store in memory for later sending to user
+            // Store card details in memory for sending PIN files at the end.
             const orderData = this.orderPins.get(order.id);
             if (orderData && orderData.pins) {
               orderData.pins.push({
@@ -170,25 +171,24 @@ class OrderService {
                 cardValue: cardName
               });
             }
-          } catch (dbErr) {
-            logger.error(`Failed to save card ${cardNumber} to database:`, dbErr.message);
+          } catch (trackErr) {
+            logger.error(`Failed to track card ${cardNumber} result:`, trackErr.message);
             // Don't throw - continue processing remaining cards
           }
         }
       });
 
-      // Step 3: Handle failed cards NOT already saved via onCardCompleted
-      // Cards saved via guaranteedDbSave during processing have savedToDb=true
-      // Only add cards that were NOT already saved (to prevent double-counting)
+      // Step 3: Handle failed cards NOT already tracked via onCardCompleted.
       let failedCardsCount = 0;
       for (const purchase of purchases) {
         if (purchase.success === false) {
           failedCardsCount++;
-          // Skip entries already saved to DB and already in orderData.pins via onCardCompleted
+          // Skip entries already tracked in memory by onCardCompleted.
           if (purchase.savedToDb) {
             continue;
           }
-          // Store failed cards in memory for sending to user
+
+          // Keep failed cards in memory for reporting to user.
           const orderData = this.orderPins.get(order.id);
           if (orderData && orderData.pins) {
             orderData.pins.push({
@@ -206,11 +206,8 @@ class OrderService {
         }
       }
 
-      // Step 4: Mark order as completed (purchases already saved in database)
-      await databaseService.updateOrderStatus(order.id, 'completed');
-
-      // Get final order state
-      order = await databaseService.getOrderById(order.id);
+      // Step 4: Mark order as completed in memory.
+      order.status = 'completed';
 
       logger.success(`Order #${order.id} completed successfully!`);
       logger.order(`   Total purchases: ${order.completed_purchases}/${order.cards_count}`);
@@ -244,13 +241,10 @@ class OrderService {
         logger.order('Processing cancellation - returning partial order...');
 
         if (order && err.purchases && err.purchases.length > 0) {
-          // NOTE: Successful purchases already saved to database AND already in orderData.pins
-          // from onCardCompleted callback - DO NOT add them again (would create duplicates)
-          // Just use what's already in memory
+          // Results are already tracked in memory via onCardCompleted.
 
-          // Update order status to completed (purchases already in database)
-          await databaseService.updateOrderStatus(order.id, 'completed');
-          order = await databaseService.getOrderById(order.id);
+          // Mark partial order as completed in memory.
+          order.status = 'completed';
 
           logger.success(`Partial order saved: ${order.completed_purchases}/${order.cards_count} cards`);
 
@@ -261,7 +255,7 @@ class OrderService {
           };
         } else if (order) {
           // No purchases completed, just mark as failed
-          await databaseService.updateOrderStatus(order.id, 'failed');
+          order.status = 'failed';
           logger.order(`Order #${order.id} cancelled with no completed purchases`);
         }
 
@@ -270,7 +264,7 @@ class OrderService {
 
       // Mark order as failed if it was created (for non-cancellation errors)
       if (order) {
-        await databaseService.updateOrderStatus(order.id, 'failed');
+        order.status = 'failed';
       }
 
       throw err;
