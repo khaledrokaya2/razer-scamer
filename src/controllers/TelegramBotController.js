@@ -60,9 +60,47 @@ class TelegramBotController {
     }
 
     this.bot = new TelegramBot(token, { polling: true });
+    this.installTelegramSendFallback();
     logger.bot('Telegram bot initialized');
 
     this.registerHandlers();
+  }
+
+  /**
+   * Install a global fallback for Telegram Markdown parse errors.
+   * If Telegram rejects Markdown entities, resend as plain text to avoid crashes.
+   */
+  installTelegramSendFallback() {
+    if (!this.bot || this.bot.__sendFallbackInstalled) {
+      return;
+    }
+
+    const originalSendMessage = this.bot.sendMessage.bind(this.bot);
+
+    this.bot.sendMessage = async (chatId, text, options = {}) => {
+      try {
+        return await originalSendMessage(chatId, text, options);
+      } catch (err) {
+        const description = err && err.response && err.response.body && err.response.body.description
+          ? String(err.response.body.description)
+          : '';
+        const hasMarkdownParseError = description.includes("can't parse entities");
+        const usesMarkdown = options && options.parse_mode === 'Markdown';
+
+        if (!hasMarkdownParseError || !usesMarkdown) {
+          throw err;
+        }
+
+        logger.warn(`Markdown parse failed for chat ${chatId}. Retrying without parse_mode.`);
+
+        const fallbackOptions = { ...options };
+        delete fallbackOptions.parse_mode;
+
+        return originalSendMessage(chatId, text, fallbackOptions);
+      }
+    };
+
+    this.bot.__sendFallbackInstalled = true;
   }
 
   /**
