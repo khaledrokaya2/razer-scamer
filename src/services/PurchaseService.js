@@ -197,11 +197,11 @@ class PurchaseService {
     this.readyBrowsersByUser = new Map(); // userId -> Array<{browser, page, slot}>
     this.readyInitLocks = new Map(); // userId -> Promise
     this.currentReadyUserId = null; // One-user-at-a-time policy
-    this.MAX_READY_BROWSERS = 20;
+    this.MAX_READY_BROWSERS = 10;
 
     // Anti-ban staggering between browsers.
-    this.READY_LOGIN_STAGGER_MS = 4500;
-    this.READY_LOGIN_JITTER_MS = 2500;
+    this.READY_LOGIN_STAGGER_MS = 700;
+    this.READY_LOGIN_JITTER_MS = 350;
     this.PURCHASE_BROWSER_STAGGER_MS = 3200;
     this.PURCHASE_BROWSER_JITTER_MS = 1800;
     this.PURCHASE_CARD_STAGGER_MS = 900;
