@@ -10,6 +10,7 @@
  */
 
 const logger = require('../utils/logger');
+const appConfig = require('../config/app-config');
 
 class SessionManager {
   constructor() {
@@ -19,7 +20,7 @@ class SessionManager {
     this.sessions = {};
 
     // Session timeout for memory optimization
-    this.SESSION_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours
+    this.SESSION_TIMEOUT = appConfig.session.sessionTimeoutMs;
     this.startSessionCleanup();
   }
 
@@ -49,7 +50,7 @@ class SessionManager {
       if (cleaned > 0) {
         logger.info(`Session cleanup: ${cleaned} old sessions removed`);
       }
-    }, 30 * 60 * 1000); // Check every 30 minutes
+    }, appConfig.session.cleanupIntervalMs);
   }
 
   /**

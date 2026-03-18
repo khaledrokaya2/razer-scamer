@@ -1,126 +1,11 @@
 const BrowserManager = require('./BrowserManager');
 const logger = require('../utils/logger');
+const AntibanService = require('./AntibanService');
 
-// ANTI-BAN
-const humanDelay = (min = 1200, max = 3500) => new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
-
-// ANTI-BAN
-const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36'
-];
-
-// ANTI-BAN
-const setupPage = async (page) => {
-  const userAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-  const width = 1280 + Math.floor(Math.random() * 201);
-  const height = 800 + Math.floor(Math.random() * 201);
-
-  await page.setUserAgent(userAgent);
-  await page.setViewport({ width, height });
-
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    window.chrome = { runtime: {} };
-  });
-
-  await page.setExtraHTTPHeaders({
-    'Accept-Language': 'en-US,en;q=0.9',
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br'
-  });
-
-  if (!page.__antiBanRequestHooked) {
-    await page.setRequestInterception(true);
-    const requestHandler = (request) => {
-      const resourceType = request.resourceType();
-      if (resourceType === 'image' || resourceType === 'media' || resourceType === 'font' || resourceType === 'stylesheet') {
-        request.abort();
-      } else {
-        request.continue();
-      }
-    };
-    page.__antiBanRequestHooked = true;
-    page.on('request', requestHandler);
-  }
-
-  if (!page.__antiBanMethodPatched) {
-    const originalGoto = page.goto.bind(page);
-    const originalClick = page.click.bind(page);
-    const originalKeyboardType = page.keyboard.type.bind(page.keyboard);
-
-    page.goto = async (url, options) => {
-      const runGoto = async () => {
-        const result = await originalGoto(url, options);
-        await humanDelay();
-        if (await isBanned(page)) throw new Error('rate limited');
-        return result;
-      };
-
-      const isTransactionUrl = typeof url === 'string' && (url.includes('/transaction/') || url.includes('/transactions'));
-      if (isTransactionUrl) {
-        return withRetry(runGoto, 3);
-      }
-
-      return runGoto();
-    };
-
-    page.click = async (...args) => {
-      const result = await originalClick(...args);
-      await humanDelay();
-      return result;
-    };
-
-    page.keyboard.type = async (text, options = {}) => {
-      const result = await originalKeyboardType(text, {
-        ...options,
-        delay: options.delay ?? (80 + Math.random() * 60)
-      });
-      await humanDelay();
-      return result;
-    };
-
-    page.__antiBanMethodPatched = true;
-  }
-};
-
-// ANTI-BAN
-const isBanned = async (page) => {
-  const title = (await page.title().catch(() => '')) || '';
-  const url = page.url() || '';
-  const bodyText = await page.evaluate(() => (document.body && document.body.innerText) ? document.body.innerText : '').catch(() => '');
-
-  const titleLower = title.toLowerCase();
-  const urlLower = url.toLowerCase();
-  const bodyLower = String(bodyText || '').toLowerCase();
-
-  return titleLower.includes('access denied')
-    || titleLower.includes('too many requests')
-    || urlLower.includes('captcha')
-    || bodyLower.includes('you have been blocked')
-    || bodyLower.includes('rate limit')
-    || bodyLower.includes('access denied');
-};
-
-// ANTI-BAN
-const withRetry = async (fn, retries = 3) => {
-  let lastError;
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-      if (attempt >= retries) break;
-      const backoff = 8000 * (2 ** (attempt - 1));
-      await new Promise(resolve => setTimeout(resolve, backoff));
-    }
-  }
-  throw lastError;
-};
+const humanDelay = AntibanService.humanDelay;
+const setupPage = AntibanService.setupPage;
+const isBanned = AntibanService.isBanned;
+const withRetry = AntibanService.withRetry;
 
 /**
  * Service for verifying Razer transaction status by scraping transaction pages
@@ -141,7 +26,7 @@ class TransactionVerificationService {
 
     try {
       // ANTI-BAN
-      await setupPage(page);
+      await setupPage(page, { blockedResourceTypes: ['image', 'media', 'font', 'stylesheet'] });
       logger.http(`Verifying transaction: ${transactionId}`);
 
       // Navigate to transaction page with fast loading

@@ -10,17 +10,20 @@ const TelegramBot = require('node-telegram-bot-api');
 const authService = require('../services/AuthorizationService');
 const sessionManager = require('../services/SessionManager');
 const scraperService = require('../services/RazerScraperService');
+const browserManager = require('../services/BrowserManager');
 const orderFlowHandler = require('./OrderFlowHandler');
 const orderHistoryHandler = require('./OrderHistoryHandler');
 const fileGenerator = require('../utils/FileGenerator');
+const backupCodeValidator = require('../utils/backupCodeValidator');
 const logger = require('../utils/logger');
+const appConfig = require('../config/app-config');
 
 class TelegramBotController {
   constructor() {
     this.bot = null;
     // Rate limiting (optimized for 5 users)
     this.rateLimits = new Map();
-    this.RATE_LIMIT_MS = 800; // OPTIMIZATION: 800ms for faster UX (5 users only)
+    this.RATE_LIMIT_MS = appConfig.bot.rateLimitMs;
     // State locking to prevent race conditions
     this.processingCallbacks = new Set();
     // Track users currently auto-logging in
@@ -29,8 +32,162 @@ class TelegramBotController {
     this.balanceCheckInProgress = new Set();
     // Track ongoing /transactions fetch operations for cancellation support
     this.transactionsFetchControllers = new Map(); // userId -> { cancelled: boolean }
+    // Track current user-level operation to block concurrent commands/callbacks.
+    this.userOperations = new Map(); // userId -> { id, type, cancellable, startedAt }
+    this.operationSeq = 0;
     // Cleanup rate limit map periodically
     this.startRateLimitCleanup();
+  }
+
+  getActiveOperation(userId) {
+    return this.userOperations.get(userId) || null;
+  }
+
+  isUserBusy(userId) {
+    return this.userOperations.has(userId);
+  }
+
+  beginUserOperation(userId, type, cancellable) {
+    if (this.userOperations.has(userId)) {
+      return null;
+    }
+
+    const operation = {
+      id: ++this.operationSeq,
+      type,
+      cancellable: !!cancellable,
+      startedAt: Date.now()
+    };
+
+    this.userOperations.set(userId, operation);
+    return operation;
+  }
+
+  clearUserOperation(userId, operationId = null) {
+    const current = this.userOperations.get(userId);
+    if (!current) return;
+
+    if (operationId !== null && current.id !== operationId) {
+      return;
+    }
+
+    this.userOperations.delete(userId);
+  }
+
+  formatOperationName(type) {
+    if (!type) return 'another operation';
+    if (type === 'purchase') return 'purchase processing';
+    if (type === 'launching') return 'browser launch/login';
+    if (type === 'check_balance') return 'balance check';
+    if (type === 'transactions') return 'transactions fetch';
+    if (type === 'schedule') return 'schedule flow';
+    if (type === 'settings') return 'settings update';
+    if (type === 'info') return 'info request';
+    if (type === 'callback') return 'current action';
+    return type;
+  }
+
+  async sendBusyMessage(chatId, operation) {
+    const operationName = this.formatOperationName(operation && operation.type);
+    const cancellableHint = operation && operation.cancellable
+      ? '\nUse /cancel if you want to stop it.'
+      : '\nPlease wait until it finishes.';
+    await this.safeSendMessage(chatId, `⏳ Please wait, ${operationName} is in progress.${cancellableHint}`);
+  }
+
+  async tryBeginCommandOperation(chatId, telegramUserId, type, cancellable, options = {}) {
+    const { enforceExclusive = true } = options;
+
+    if (enforceExclusive && await this.blockIfExclusiveOperationActive(chatId, telegramUserId)) {
+      return null;
+    }
+
+    const activeOperation = this.getActiveOperation(telegramUserId);
+    if (activeOperation) {
+      await this.sendBusyMessage(chatId, activeOperation);
+      return null;
+    }
+
+    const operation = this.beginUserOperation(telegramUserId, type, cancellable);
+    if (!operation) {
+      await this.sendBusyMessage(chatId, this.getActiveOperation(telegramUserId));
+      return null;
+    }
+
+    return operation;
+  }
+
+  async ensureAuthorized(chatId, telegramUserId) {
+    const authResult = await authService.checkAuthorization(telegramUserId);
+    if (authResult.authorized) {
+      return true;
+    }
+
+    await this.bot.sendMessage(chatId, '⛔ Access denied.');
+    return false;
+  }
+
+  /**
+   * Returns an exclusive long-running operation that should block all commands except /cancel.
+   * Sources: active order session in processing step, running balance check, running transactions fetch,
+   * or explicit user operation lock for these flows.
+   */
+  getExclusiveOperation(chatId, telegramUserId) {
+    const orderSession = orderFlowHandler.getSession(chatId);
+    if (orderSession && (orderSession.step === 'processing' || orderSession.step === 'checking_balance')) {
+      return {
+        id: -1,
+        type: 'purchase',
+        cancellable: true,
+        startedAt: orderSession.lastActivity || Date.now()
+      };
+    }
+
+    if (this.balanceCheckInProgress.has(telegramUserId)) {
+      return {
+        id: -2,
+        type: 'check_balance',
+        cancellable: true,
+        startedAt: Date.now()
+      };
+    }
+
+    const txController = this.transactionsFetchControllers.get(telegramUserId);
+    if (txController && txController.cancelled !== true) {
+      return {
+        id: -3,
+        type: 'transactions',
+        cancellable: true,
+        startedAt: Date.now()
+      };
+    }
+
+    const activeOperation = this.getActiveOperation(telegramUserId);
+    if (activeOperation && (
+      activeOperation.type === 'purchase'
+      || activeOperation.type === 'check_balance'
+      || activeOperation.type === 'transactions'
+    )) {
+      return activeOperation;
+    }
+
+    return null;
+  }
+
+  async blockIfExclusiveOperationActive(chatId, telegramUserId) {
+    const exclusiveOperation = this.getExclusiveOperation(chatId, telegramUserId);
+    if (!exclusiveOperation) {
+      return false;
+    }
+
+    await this.sendBusyMessage(chatId, exclusiveOperation);
+    return true;
+  }
+
+  isCancelCallback(callbackData) {
+    return callbackData === 'order_cancel'
+      || callbackData === 'order_cancel_processing'
+      || callbackData.startsWith('scheduled_cancel_');
   }
 
   /**
@@ -40,14 +197,14 @@ class TelegramBotController {
   startRateLimitCleanup() {
     setInterval(() => {
       const now = Date.now();
-      const timeout = 5 * 60 * 1000; // 5 minutes
+      const timeout = appConfig.bot.rateLimitEntryTtlMs;
 
       for (const [chatId, lastRequest] of this.rateLimits.entries()) {
         if (now - lastRequest > timeout) {
           this.rateLimits.delete(chatId);
         }
       }
-    }, 10 * 60 * 1000); // Check every 10 minutes
+    }, appConfig.bot.rateLimitCleanupIntervalMs);
   }
 
   /**
@@ -156,7 +313,6 @@ class TelegramBotController {
    * @returns {Promise<boolean>} True if browser session exists
    */
   async ensureBrowserSession(user, chatId, telegramUserId) {
-    const browserManager = require('../services/BrowserManager');
     // Use telegramUserId as the browser session key
     const page = browserManager.getPage(telegramUserId);
 
@@ -247,6 +403,10 @@ class TelegramBotController {
   async handleStartCommand(msg) {
     const chatId = msg.chat.id.toString();
     const telegramUserId = msg.from.id.toString();
+    const operation = await this.tryBeginCommandOperation(chatId, telegramUserId, 'launching', false);
+    if (!operation) {
+      return;
+    }
 
     try {
       // Block if user is currently logging in
@@ -255,10 +415,9 @@ class TelegramBotController {
       }
 
       // Check if user is authorized (whitelist check)
-      const authResult = await authService.checkAuthorization(chatId);
-
-      if (!authResult.authorized) {
-        return this.bot.sendMessage(chatId, '⛔ Access denied. Contact admin.');
+      const isAuthorized = await this.ensureAuthorized(chatId, telegramUserId);
+      if (!isAuthorized) {
+        return;
       }
 
       // Check if user has credentials
@@ -273,44 +432,21 @@ class TelegramBotController {
         );
       }
 
-      // Pre-warm maximum browsers on /start for instant purchase execution.
       const purchaseService = require('../services/PurchaseService');
-      const warmingMsg = await this.bot.sendMessage(chatId, '⏳ Preparing browsers and logging in...');
-      let lastProgressText = '';
+      const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
 
-      const warmResult = await purchaseService.ensureReadyBrowsers(telegramUserId, {
-        forceRestart: false,
-        onProgress: async ({ ready, target, phase }) => {
-          try {
-            const percent = Math.round((Math.max(0, Math.min(ready, target)) / Math.max(target, 1)) * 100);
-            const bar = this.createWarmupProgressBar(ready, target);
-            const status = phase === 'complete' ? 'Finalizing' : 'Logging in browsers';
-            const progressText =
-              `⏳ *Preparing Browsers*\n` +
-              `${status}\n` +
-              `${bar}\n` +
-              `✅ ${ready}/${target} (${percent}%)`;
-
-            if (progressText === lastProgressText) return;
-            lastProgressText = progressText;
-
-            await this.bot.editMessageText(progressText, {
-              chat_id: chatId,
-              message_id: warmingMsg.message_id,
-              parse_mode: 'Markdown'
-            });
-          } catch (editErr) {
-            logger.debug(`Could not update warm-up progress message: ${editErr.message}`);
-          }
-        }
-      });
-      if (!warmResult.ready) {
-        await this.bot.deleteMessage(chatId, warmingMsg.message_id).catch(() => { });
-        return this.bot.sendMessage(chatId, '⚠️ Could not prepare browsers. Check credentials in /settings.');
+      if (!hasActiveBrowser) {
+        const loginMsg = await this.bot.sendMessage(chatId, '⏳ Opening browser and logging in...');
+        await scraperService.login(telegramUserId, credentials.email, credentials.password);
+        await this.bot.deleteMessage(chatId, loginMsg.message_id).catch(() => { });
       }
 
-      await this.bot.deleteMessage(chatId, warmingMsg.message_id).catch(() => { });
-      await this.bot.sendMessage(chatId, `✅ Browsers ready: ${warmResult.count}/${warmResult.target || purchaseService.MAX_READY_BROWSERS}`);
+      await this.bot.sendMessage(chatId, '✅ Browser is ready.');
+
+      // Keep purchase ready session in sync, but do not block user flow if it fails.
+      purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch((warmErr) => {
+        logger.warn(`Background ready-session sync failed for user ${telegramUserId}: ${warmErr.message}`);
+      });
 
       // Initialize order flow and show game selection directly
       // Cards are loaded from local catalog cache first, then user browser when needed.
@@ -319,6 +455,8 @@ class TelegramBotController {
     } catch (err) {
       logger.error('Error in /start command:', err);
       this.bot.sendMessage(chatId, '❌ Error. Try again later.');
+    } finally {
+      this.clearUserOperation(telegramUserId, operation.id);
     }
   }
 
@@ -390,18 +528,23 @@ class TelegramBotController {
   async handleCheckBalanceCommand(msg) {
     const chatId = msg.chat.id.toString();
     const telegramUserId = msg.from.id.toString();
+    const operation = await this.tryBeginCommandOperation(chatId, telegramUserId, 'check_balance', true);
+    if (!operation) {
+      return;
+    }
 
     try {
-      // Check authorization
-      const authResult = await authService.checkAuthorization(telegramUserId);
-      if (!authResult.authorized) {
-        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      const isAuthorized = await this.ensureAuthorized(chatId, telegramUserId);
+      if (!isAuthorized) {
+        return;
       }
 
       await this.handleCheckBalanceButton(chatId, telegramUserId);
     } catch (err) {
       logger.error('Error in /check_balance command:', err);
       this.bot.sendMessage(chatId, '❌ Error.');
+    } finally {
+      this.clearUserOperation(telegramUserId, operation.id);
     }
   }
 
@@ -412,15 +555,19 @@ class TelegramBotController {
   async handleTransactionsCommand(msg) {
     const chatId = msg.chat.id.toString();
     const telegramUserId = msg.from.id.toString();
+    const operation = await this.tryBeginCommandOperation(chatId, telegramUserId, 'transactions', true);
+    if (!operation) {
+      return;
+    }
+
     const purchaseService = require('../services/PurchaseService');
     const rawText = String(msg.text || '').trim();
     const dateInput = rawText.replace(/^\/transactions\b/i, '').trim();
 
     try {
-      // Check authorization
-      const authResult = await authService.checkAuthorization(telegramUserId);
-      if (!authResult.authorized) {
-        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      const isAuthorized = await this.ensureAuthorized(chatId, telegramUserId);
+      if (!isAuthorized) {
+        return;
       }
 
       if (this.transactionsFetchControllers.has(telegramUserId)) {
@@ -538,6 +685,8 @@ class TelegramBotController {
       }
 
       this.bot.sendMessage(chatId, '❌ Failed to fetch transactions.');
+    } finally {
+      this.clearUserOperation(telegramUserId, operation.id);
     }
   }
 
@@ -548,18 +697,23 @@ class TelegramBotController {
   async handleSettingsCommand(msg) {
     const chatId = msg.chat.id.toString();
     const telegramUserId = msg.from.id.toString();
+    const operation = await this.tryBeginCommandOperation(chatId, telegramUserId, 'settings', true);
+    if (!operation) {
+      return;
+    }
 
     try {
-      // Check authorization
-      const authResult = await authService.checkAuthorization(telegramUserId);
-      if (!authResult.authorized) {
-        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      const isAuthorized = await this.ensureAuthorized(chatId, telegramUserId);
+      if (!isAuthorized) {
+        return;
       }
 
       await this.handleSettingsMenu(chatId);
     } catch (err) {
       logger.error('Error in /settings command:', err);
       this.bot.sendMessage(chatId, '❌ Error.');
+    } finally {
+      this.clearUserOperation(telegramUserId, operation.id);
     }
   }
 
@@ -570,12 +724,15 @@ class TelegramBotController {
   async handleScheduleCommand(msg) {
     const chatId = msg.chat.id.toString();
     const telegramUserId = msg.from.id.toString();
+    const operation = await this.tryBeginCommandOperation(chatId, telegramUserId, 'schedule', true);
+    if (!operation) {
+      return;
+    }
 
     try {
-      // Check authorization
-      const authResult = await authService.checkAuthorization(telegramUserId);
-      if (!authResult.authorized) {
-        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      const isAuthorized = await this.ensureAuthorized(chatId, telegramUserId);
+      if (!isAuthorized) {
+        return;
       }
 
       // Check if user has credentials
@@ -594,6 +751,8 @@ class TelegramBotController {
     } catch (err) {
       logger.error('Error in /schedule command:', err);
       this.bot.sendMessage(chatId, '❌ Error.');
+    } finally {
+      this.clearUserOperation(telegramUserId, operation.id);
     }
   }
 
@@ -604,12 +763,15 @@ class TelegramBotController {
   async handleInfoCommand(msg) {
     const chatId = msg.chat.id.toString();
     const telegramUserId = msg.from.id.toString();
+    const operation = await this.tryBeginCommandOperation(chatId, telegramUserId, 'info', true);
+    if (!operation) {
+      return;
+    }
 
     try {
-      // Check authorization
-      const authResult = await authService.checkAuthorization(telegramUserId);
-      if (!authResult.authorized) {
-        return this.bot.sendMessage(chatId, '⛔ Access denied.');
+      const isAuthorized = await this.ensureAuthorized(chatId, telegramUserId);
+      if (!isAuthorized) {
+        return;
       }
 
       const db = require('../services/DatabaseService');
@@ -629,6 +791,8 @@ class TelegramBotController {
     } catch (err) {
       logger.error('Error in /info command:', err);
       this.bot.sendMessage(chatId, '❌ Error.');
+    } finally {
+      this.clearUserOperation(telegramUserId, operation.id);
     }
   }
 
@@ -641,6 +805,12 @@ class TelegramBotController {
     const telegramUserId = msg.from.id.toString();
 
     try {
+      const activeOperation = this.getActiveOperation(telegramUserId);
+      if (activeOperation && !activeOperation.cancellable) {
+        await this.bot.sendMessage(chatId, '⏳ Browser launch/login is in progress and cannot be cancelled. Please wait.');
+        return;
+      }
+
       // Check authorization
       const authResult = await authService.checkAuthorization(telegramUserId);
       if (!authResult.authorized) {
@@ -655,18 +825,14 @@ class TelegramBotController {
         // Mark as cancelled to stop purchase flow
         orderFlowHandler.markAsCancelled(chatId);
 
-        // Force close ALL parallel browsers
+        // Force close all active purchase pages/tabs only.
         const purchaseService = require('../services/PurchaseService');
         const browsersClosed = await purchaseService.forceCloseUserBrowsers(telegramUserId);
         if (browsersClosed > 0) {
-          logger.system(`Force closed ${browsersClosed} parallel browsers for user ${telegramUserId}`);
+          logger.system(`Force closed ${browsersClosed} active purchase page(s) for user ${telegramUserId}`);
         }
 
-        // Close user session browser
-        const browserManager = require('../services/BrowserManager');
-        await browserManager.closeBrowser(telegramUserId);
-
-        logger.info(`Cancelled purchase and closed all browsers for user ${telegramUserId}`);
+        logger.info(`Cancelled purchase flow and kept persistent browser alive for user ${telegramUserId}`);
       }
 
       // Cancel any ongoing balance checks
@@ -695,6 +861,9 @@ class TelegramBotController {
       sessionManager.updateState(chatId, 'idle');
       sessionManager.clearCredentials(chatId);
 
+      // Mark user immediately ready for new commands after cancellation.
+      this.clearUserOperation(telegramUserId, activeOperation ? activeOperation.id : null);
+
       await this.bot.sendMessage(
         chatId,
         '✅ *Cancelled*\nUse /start for new order.',
@@ -714,6 +883,8 @@ class TelegramBotController {
     const chatId = query.message.chat.id.toString();
     const telegramUserId = query.from.id.toString();
     const callbackData = query.data;
+    const isCancelAction = this.isCancelCallback(callbackData);
+    let callbackOperation = null;
 
     // Prevent race conditions with state locking
     const lockKey = `${chatId}:${callbackData}`;
@@ -746,6 +917,27 @@ class TelegramBotController {
         return;
       }
 
+      const activeOperation = this.getActiveOperation(telegramUserId);
+      if (activeOperation && !isCancelAction) {
+        await this.bot.answerCallbackQuery(query.id, {
+          text: `⏳ ${this.formatOperationName(activeOperation.type)} in progress` ,
+          show_alert: false
+        });
+        return;
+      }
+
+      if (!isCancelAction) {
+        callbackOperation = this.beginUserOperation(telegramUserId, 'callback', true);
+        if (!callbackOperation) {
+          const current = this.getActiveOperation(telegramUserId);
+          await this.bot.answerCallbackQuery(query.id, {
+            text: `⏳ ${this.formatOperationName(current && current.type)} in progress`,
+            show_alert: false
+          });
+          return;
+        }
+      }
+
       // Block all interactions if user is currently logging in
       if (this.usersLoggingIn.has(telegramUserId)) {
         await this.bot.answerCallbackQuery(query.id, { text: '⏳ Login in progress...', show_alert: true });
@@ -766,6 +958,9 @@ class TelegramBotController {
       }
     } finally {
       this.processingCallbacks.delete(lockKey);
+      if (callbackOperation) {
+        this.clearUserOperation(telegramUserId, callbackOperation.id);
+      }
     }
   }
 
@@ -853,7 +1048,7 @@ class TelegramBotController {
               // Mark as cancelled
               scheduledService.cancelScheduledOrder(chatId);
 
-              await this.bot.answerCallbackQuery(query.id, {
+              await this.bot.answerCallbackQuery(queryId, {
                 text: '🛑 Cancelling order...',
                 show_alert: false
               });
@@ -1090,6 +1285,12 @@ class TelegramBotController {
       return;
     }
 
+    const activeOperation = this.getActiveOperation(telegramUserId);
+    if (activeOperation) {
+      await this.sendBusyMessage(chatId, activeOperation);
+      return;
+    }
+
     try {
       // Check authorization
       const authResult = await authService.checkAuthorization(telegramUserId);
@@ -1119,8 +1320,6 @@ class TelegramBotController {
           await orderFlowHandler.handleCustomUrlInput(this.bot, chatId, telegramUserId, text);
         } else if (orderSession.step === 'enter_quantity') {
           await orderFlowHandler.handleQuantityInput(this.bot, chatId, text);
-        } else if (orderSession.step === 'enter_backup_code') {
-          await orderFlowHandler.handleBackupCodeInput(this.bot, chatId, telegramUserId, text);
         } else if (orderSession.step === 'enter_schedule_time') {
           await orderFlowHandler.handleScheduleTimeInput(this.bot, chatId, telegramUserId, text);
         }
@@ -1213,32 +1412,38 @@ class TelegramBotController {
     const db = require('../services/DatabaseService');
 
     try {
-      // Parse backup codes (one per line)
-      const codes = text.split('\n')
-        .map(line => line.trim())
-        .filter(line => line.length > 0);
+      const result = backupCodeValidator.parseAndValidateBackupCodes(text, {
+        exactCount: 10,
+        requireUnique: true,
+        rejectUniformPattern: true
+      });
 
-      // Validate count
-      if (codes.length !== 10) {
-        await this.bot.sendMessage(chatId, `❌ Invalid. Need exactly 10 codes (got ${codes.length})`);
+      if (result.type === 'count') {
+        await this.bot.sendMessage(chatId, `❌ Invalid. Need exactly 10 codes (got ${result.details.actual})`);
         return;
       }
 
-      // Validate format (8 digits each)
-      const invalidCodes = [];
-      for (let i = 0; i < codes.length; i++) {
-        if (!/^\d{8}$/.test(codes[i])) {
-          invalidCodes.push(`Line ${i + 1}: "${codes[i]}"`);
-        }
+      if (result.type === 'format') {
+        const invalidLines = result.details.positions.map((pos) => {
+          const value = result.codes[pos - 1] || '';
+          return `Line ${pos}: "${value}"`;
+        });
+        await this.bot.sendMessage(chatId, `❌ Invalid format:\n${invalidLines.join('\n')}\nMust be 8 digits each`);
+        return;
       }
 
-      if (invalidCodes.length > 0) {
-        await this.bot.sendMessage(chatId, `❌ Invalid format:\n${invalidCodes.join('\n')}\nMust be 8 digits each`);
+      if (result.type === 'pattern') {
+        await this.bot.sendMessage(chatId, `❌ Invalid pattern at line(s): ${result.details.positions.join(', ')}\nCodes cannot be repeated single digits.`);
+        return;
+      }
+
+      if (result.type === 'duplicate') {
+        await this.bot.sendMessage(chatId, '❌ Duplicate codes detected. Enter 10 unique backup codes.');
         return;
       }
 
       // Save to database
-      await db.saveBackupCodes(telegramUserId, codes);
+      await db.saveBackupCodes(telegramUserId, result.codes);
 
       await this.bot.sendMessage(chatId, '✅ *Saved*\nCodes encrypted and ready. Use /start', { parse_mode: 'Markdown' });
 
@@ -1337,10 +1542,15 @@ class TelegramBotController {
       // Save to database
       await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
 
-      // Credentials changed: close all existing browsers and rebuild ready pool.
+      // Credentials changed: reset browser and login immediately with the new credentials.
       const purchaseService = require('../services/PurchaseService');
       await purchaseService.resetUserBrowsers(telegramUserId);
-      await purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: true });
+      await scraperService.login(telegramUserId, email, passwordTrimmed);
+
+      // Keep ready-session map synchronized in background without blocking UX.
+      purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch((syncErr) => {
+        logger.warn(`Background ready-session sync failed after credential update for user ${telegramUserId}: ${syncErr.message}`);
+      });
 
       // Clear credentials from memory
       sessionManager.clearCredentials(chatId);
@@ -1350,7 +1560,7 @@ class TelegramBotController {
 
       await this.safeSendMessage(
         chatId,
-        `✅ *Credentials Updated*\n${purchaseService.MAX_READY_BROWSERS} browsers re-logged and ready.`,
+        '✅ *Credentials Updated*\nBrowser is ready.',
         { parse_mode: 'Markdown' }
       );
 
@@ -1417,10 +1627,11 @@ class TelegramBotController {
           await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
           logger.success(`Saved encrypted credentials for user ${telegramUserId}`);
 
-          // New credentials added: reset old browsers and build fresh ready pool.
+          // New credentials added: keep PurchaseService ready-session map in sync in background.
           const purchaseService = require('../services/PurchaseService');
-          await purchaseService.resetUserBrowsers(telegramUserId);
-          await purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: true });
+          purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch((syncErr) => {
+            logger.warn(`Background ready-session sync failed after login for user ${telegramUserId}: ${syncErr.message}`);
+          });
         } catch (saveErr) {
           logger.error('Failed to save credentials (login still successful):', saveErr);
           // Continue anyway - login was successful
@@ -1440,8 +1651,7 @@ class TelegramBotController {
             logger.warn('Could not delete loading message');
           }
         }
-        const purchaseService = require('../services/PurchaseService');
-        await this.safeSendMessage(chatId, `✅ Logged in!\n💾 Credentials saved.\n🚀 ${purchaseService.MAX_READY_BROWSERS} browsers are ready.`);
+        await this.safeSendMessage(chatId, '✅ Logged in!\n💾 Credentials saved.\n🚀 Browser is ready.');
 
       } catch (err) {
         logger.error('Login error:', err);

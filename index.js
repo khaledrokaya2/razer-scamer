@@ -13,10 +13,16 @@
 // Load environment variables from .env file
 require('dotenv').config();
 
+const {
+  getRuntimeEnvironmentConfig,
+  getEnvironmentValidationErrors,
+  applyDatabaseEnvironmentVariables
+} = require('./src/config/environment');
+
 // CRITICAL FIX: Set environment-specific DB connection BEFORE loading services
 // This ensures DatabaseService uses the correct connection string from its constructor
-const env = process.env.NODE_ENV || 'development';
-const isDevelopment = env === 'development';
+const startupConfig = getRuntimeEnvironmentConfig();
+const isDevelopment = startupConfig.isDevelopment;
 
 if (isDevelopment && process.env.TEST_DB_CONNECTION_STRING) {
   process.env.DB_CONNECTION_STRING = process.env.TEST_DB_CONNECTION_STRING;
@@ -37,53 +43,12 @@ const getScheduledOrderService = require('./src/services/ScheduledOrderService')
 let scheduledOrderService = null;
 
 /**
- * Get environment-specific configuration
- * Returns bot token and database config based on NODE_ENV
- */
-function getEnvironmentConfig() {
-  const env = process.env.NODE_ENV || 'development';
-  const isDevelopment = env === 'development';
-
-  return {
-    environment: env,
-    isDevelopment,
-    botToken: isDevelopment
-      ? process.env.TELEGRAM_TEST_BOT_TOKEN
-      : process.env.TELEGRAM_BOT_TOKEN,
-    dbConnectionString: isDevelopment
-      ? process.env.TEST_DB_CONNECTION_STRING
-      : process.env.DB_CONNECTION_STRING,
-    dbServer: isDevelopment
-      ? process.env.TEST_DB_SERVER
-      : process.env.DB_SERVER,
-    dbName: isDevelopment
-      ? process.env.TEST_DB_NAME
-      : process.env.DB_NAME,
-  };
-}
-
-/**
  * Validates required environment variables
  * Exits the process if critical variables are missing
  */
 function validateEnvironment() {
-  const config = getEnvironmentConfig();
-  const errors = [];
-
-  // Check bot token
-  if (!config.botToken) {
-    const envVar = config.isDevelopment ? 'TELEGRAM_TEST_BOT_TOKEN' : 'TELEGRAM_BOT_TOKEN';
-    errors.push(`${envVar} (required for ${config.environment} environment)`);
-  }
-
-  // Check database config (either connection string or individual params)
-  const hasConnectionString = !!config.dbConnectionString;
-  const hasIndividualParams = config.dbServer && config.dbName;
-
-  if (!hasConnectionString && !hasIndividualParams) {
-    const prefix = config.isDevelopment ? 'TEST_DB' : 'DB';
-    errors.push(`Either ${prefix}_CONNECTION_STRING or both ${prefix}_SERVER and ${prefix}_NAME`);
-  }
+  const config = getRuntimeEnvironmentConfig();
+  const errors = getEnvironmentValidationErrors(config);
 
   if (errors.length > 0) {
     logger.error('Missing required environment variables:');
@@ -130,11 +95,8 @@ async function startApplication() {
   // Validate environment configuration and get config
   const config = validateEnvironment();
 
-  // Note: DB_CONNECTION_STRING is already set at top of file before services loaded
-  // This redundant setting is kept for backwards compatibility
-  process.env.DB_CONNECTION_STRING = config.dbConnectionString;
-  process.env.DB_SERVER = config.dbServer;
-  process.env.DB_NAME = config.dbName;
+  // Keep runtime DB env vars synchronized with selected environment profile.
+  applyDatabaseEnvironmentVariables(config);
 
   // Initialize all services
   await initializeServices(config);

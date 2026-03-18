@@ -11,14 +11,16 @@
  */
 
 const browserManager = require('./BrowserManager');
+const RazerLoginService = require('./RazerLoginService');
 const logger = require('../utils/logger');
+const appConfig = require('../config/app-config');
 
 class RazerScraperService {
   constructor() {
     //* Razer website URLs
     this.LOGIN_URL = 'https://razerid.razer.com';
     this.DASHBOARD_URL = 'https://razerid.razer.com/dashboard';
-    this.DEFAULT_TIMEOUT = 30000; // 30 seconds
+    this.DEFAULT_TIMEOUT = appConfig.browser.defaultTimeoutMs;
   }
 
   /**
@@ -36,49 +38,14 @@ class RazerScraperService {
     page.setDefaultTimeout(this.DEFAULT_TIMEOUT);
 
     try {
-      // Navigate to Razer login page
-      logger.http('Opening Razer login page...');
-      await page.goto(this.LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-      // Wait for email and password input fields to appear
-      logger.info('Waiting for login form...');
-      await page.waitForSelector('#input-login-email', { visible: true, timeout: 8000 });
-      await page.waitForSelector('#input-login-password', { visible: true, timeout: 8000 });
-
-      // Type credentials into the form (delay simulates human typing)
-      logger.info('Typing credentials...');
-      await page.type('#input-login-email', email, { delay: 50 });
-      await page.type('#input-login-password', password, { delay: 50 });
-
-      // Handle cookie consent banner if present
-      try {
-        await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 2000 });
-        await page.click('button[aria-label="Accept All"]');
-        await new Promise(resolve => setTimeout(resolve, 150));
-        logger.debug('Cookie consent accepted');
-      } catch (err) {
-        // No cookie banner - that's fine
-        logger.debug('No cookie consent banner');
-      }
-
-      // Click submit button and wait for navigation to complete
-      logger.info('Submitting login form...');
-      await Promise.all([
-        page.click('button[type="submit"]'),
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 })
-      ]);
-
-      // Verify login success by checking if we're on the dashboard
-      const currentUrl = page.url();
-      if (currentUrl !== "https://razerid.razer.com" && currentUrl !== "https://razerid.razer.com/") {
-        logger.success('Login successful!');
-        browserManager.updateActivity(userId);
-        return { browser, page };
-      } else {
-        // Login failed - throw error (don't close browser, might be reused)
-        throw new Error('Login failed');
-      }
+      browserManager.markSessionReady(userId, false);
+      await RazerLoginService.loginOnPage(page, email, password);
+      browserManager.markSessionReady(userId, true);
+      logger.success('Login successful!');
+      browserManager.updateActivity(userId);
+      return { browser, page };
     } catch (err) {
+      browserManager.markSessionReady(userId, false);
       // Don't close browser on error - let user retry
       logger.error('Login error:', err.message);
       throw err;

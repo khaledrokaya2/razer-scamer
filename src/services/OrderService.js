@@ -7,12 +7,13 @@
 
 const purchaseService = require('./PurchaseService');
 const logger = require('../utils/logger');
+const appConfig = require('../config/app-config');
 
 class OrderService {
   constructor() {
     // In-memory storage for pins (not saved to database)
     this.orderPins = new Map(); // orderId -> {pins: [...], timestamp: Date.now()}
-    this.ORDER_PIN_TTL = 2 * 60 * 60 * 1000; // 2 hours
+    this.ORDER_PIN_TTL = appConfig.order.pinTtlMs;
     this.nextOrderId = Date.now();
 
     // CONCURRENCY FIX: Track active orders to prevent cleanup during processing
@@ -62,7 +63,7 @@ class OrderService {
         logger.order(`Cleanup: ${cleaned} old orders removed, ${skipped} active orders skipped`);
         logger.order(`Memory: ${this.orderPins.size} orders, ${this.activeOrders.size} active`);
       }
-    }, 15 * 60 * 1000); // OPTIMIZATION: Check every 15 minutes (faster cleanup)
+    }, appConfig.order.cleanupIntervalMs);
   }
 
   /**

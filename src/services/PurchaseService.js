@@ -11,220 +11,65 @@
 
 const browserManager = require('./BrowserManager');
 const logger = require('../utils/logger');
-const puppeteer = require('puppeteer-extra');
-// ANTI-BAN
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-// ANTI-BAN
-const PQueue = require('p-queue').default;
-
-// ANTI-BAN
-puppeteer.use(StealthPlugin());
-
-// ANTI-BAN
-const queue = new PQueue({ concurrency: 5, interval: 4000, intervalCap: 5 });
-
-// ANTI-BAN
-const PROXY_LIST = [];
-
-// ANTI-BAN
-const getProxy = (i) => PROXY_LIST.length ? PROXY_LIST[i % PROXY_LIST.length] : null;
-
-// ANTI-BAN
-const humanDelay = (min = 1200, max = 3500) => new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
-
-// ANTI-BAN
-const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36'
-];
-
-// ANTI-BAN
-const setupPage = async (page) => {
-  const userAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-  const width = 1280 + Math.floor(Math.random() * 201);
-  const height = 800 + Math.floor(Math.random() * 201);
-
-  await page.setUserAgent(userAgent);
-  await page.setViewport({ width, height });
-
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    window.chrome = { runtime: {} };
-  });
-
-  await page.setExtraHTTPHeaders({
-    'Accept-Language': 'en-US,en;q=0.9',
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br'
-  });
-
-  if (!page.__antiBanRequestHooked) {
-    await page.setRequestInterception(true);
-    const requestHandler = (request) => {
-      const resourceType = request.resourceType();
-      if (resourceType === 'image' || resourceType === 'media' || resourceType === 'font') {
-        request.abort();
-      } else {
-        request.continue();
-      }
-    };
-    page.__antiBanRequestHooked = true;
-    page.on('request', requestHandler);
-  }
-
-  if (!page.__antiBanMethodPatched) {
-    const originalGoto = page.goto.bind(page);
-    const originalClick = page.click.bind(page);
-    const originalKeyboardType = page.keyboard.type.bind(page.keyboard);
-
-    page.goto = async (url, options) => {
-      const runGoto = async () => {
-        const result = await originalGoto(url, options);
-        await humanDelay();
-        if (await isBanned(page)) throw new Error('rate limited');
-        return result;
-      };
-
-      const isTransactionUrl = typeof url === 'string' && url.includes('/transaction/purchase/');
-      if (isTransactionUrl) {
-        return withRetry(runGoto, 3);
-      }
-
-      return runGoto();
-    };
-
-    page.click = async (...args) => {
-      const result = await originalClick(...args);
-      await humanDelay();
-      return result;
-    };
-
-    page.keyboard.type = async (text, options = {}) => {
-      const result = await originalKeyboardType(text, {
-        ...options,
-        delay: options.delay ?? (80 + Math.random() * 60)
-      });
-      await humanDelay();
-      return result;
-    };
-
-    page.__antiBanMethodPatched = true;
-  }
-};
-
-// ANTI-BAN
-const isBanned = async (page) => {
-  const title = (await page.title().catch(() => '')) || '';
-  const url = page.url() || '';
-  const bodyText = await page.evaluate(() => (document.body && document.body.innerText) ? document.body.innerText : '').catch(() => '');
-
-  const titleLower = title.toLowerCase();
-  const urlLower = url.toLowerCase();
-  const bodyLower = String(bodyText || '').toLowerCase();
-
-  return titleLower.includes('access denied')
-    || titleLower.includes('too many requests')
-    || urlLower.includes('captcha')
-    || bodyLower.includes('you have been blocked')
-    || bodyLower.includes('rate limit')
-    || bodyLower.includes('access denied');
-};
-
-// ANTI-BAN
-const withRetry = async (fn, retries = 3) => {
-  let lastError;
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-      if (attempt >= retries) break;
-      const backoff = 8000 * (2 ** (attempt - 1));
-      await new Promise(resolve => setTimeout(resolve, backoff));
-    }
-  }
-  throw lastError;
-};
-
-/**
- * Custom error for insufficient balance
- * This error should NOT be retried
- */
-class InsufficientBalanceError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'InsufficientBalanceError';
-  }
-}
-
-/**
- * Custom error for invalid backup code
- * This error should NOT be retried - requires user input
- */
-class InvalidBackupCodeError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'InvalidBackupCodeError';
-  }
-}
-
-/**
- * Custom error for expired backup code session (~15 min limit)
- * Browser should be closed - no more codes available for this session
- */
-class BackupCodeExpiredError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'BackupCodeExpiredError';
-  }
-}
+const appConfig = require('../config/app-config');
+const PurchaseStages = require('./purchase/stages');
+const {
+  InsufficientBalanceError,
+  InvalidBackupCodeError,
+  BackupCodeExpiredError,
+  TwoFactorVerificationRequiredError,
+  TwoFactorRestartRequiredError
+} = require('./purchase/errors');
+const {
+  sleep,
+  sleepCancellable,
+  getStaggerDelay
+} = require('./purchase/timing');
+const {
+  createCatalogPageMatcher
+} = require('./purchase/url');
+const AntibanService = require('./AntibanService');
+const setupPage = AntibanService.setupPage;
+const isBanned = AntibanService.isBanned;
+const withRetry = AntibanService.withRetry;
+const humanDelay = AntibanService.humanDelay;
 
 class PurchaseService {
   constructor() {
-    this.DEFAULT_TIMEOUT = 30000; // 30 seconds
-    this.RELOAD_CHECK_INTERVAL = 500; // 0.5 seconds between stock checks (faster restocking detection)
-    this.MAX_RELOAD_ATTEMPTS = 600; // 5 minutes of retrying (600 * 0.5s)
+    this.DEFAULT_TIMEOUT = appConfig.browser.defaultTimeoutMs;
+    this.RELOAD_CHECK_INTERVAL = appConfig.browser.reloadCheckIntervalMs;
+    this.MAX_RELOAD_ATTEMPTS = appConfig.browser.maxReloadAttempts;
 
-    // Track active browser instances for each user (for cancellation)
-    // Map of telegramUserId -> Array of browser instances
-    this.activeBrowsers = new Map();
+    // Track active purchase pages for each user (for cancellation)
+    // Map of telegramUserId -> Array of page instances
+    this.activePurchasePages = new Map();
 
-    // Keep a pre-warmed browser pool for instant purchases.
-    this.readyBrowsersByUser = new Map(); // userId -> Array<{browser, page, slot}>
+    // Keep one persistent logged-in browser per user.
+    this.readyBrowsersByUser = new Map(); // userId -> {browser, page, slot}
     this.readyInitLocks = new Map(); // userId -> Promise
-    this.currentReadyUserId = null; // One-user-at-a-time policy
-    this.MAX_READY_BROWSERS = 10;
+    this.twoFactorLocks = new Map(); // userId -> Promise chain lock
+    this.intentionalReadyCloseUsers = new Set();
+    this.MAX_READY_BROWSERS = 1;
+    this.MAX_PARALLEL_PAGES = 5;
 
-    // Anti-ban staggering between browsers.
-    this.READY_LOGIN_STAGGER_MS = 700;
-    this.READY_LOGIN_JITTER_MS = 350;
-    this.PURCHASE_BROWSER_STAGGER_MS = 3200;
-    this.PURCHASE_BROWSER_JITTER_MS = 1800;
-    this.PURCHASE_CARD_STAGGER_MS = 900;
-    this.PURCHASE_CARD_JITTER_MS = 500;
-    this.TRANSACTION_DETAIL_STAGGER_MS = 5200;
-    this.TRANSACTION_DETAIL_JITTER_MS = 2600;
+    // Anti-ban staggering between pages/workers.
+    this.READY_LOGIN_STAGGER_MS = appConfig.purchase.readyLoginStaggerMs;
+    this.READY_LOGIN_JITTER_MS = appConfig.purchase.readyLoginJitterMs;
+    this.PURCHASE_PAGE_STAGGER_MS = appConfig.purchase.purchasePageStaggerMs;
+    this.PURCHASE_PAGE_JITTER_MS = appConfig.purchase.purchasePageJitterMs;
+    this.PURCHASE_CARD_STAGGER_MS = appConfig.purchase.purchaseCardStaggerMs;
+    this.PURCHASE_CARD_JITTER_MS = appConfig.purchase.purchaseCardJitterMs;
+    this.TRANSACTION_DETAIL_STAGGER_MS = appConfig.purchase.transactionDetailStaggerMs;
+    this.TRANSACTION_DETAIL_JITTER_MS = appConfig.purchase.transactionDetailJitterMs;
+    this.TRANSACTION_API_RATE_DELAY_MS = appConfig.purchase.transactionApiRateDelayMs;
+    this.TWO_FACTOR_RESTART_STAGGER_MS = Math.max(600, Math.floor(this.PURCHASE_PAGE_STAGGER_MS / 2));
+    this.TWO_FACTOR_RESTART_JITTER_MS = Math.max(150, Math.floor(this.PURCHASE_PAGE_JITTER_MS / 4));
     this.TRANSACTIONS_PAGE_URL = 'https://gold.razer.com/global/en/transactions';
     this.TRANSACTION_DETAIL_URL_PREFIX = 'https://gold.razer.com/global/en/transaction/purchase/';
     this.READY_BROWSER_HOME_URL = 'https://gold.razer.com/global/en';
 
-    // Purchase stages for tracking
-    this.STAGES = {
-      IDLE: 'idle',
-      NAVIGATING: 'navigating_to_game',
-      SELECTING_CARD: 'selecting_card',
-      SELECTING_PAYMENT: 'selecting_payment',
-      CLICKING_CHECKOUT: 'clicking_checkout',
-      PROCESSING_2FA: 'processing_2fa',
-      REACHED_TRANSACTION: 'reached_transaction_page',
-      EXTRACTING_DATA: 'extracting_pin_data',
-      COMPLETED: 'completed',
-      FAILED: 'failed'
-    };
+    // Purchase stage value object imported from domain module.
+    this.STAGES = PurchaseStages;
   }
 
   /**
@@ -232,7 +77,7 @@ class PurchaseService {
    * @param {number} ms
    */
   async sleep(ms) {
-    await new Promise(resolve => setTimeout(resolve, ms));
+    await sleep(ms);
   }
 
   /**
@@ -242,24 +87,7 @@ class PurchaseService {
    * @returns {Promise<boolean>} true when cancelled during wait
    */
   async sleepCancellable(ms, checkCancellation = null) {
-    if (!checkCancellation) {
-      await this.sleep(ms);
-      return false;
-    }
-
-    const slice = 250;
-    let elapsed = 0;
-    while (elapsed < ms) {
-      if (checkCancellation()) {
-        return true;
-      }
-
-      const step = Math.min(slice, ms - elapsed);
-      await this.sleep(step);
-      elapsed += step;
-    }
-
-    return !!checkCancellation();
+    return sleepCancellable(ms, checkCancellation);
   }
 
   /**
@@ -270,37 +98,96 @@ class PurchaseService {
    * @returns {number}
    */
   getStaggerDelay(index, baseMs, jitterMs = 0) {
-    const jitter = jitterMs > 0 ? Math.floor(Math.random() * (jitterMs + 1)) : 0;
-    return (index * baseMs) + jitter;
+    return getStaggerDelay(index, baseMs, jitterMs);
   }
 
   /**
-   * Get connected ready sessions for a user.
+   * Get connected ready session for a user.
    * @param {string} telegramUserId - Telegram user ID
    * @returns {Array<{browser: Object, page: Object, slot: number}>}
    */
   getReadySessions(telegramUserId) {
-    const sessions = this.readyBrowsersByUser.get(telegramUserId) || [];
-    return sessions.filter(session => {
-      if (!session || !session.browser || !session.page) return false;
-      try {
-        return session.browser.isConnected() && !session.page.isClosed();
-      } catch (err) {
-        return false;
+    const session = this.readyBrowsersByUser.get(telegramUserId);
+    if (!session || !session.browser || !session.page) {
+      return [];
+    }
+
+    try {
+      if (session.browser.isConnected() && !session.page.isClosed()) {
+        return [session];
       }
-    });
+    } catch (err) {
+      return [];
+    }
+
+    return [];
   }
 
   /**
-   * Ensure maximum ready browsers are launched and logged in for user.
-   * Enforces one-active-user-at-a-time by closing previous user's pool.
+   * Execute a task while holding a per-user lock.
+   * Used to prevent multiple pages from consuming backup codes at once.
+   * @param {string} telegramUserId - Telegram user ID
+   * @param {Function} task - Async task to run
+   * @returns {Promise<any>}
+   */
+  async runWithUserLock(telegramUserId, task) {
+    const previous = this.twoFactorLocks.get(telegramUserId) || Promise.resolve();
+    let release;
+    const current = new Promise(resolve => {
+      release = resolve;
+    });
+
+    this.twoFactorLocks.set(telegramUserId, current);
+    await previous;
+
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.twoFactorLocks.get(telegramUserId) === current) {
+        this.twoFactorLocks.delete(telegramUserId);
+      }
+    }
+  }
+
+  /**
+   * Track a purchase page for cancellation.
+   * @param {string} telegramUserId - Telegram user ID
+   * @param {Object} page - Puppeteer page
+   */
+  trackPurchasePage(telegramUserId, page) {
+    if (!this.activePurchasePages.has(telegramUserId)) {
+      this.activePurchasePages.set(telegramUserId, []);
+    }
+    this.activePurchasePages.get(telegramUserId).push(page);
+  }
+
+  /**
+   * Remove a tracked purchase page.
+   * @param {string} telegramUserId - Telegram user ID
+   * @param {Object} page - Puppeteer page
+   */
+  untrackPurchasePage(telegramUserId, page) {
+    if (!this.activePurchasePages.has(telegramUserId)) return;
+    const pages = this.activePurchasePages.get(telegramUserId);
+    const index = pages.indexOf(page);
+    if (index > -1) {
+      pages.splice(index, 1);
+    }
+    if (pages.length === 0) {
+      this.activePurchasePages.delete(telegramUserId);
+    }
+  }
+
+  /**
+  * Ensure one persistent ready browser is launched and logged in for user.
    * @param {string} telegramUserId - Telegram user ID
    * @param {Object} options - Options
-   * @param {boolean} options.forceRestart - Force close and recreate user's ready pool
+  * @param {boolean} options.forceRestart - Force close and recreate user's ready browser
     * @param {Function} options.onProgress - Optional callback: ({ready, target, phase})
    * @returns {Promise<{ready: boolean, count: number, reason?: string}>}
    */
-    async ensureReadyBrowsers(telegramUserId, { forceRestart = false, onProgress = null } = {}) {
+  async ensureReadyBrowsers(telegramUserId, { forceRestart = false, onProgress = null } = {}) {
     if (this.readyInitLocks.has(telegramUserId)) {
       return this.readyInitLocks.get(telegramUserId);
     }
@@ -314,20 +201,12 @@ class PurchaseService {
         return { ready: false, count: 0, reason: 'no_credentials' };
       }
 
-      // One-user-only policy: switch ownership of ready pool to latest /start user.
-      if (this.currentReadyUserId && this.currentReadyUserId !== telegramUserId) {
-        await this.resetUserBrowsers(this.currentReadyUserId);
-      }
-
       if (forceRestart) {
         await this.closeReadyBrowsersForUser(telegramUserId);
       }
 
-      this.currentReadyUserId = telegramUserId;
-
-      // Recompute after optional close.
-      let sessions = this.getReadySessions(telegramUserId);
-      const target = this.MAX_READY_BROWSERS;
+      const sessions = this.getReadySessions(telegramUserId);
+      const target = 1;
 
       if (onProgress) {
         try {
@@ -337,7 +216,36 @@ class PurchaseService {
         }
       }
 
-      if (sessions.length >= this.MAX_READY_BROWSERS) {
+      if (sessions.length >= 1 && browserManager.isSessionReady(telegramUserId)) {
+        // Ensure ready session and BrowserManager point to the same browser instance.
+        try {
+          if (browserManager.hasActiveBrowser(telegramUserId)) {
+            const managed = await browserManager.getBrowser(telegramUserId);
+            const current = sessions[0];
+            if (managed && managed.browser && current.browser !== managed.browser) {
+              try {
+                if (current.browser && current.browser.isConnected()) {
+                  await Promise.race([
+                    current.browser.close().catch(() => { }),
+                    new Promise(resolve => setTimeout(resolve, 2000))
+                  ]);
+                }
+              } catch (syncErr) {
+                logger.debug(`Failed closing stale ready browser for user ${telegramUserId}: ${syncErr.message}`);
+              }
+
+              this.readyBrowsersByUser.set(telegramUserId, {
+                browser: managed.browser,
+                page: managed.page,
+                slot: 1
+              });
+              logger.system(`Rebound ready session to managed browser for user ${telegramUserId}`);
+            }
+          }
+        } catch (syncErr) {
+          logger.debug(`Ready/managed browser sync skipped for user ${telegramUserId}: ${syncErr.message}`);
+        }
+
         if (onProgress) {
           try {
             await onProgress({ ready: sessions.length, target, phase: 'complete' });
@@ -348,51 +256,57 @@ class PurchaseService {
         return { ready: true, count: sessions.length, target };
       }
 
-      const missing = this.MAX_READY_BROWSERS - sessions.length;
-      logger.system(`Preparing ${missing} ready browser(s) for user ${telegramUserId}...`);
-
-      const baseIndex = sessions.length;
-      let readyCount = sessions.length;
-
-      // Launch missing browsers in parallel, each with staggered start delay.
-      const launchTasks = Array.from({ length: missing }, (_, i) => (async () => {
-        const slot = baseIndex + i + 1;
-        const startDelay = this.getStaggerDelay(i, this.READY_LOGIN_STAGGER_MS, this.READY_LOGIN_JITTER_MS);
-        if (startDelay > 0) {
-          logger.debug(`[Ready ${slot}] Delaying login start by ${startDelay}ms to reduce detection`);
-          await this.sleep(startDelay);
-        }
-
-        const session = await this.launchReadyBrowserWithRetry(telegramUserId, credentials, slot);
-        readyCount += 1;
-
-        if (onProgress) {
-          try {
-            await onProgress({ ready: readyCount, target, phase: 'building' });
-          } catch (progressErr) {
-            logger.debug(`ensureReadyBrowsers progress callback error: ${progressErr.message}`);
+      // First preference: reuse BrowserManager's already logged-in browser for this user.
+      try {
+        if (browserManager.isSessionReady(telegramUserId)) {
+          const browserSession = await browserManager.getBrowser(telegramUserId);
+          if (!browserSession || !browserSession.browser || !browserSession.page) {
+            throw new Error('active BrowserManager session missing browser/page');
           }
+
+          const adoptedSession = {
+            browser: browserSession.browser,
+            page: browserSession.page,
+            slot: 1
+          };
+          this.readyBrowsersByUser.set(telegramUserId, adoptedSession);
+          logger.success(`Adopted BrowserManager session as ready browser for user ${telegramUserId}`);
+
+          if (onProgress) {
+            try {
+              await onProgress({ ready: 1, target, phase: 'complete' });
+            } catch (progressErr) {
+              logger.debug(`ensureReadyBrowsers progress callback error: ${progressErr.message}`);
+            }
+          }
+
+          return { ready: true, count: 1, target };
         }
+      } catch (adoptErr) {
+        logger.debug(`Could not adopt BrowserManager session for user ${telegramUserId}: ${adoptErr.message}`);
+      }
 
-        return session;
-      })());
+      logger.system(`Preparing 1 ready browser for user ${telegramUserId}...`);
 
-      const newSessions = await Promise.all(launchTasks);
+      const startDelay = this.getStaggerDelay(0, this.READY_LOGIN_STAGGER_MS, this.READY_LOGIN_JITTER_MS);
+      if (startDelay > 0) {
+        logger.debug(`[Ready 1] Delaying login start by ${startDelay}ms to reduce detection`);
+        await this.sleep(startDelay);
+      }
 
-      sessions.push(...newSessions);
-
-      this.readyBrowsersByUser.set(telegramUserId, sessions);
-      logger.success(`Ready browser pool initialized for user ${telegramUserId}: ${sessions.length}/${this.MAX_READY_BROWSERS}`);
+      const session = await this.launchReadyBrowserWithRetry(telegramUserId, credentials, 1);
+      this.readyBrowsersByUser.set(telegramUserId, session);
+      logger.success(`Ready browser initialized for user ${telegramUserId}: 1/1`);
 
       if (onProgress) {
         try {
-          await onProgress({ ready: sessions.length, target, phase: 'complete' });
+          await onProgress({ ready: 1, target, phase: 'complete' });
         } catch (progressErr) {
           logger.debug(`ensureReadyBrowsers progress callback error: ${progressErr.message}`);
         }
       }
 
-      return { ready: true, count: sessions.length, target };
+      return { ready: true, count: 1, target };
     })();
 
     this.readyInitLocks.set(telegramUserId, initPromise);
@@ -421,90 +335,101 @@ class PurchaseService {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let browser = null;
+      let page = null;
       try {
-        logger.system(`${logPrefix} Launching browser (attempt ${attempt}/${maxAttempts})`);
+        logger.system(`${logPrefix} Binding ready session to managed browser (attempt ${attempt}/${maxAttempts})`);
 
-        // ANTI-BAN
-        const proxy = getProxy(slot);
-        // ANTI-BAN
-        const launchArgs = [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-extensions',
-          '--disable-sync',
-          '--disable-translate',
-          '--no-first-run',
-          '--mute-audio',
-          '--disable-blink-features=AutomationControlled',
-          '--incognito',
-          '--js-flags=--max-old-space-size=256'
-        ];
+        const hadActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
+        const managedSession = await browserManager.getBrowser(telegramUserId);
+        browser = managedSession.browser;
+        page = managedSession.page;
 
-        // ANTI-BAN
-        if (proxy) {
-          launchArgs.push(`--proxy-server=${proxy}`);
-        }
-
-        browser = await puppeteer.launch({
-          headless: true,
-          protocolTimeout: 180000,
-          args: launchArgs
-        });
-
-        const existingPages = await browser.pages();
-        const page = existingPages[0] || await browser.newPage();
         // ANTI-BAN
         await setupPage(page);
         await page.setDefaultTimeout(45000);
         await page.setDefaultNavigationTimeout(60000);
 
-        await page.goto('https://razerid.razer.com', { waitUntil: 'load', timeout: 60000 });
-        // ANTI-BAN
-        await humanDelay();
-        // ANTI-BAN
-        if (await isBanned(page)) throw new Error('rate limited');
-        await page.waitForSelector('#input-login-email', { visible: true, timeout: 15000 });
-        await page.waitForSelector('#input-login-password', { visible: true, timeout: 15000 });
+        const verifyAuthenticatedSession = async () => {
+          await withRetry(async () => {
+            await page.goto('https://razerid.razer.com/dashboard', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            if (await isBanned(page)) throw new Error('rate limited');
+          });
 
-        await page.type('#input-login-email', credentials.email, { delay: 20 });
-        // ANTI-BAN
-        await humanDelay();
-        await page.type('#input-login-password', credentials.password, { delay: 20 });
-        // ANTI-BAN
-        await humanDelay();
+          const sessionValid = await browserManager.checkSessionValid(page);
+          if (!sessionValid) {
+            return false;
+          }
 
-        try {
-          await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 1500 });
-          await page.click('button[aria-label="Accept All"]');
-          // ANTI-BAN
+          return await page.evaluate(() => {
+            const href = (window.location.href || '').toLowerCase();
+            const hasEmailInput = !!document.querySelector('#input-login-email, input[type="email"]');
+            const hasPasswordInput = !!document.querySelector('#input-login-password, input[type="password"]');
+            const hasLoginForm = !!document.querySelector('form[action*="login"], form[action*="signin"]');
+            return !href.includes('login') && !(hasEmailInput && hasPasswordInput) && !hasLoginForm;
+          }).catch(() => false);
+        };
+
+        let loggedIn = await verifyAuthenticatedSession();
+        if (!loggedIn) {
+          logger.system(`${logPrefix} Session is not authenticated yet for user ${telegramUserId}; signing in...`);
+
+          await page.goto('https://razerid.razer.com', { waitUntil: 'load', timeout: 60000 });
+          if (await isBanned(page)) throw new Error('rate limited');
+
+          const emailSelector = '#input-login-email, input[type="email"]';
+          const passwordSelector = '#input-login-password, input[type="password"]';
+
+          await page.waitForSelector(emailSelector, { visible: true, timeout: 15000 });
+          await page.waitForSelector(passwordSelector, { visible: true, timeout: 15000 });
+
+          await page.type(emailSelector, credentials.email, { delay: 20 });
           await humanDelay();
-        } catch (err) {
-          // Cookie banner not always present.
+          await page.type(passwordSelector, credentials.password, { delay: 20 });
+          await humanDelay();
+
+          try {
+            await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 1500 });
+            await page.click('button[aria-label="Accept All"]');
+            await humanDelay();
+          } catch (err) {
+            // Cookie banner not always present.
+          }
+
+          await Promise.all([
+            page.click('button[type="submit"]'),
+            page.waitForNavigation({ waitUntil: 'load', timeout: 60000 }).catch(() => null)
+          ]);
+
+          loggedIn = await verifyAuthenticatedSession();
+          if (!loggedIn) {
+            throw new Error('Login verification failed - still not authenticated');
+          }
         }
 
-        await Promise.all([
-          page.click('button[type="submit"]'),
-          page.waitForNavigation({ waitUntil: 'load', timeout: 60000 })
-        ]);
+        await withRetry(async () => {
+          await page.goto('https://gold.razer.com/global/en', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          if (await isBanned(page)) throw new Error('rate limited');
+        });
 
-        const currentUrl = page.url();
-        if (currentUrl === 'https://razerid.razer.com' || currentUrl === 'https://razerid.razer.com/') {
-          throw new Error('Login failed - still on login page');
+        if (!hadActiveBrowser) {
+          logger.success(`${logPrefix} Created and initialized managed browser for user ${telegramUserId}`);
+        } else {
+          logger.success(`${logPrefix} Reusing existing managed browser for user ${telegramUserId}`);
         }
 
-        await page.goto('https://gold.razer.com/global/en', { waitUntil: 'domcontentloaded', timeout: 30000 });
-        // ANTI-BAN
-        await humanDelay();
-        // ANTI-BAN
-        if (await isBanned(page)) throw new Error('rate limited');
-
-        if (keepPoolAtMaxOnDisconnect) {
+        if (keepPoolAtMaxOnDisconnect && !browser.__purchaseReadyDisconnectHooked) {
+          browser.__purchaseReadyDisconnectHooked = true;
           browser.on('disconnected', () => {
-            if (this.currentReadyUserId !== telegramUserId) return;
+            if (this.intentionalReadyCloseUsers.has(telegramUserId)) {
+              logger.debug(`${logPrefix} Ignoring disconnect recovery for intentional close (user ${telegramUserId})`);
+              return;
+            }
             logger.warn(`${logPrefix} Browser disconnected for user ${telegramUserId}. Recreating...`);
             setTimeout(() => {
+              if (this.intentionalReadyCloseUsers.has(telegramUserId)) {
+                logger.debug(`${logPrefix} Recovery skipped after intentional close (user ${telegramUserId})`);
+                return;
+              }
               this.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch(err => {
                 logger.error(`${logPrefix} Failed to recover ready browser:`, err.message);
               });
@@ -516,8 +441,9 @@ class PurchaseService {
         return { browser, page, slot };
       } catch (err) {
         logger.error(`${logPrefix} Launch/login failed: ${err.message}`);
-        if (browser) {
-          try { await browser.close(); } catch (closeErr) { }
+        // Never close managed browser from this flow unless it became disconnected.
+        if (browser && !browser.isConnected()) {
+          try { await browserManager.closeBrowser(telegramUserId); } catch (closeErr) { }
         }
         if (attempt === maxAttempts) {
           throw new Error(`Failed to prepare ready browser slot ${slot}: ${err.message}`);
@@ -535,29 +461,43 @@ class PurchaseService {
    * @returns {Promise<number>} Number of browsers closed
    */
   async closeReadyBrowsersForUser(telegramUserId) {
-    const sessions = this.readyBrowsersByUser.get(telegramUserId) || [];
-    if (sessions.length === 0) return 0;
+    const session = this.readyBrowsersByUser.get(telegramUserId);
+    this.intentionalReadyCloseUsers.add(telegramUserId);
 
-    const closePromises = sessions.map(async (session) => {
+    if (!session) {
+      // Keep BrowserManager in sync on forced resets even when no ready map entry exists.
       try {
-        await Promise.race([
-          session.browser.close(),
-          new Promise(resolve => setTimeout(resolve, 3000))
-        ]);
+        await browserManager.closeBrowser(telegramUserId);
       } catch (err) {
-        logger.debug(`Error closing ready browser for user ${telegramUserId}: ${err.message}`);
+        logger.debug(`Error closing BrowserManager browser for user ${telegramUserId}: ${err.message}`);
+      } finally {
+        setTimeout(() => this.intentionalReadyCloseUsers.delete(telegramUserId), 4500);
       }
-    });
-
-    await Promise.all(closePromises);
-    this.readyBrowsersByUser.delete(telegramUserId);
-
-    if (this.currentReadyUserId === telegramUserId) {
-      this.currentReadyUserId = null;
+      return 0;
     }
 
-    logger.system(`Closed ${sessions.length} ready browsers for user ${telegramUserId}`);
-    return sessions.length;
+    try {
+      await Promise.race([
+        session.browser.close(),
+        new Promise(resolve => setTimeout(resolve, 3000))
+      ]);
+    } catch (err) {
+      logger.debug(`Error closing ready browser for user ${telegramUserId}: ${err.message}`);
+    }
+
+    this.readyBrowsersByUser.delete(telegramUserId);
+
+    // Ensure BrowserManager map does not keep stale disconnected browser handles.
+    try {
+      await browserManager.closeBrowser(telegramUserId);
+    } catch (err) {
+      logger.debug(`Error closing BrowserManager browser for user ${telegramUserId}: ${err.message}`);
+    } finally {
+      setTimeout(() => this.intentionalReadyCloseUsers.delete(telegramUserId), 4500);
+    }
+
+    logger.system(`Closed ready browser for user ${telegramUserId}`);
+    return 1;
   }
 
   /**
@@ -576,13 +516,24 @@ class PurchaseService {
    * @returns {Promise<Array>} Array of card options {name, index, disabled}
    */
   async getAvailableCards(telegramUserId, gameUrl) {
-    const page = await browserManager.navigateToUrl(telegramUserId, gameUrl);
+    const readySession = this.getReadySessions(telegramUserId)[0];
+    if (!readySession) {
+      throw new Error('No ready browser session found. Use /start first to open and login your persistent browser.');
+    }
+
+    const page = readySession.page;
+
+    // Reuse the persistent ready browser page instead of creating a BrowserManager session.
+    await setupPage(page);
+    await withRetry(async () => {
+      await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
+      if (await isBanned(page)) throw new Error('rate limited');
+    });
 
     try {
       // Wait for page to fully load and JavaScript to execute
       logger.http('Waiting for page to load...');
       await page.waitForSelector('body', { timeout: 5000 });
-      await new Promise(resolve => setTimeout(resolve, 2000));
 
       // Check for access denied or login required (improved logic)
       const pageStatus = await page.evaluate(() => {
@@ -634,8 +585,8 @@ class PurchaseService {
         logger.success('Card elements detected on page');
       } catch (waitErr) {
         logger.warn('Card elements not found within timeout, will try extraction anyway...');
-        // Give it one more second for slower connections
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        // Small grace period for slow DOM hydration before extraction fallback.
+        await new Promise(resolve => setTimeout(resolve, 400));
       }
 
       // OPTIMIZED: Try ALL 3 detection methods in ONE evaluation
@@ -858,8 +809,8 @@ class PurchaseService {
 
       // Reload page
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
-      // Wait for JS to render
-      await new Promise(resolve => setTimeout(resolve, 1500));
+      // Wait until card inputs are present (returns early when ready).
+      await page.waitForSelector("input[type='radio'][data-v-498979e2]", { timeout: 1200 }).catch(() => { });
 
       attempts++;
     }
@@ -872,7 +823,7 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters {userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber}
    * @returns {Promise<Object>} Purchase data
    */
-  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '' }) {
+  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '', onTwoFactorStart = null, onTwoFactorEnd = null, waitForTwoFactorPause = null, shouldDeferTwoFactor = null, resumeFromTwoFactor = false }) {
     // ANTI-BAN
     await setupPage(page);
     let currentStage = this.STAGES.IDLE;
@@ -891,18 +842,42 @@ class PurchaseService {
     };
 
     try {
-      log.purchase('Starting purchase process...');
+      let currentUrl = page.url();
+      const isSameCatalogPage = createCatalogPageMatcher(gameUrl);
+
+      if (resumeFromTwoFactor) {
+        log.purchase('Resuming purchase process from 2FA checkpoint...');
+      } else {
+        log.purchase('Starting purchase process...');
+      }
 
       // Check cancellation before starting
       if (checkCancellation && checkCancellation()) {
         throw new Error('Order cancelled by user');
       }
 
+      let postCheckoutResolutionActive = false;
+
+      const waitIfTwoFactorPaused = async () => {
+        if (postCheckoutResolutionActive) {
+          return;
+        }
+        if (!waitForTwoFactorPause) return;
+        const canProceed = await waitForTwoFactorPause();
+        if (!canProceed) {
+          throw new Error('Order cancelled by user');
+        }
+      };
+
+      await waitIfTwoFactorPaused();
+
+      // STAGE 1-4: Full checkout flow (skip in 2FA resume mode)
+      if (!resumeFromTwoFactor) {
       // STAGE 1: Navigate to game page (skip if already there - HUGE speed boost!)
       currentStage = this.STAGES.NAVIGATING;
       log.debug(`Stage: ${currentStage}`);
 
-      let currentUrl = page.url();
+      currentUrl = page.url();
       log.debug(`Current URL: ${currentUrl}`);
       log.debug(`Target game URL: ${gameUrl}`);
 
@@ -920,14 +895,10 @@ class PurchaseService {
         log.debug('Not on game page, navigating...');
         await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
         log.debug(`Navigated to: ${page.url()}`);
-        // Brief wait for JavaScript to start (we explicitly wait for interactive elements below)
-        await new Promise(resolve => setTimeout(resolve, 2000));
       } else {
         log.debug('Already on correct game page, refreshing to ensure clean state...');
         await page.reload({ waitUntil: 'load', timeout: 60000 });
         log.debug(`Page refreshed: ${page.url()}`);
-        // Brief wait for JavaScript to start (we explicitly wait for interactive elements below)
-        await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       // Wait for cards with Access Denied retry logic (Akamai WAF rate-limiting)
@@ -945,7 +916,6 @@ class PurchaseService {
             log.warn(`Access Denied detected (attempt ${adRetry + 1}/${MAX_ACCESS_DENIED_RETRIES}). Waiting ${Math.round(backoffDelay / 1000)}s...`);
             await new Promise(resolve => setTimeout(resolve, backoffDelay));
             await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
-            await new Promise(resolve => setTimeout(resolve, 2000));
             continue; // Retry the check
           }
 
@@ -982,6 +952,8 @@ class PurchaseService {
       if (checkCancellation && checkCancellation()) {
         throw new Error('Order cancelled by user');
       }
+
+      await waitIfTwoFactorPaused();
 
       // STAGE 2: Select card
       currentStage = this.STAGES.SELECTING_CARD;
@@ -1055,8 +1027,13 @@ class PurchaseService {
         cardSelected = true;
       }
 
-      // Wait for selection to register and page to update
-      await new Promise(resolve => setTimeout(resolve, 300));
+      // Wait until the selected card radio is actually checked.
+      await page.waitForFunction((index) => {
+        const cardInputs = document.querySelectorAll("input[type='radio'][name='paymentAmountItem']");
+        return !!(cardInputs[index] && cardInputs[index].checked);
+      }, { timeout: 1500 }, cardIndex).catch(() => {
+        // Non-fatal: selection was already attempted with multiple methods.
+      });
 
       log.success(`Card ${cardIndex} selected successfully`);
 
@@ -1064,6 +1041,8 @@ class PurchaseService {
       if (checkCancellation && checkCancellation()) {
         throw new Error('Order cancelled by user');
       }
+
+      await waitIfTwoFactorPaused();
 
       // STAGE 3: Select payment method
       currentStage = this.STAGES.SELECTING_PAYMENT;
@@ -1074,9 +1053,6 @@ class PurchaseService {
         visible: true,
         timeout: 6000
       });
-
-      // Additional wait to ensure payment section is fully interactive
-      await new Promise(resolve => setTimeout(resolve, 200));
 
       // Select Razer Gold as payment method
       log.purchase('Selecting Razer Gold payment...');
@@ -1094,9 +1070,6 @@ class PurchaseService {
           paymentSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
       });
-
-      // Wait after scroll
-      await new Promise(resolve => setTimeout(resolve, 300));
 
       log.debug('Looking for Razer Gold payment method...');
 
@@ -1211,15 +1184,12 @@ class PurchaseService {
 
       log.success('✅ Razer Gold payment method selected successfully');
 
-      // Wait for selection to register
-      await new Promise(resolve => setTimeout(resolve, 100));
-
-      log.success('Razer Gold payment method selected successfully');
-
       // Check cancellation
       if (checkCancellation && checkCancellation()) {
         throw new Error('Order cancelled by user');
       }
+
+      await waitIfTwoFactorPaused();
 
       // STAGE 4: Click checkout
       currentStage = this.STAGES.CLICKING_CHECKOUT;
@@ -1282,9 +1252,6 @@ class PurchaseService {
         log.debug('Navigation timeout - will check URL...');
       });
 
-      // Wait for any redirects to complete
-      await new Promise(resolve => setTimeout(resolve, 500));
-
       // Check URL after checkout
       const urlAfterCheckout = await page.url();
       log.debug('URL after checkout:', urlAfterCheckout);
@@ -1296,7 +1263,7 @@ class PurchaseService {
       }
 
       // Check for unexpected redirects
-      if (!urlAfterCheckout.includes(gameUrl) && !urlAfterCheckout.includes('/gold/purchase/')) {
+      if (!isSameCatalogPage(urlAfterCheckout) && !urlAfterCheckout.includes('/gold/purchase/')) {
         log.error(`Unexpected URL after checkout: ${urlAfterCheckout}`);
         throw new Error(`Unexpected redirect to: ${urlAfterCheckout}. Order processing cancelled.`);
       }
@@ -1308,9 +1275,15 @@ class PurchaseService {
         throw new Error('Order cancelled by user');
       }
 
+      await waitIfTwoFactorPaused();
+      } else {
+        log.debug('Resume mode active - continuing from already-open checkout/2FA state');
+      }
+
       // STAGE 5: Process 2FA or direct transaction
       currentStage = this.STAGES.PROCESSING_2FA;
       log.debug(`Stage: ${currentStage}`);
+      postCheckoutResolutionActive = true;
 
       // OPTIMIZATION: Quick pre-check if already on transaction page (instant, no wait)
       let quickCheck = page.url();
@@ -1324,31 +1297,62 @@ class PurchaseService {
         // Wait for either 2FA modal OR direct transaction page (two scenarios)
         log.debug('Checking if 2FA is required or direct processing...');
 
-        const checkoutResult = await Promise.race([
-          // Scenario 1: 2FA modal appears (requires backup code)
-          // Detection: Bootstrap adds .show class + style="display: block;" when modal is visible
-          // The #purchaseOtpModal element ALWAYS exists in the DOM (even before checkout) but is hidden.
-          // When 2FA is required, Bootstrap adds the 'show' class and an iframe appears inside it.
-          page.waitForFunction(() => {
-            const modal = document.querySelector('#purchaseOtpModal');
-            if (!modal) return false;
-            // Check for Bootstrap's .show class (definitive indicator) AND display:block
-            const hasShowClass = modal.classList.contains('show');
-            const style = window.getComputedStyle(modal);
-            const isDisplayed = style.display !== 'none';
-            return hasShowClass && isDisplayed;
-          }, { polling: 'mutation', timeout: 4000 }).then(() => ({ type: '2fa' })).catch(() => null),
+        const waitForCheckoutOutcome = async (timeoutMs = 25000) => {
+          const startedAt = Date.now();
 
-          // Scenario 2: Direct redirect to transaction page (no 2FA) - FASTER polling for common case!
-          page.waitForFunction(() => {
-            return window.location.href.includes('/transaction/');
-          }, { polling: 100, timeout: 4000 }).then(() => ({ type: 'direct' })).catch(() => null),
+          while (Date.now() - startedAt < timeoutMs) {
+            await waitIfTwoFactorPaused();
 
-          // Scenario 3: Redirect to reload page (insufficient balance)
-          page.waitForFunction(() => {
-            return window.location.href.includes('/gold/reload');
-          }, { polling: 100, timeout: 4000 }).then(() => ({ type: 'reload' })).catch(() => null)
-        ]).then(result => result || { type: 'unknown' });
+            const state = await page.evaluate(() => {
+              const href = window.location.href;
+              const modal = document.querySelector('#purchaseOtpModal');
+              const body = document.body;
+
+              let modalVisible = false;
+              if (modal) {
+                const style = window.getComputedStyle(modal);
+                const hasShowClass = modal.classList.contains('show');
+                const hasFadeClass = modal.classList.contains('fade');
+                const isDisplayed = style.display !== 'none' && style.visibility !== 'hidden' && modal.getBoundingClientRect().height > 0;
+                const bodyModalOpen = !!body && body.classList.contains('modal-open');
+                const iframe = modal.querySelector("iframe[id^='otp-iframe-']");
+                const iframeVisible = !!iframe && iframe.getBoundingClientRect().height > 0;
+
+                // Accept multiple valid visibility signatures to avoid false negatives.
+                modalVisible = isDisplayed && (
+                  hasShowClass ||
+                  (hasFadeClass && bodyModalOpen) ||
+                  iframeVisible
+                );
+              }
+
+              return {
+                href,
+                modalVisible,
+                hasTransaction: href.includes('/transaction/'),
+                hasReload: href.includes('/gold/reload')
+              };
+            });
+
+            if (state.modalVisible) {
+              return { type: '2fa' };
+            }
+
+            if (state.hasReload) {
+              return { type: 'reload' };
+            }
+
+            if (state.hasTransaction) {
+              return { type: 'direct' };
+            }
+
+            await this.sleep(200);
+          }
+
+          return { type: 'unknown' };
+        };
+
+        const checkoutResult = await waitForCheckoutOutcome(25000);
 
         // Handle reload page redirect
         if (checkoutResult.type === 'reload') {
@@ -1363,11 +1367,25 @@ class PurchaseService {
         }
         // Handle 2FA flow  
         else if (checkoutResult.type === '2fa') {
-          // CHECK: If no backup code available, session has expired (~15 min limit)
-          // This browser must close - another browser may pick up the remaining cards
+          if (shouldDeferTwoFactor && await shouldDeferTwoFactor()) {
+            log.warn('2FA detected but another page owns active verification; deferring this page until restart queue');
+            throw new TwoFactorRestartRequiredError('2FA detected while another page handles verification; defer and retry after restart');
+          }
+
+          let twoFactorPauseActive = false;
+          let shouldReleaseTwoFactorPause = true;
+          if (onTwoFactorStart) {
+            await onTwoFactorStart();
+            twoFactorPauseActive = true;
+          }
+
+          try {
+          // On first pass workers intentionally call completePurchase without a backup code.
+          // Signal caller to fetch/lock a shared code instead of mislabeling as session expiry.
           if (!backupCode) {
-            log.warn('2FA requested but no backup code available - session expired');
-            throw new BackupCodeExpiredError('2FA verification requested again but no backup code available. Session expired (~15 min limit). This browser will close.');
+            log.warn('2FA modal is visible and this checkout now requires a backup code from the shared pool');
+            shouldReleaseTwoFactorPause = false;
+            throw new TwoFactorVerificationRequiredError('2FA verification required for this checkout');
           }
 
           log.debug('2FA modal detected - processing backup code...');
@@ -1384,8 +1402,30 @@ class PurchaseService {
           // Step 3: Click "Choose another method" inside iframe
           // This button appears on the initial "Two-Step Verification" page inside the iframe
           log.debug('Clicking choose another method...');
-          const chooseAnother = await frame.waitForSelector("button[class*='arrowed']", { visible: true, timeout: 20000 });
-          await chooseAnother.click();
+          await frame.waitForFunction(() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            return buttons.some(btn => {
+              const t = (btn.textContent || '').toLowerCase();
+              return t.includes('choose another') || t.includes('different method') || t.includes('another method');
+            });
+          }, { timeout: 20000, polling: 200 });
+
+          const chooseAnotherClicked = await frame.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const target = buttons.find(btn => {
+              const t = (btn.textContent || '').toLowerCase();
+              return t.includes('choose another') || t.includes('different method') || t.includes('another method');
+            });
+            if (target) {
+              target.click();
+              return true;
+            }
+            return false;
+          });
+
+          if (!chooseAnotherClicked) {
+            throw new Error('Could not click "Choose another method" in OTP iframe');
+          }
 
           // Step 4: Wait for the "choose method" options to appear inside the iframe
           // After clicking "choose another method", the iframe content changes to show
@@ -1402,12 +1442,27 @@ class PurchaseService {
           // Step 5: Wait for and click "Backup Codes" button
           // The alt-menu contains buttons for different auth methods. Backup Codes is the second option (index 1).
           log.debug('Selecting backup code option...');
-          await frame.waitForSelector("ul[class*='alt-menu'] button", { visible: true, timeout: 8000 });
-          const backupButton = await frame.$$("ul[class*='alt-menu'] button");
-          if (!backupButton || backupButton.length < 2) {
-            throw new Error('Could not find backup code option in auth method list');
+          await frame.waitForFunction(() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            return buttons.some(btn => {
+              const t = (btn.textContent || '').toLowerCase();
+              return t.includes('backup code');
+            });
+          }, { timeout: 10000, polling: 200 });
+
+          const backupClicked = await frame.evaluate(() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const target = buttons.find(btn => (btn.textContent || '').toLowerCase().includes('backup code'));
+            if (target) {
+              target.click();
+              return true;
+            }
+            return false;
+          });
+
+          if (!backupClicked) {
+            throw new Error('Could not find/click backup code option in auth method list');
           }
-          await backupButton[1].click();
 
           // Step 6: Enter backup code (8 digits)
           log.debug('Entering backup code...');
@@ -1426,15 +1481,51 @@ class PurchaseService {
 
           if (!otpFrame) throw new Error('❌ Could not access OTP iframe for backup code entry');
 
-          // Wait for the first OTP input to be ready, then type all 8 digits
-          await otpFrame.waitForSelector('#otp-input-0', { visible: true, timeout: 8000 });
+          // Support both segmented OTP inputs and a single backup-code input.
+          const entryMode = await otpFrame.waitForFunction(() => {
+            if (document.querySelector('#otp-input-0')) return 'segmented';
+            const single = document.querySelector("input[type='text'], input[type='tel'], input[type='number']");
+            return single ? 'single' : null;
+          }, { visible: true, timeout: 10000 }).then(handle => handle.jsonValue());
 
-          for (let i = 0; i < 8; i++) {
-            const inputSelector = `#otp-input-${i}`;
-            await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 5000 });
-            await otpFrame.type(inputSelector, backupCode[i]);
-            // Small delay between digits to avoid input race conditions
-            await new Promise(resolve => setTimeout(resolve, 50));
+          if (entryMode === 'segmented') {
+            // Fast path: fill all segmented fields in one DOM pass and dispatch events.
+            const filledCount = await otpFrame.evaluate((code) => {
+              let count = 0;
+              for (let i = 0; i < 8; i++) {
+                const el = document.querySelector(`#otp-input-${i}`);
+                if (!el) continue;
+                el.focus();
+                el.value = code[i] || '';
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                if (String(el.value || '').trim().length === 1) {
+                  count++;
+                }
+              }
+              return count;
+            }, backupCode);
+
+            if (filledCount !== 8) {
+              // Fallback: char-by-char typing with very small delay.
+              for (let i = 0; i < 8; i++) {
+                const inputSelector = `#otp-input-${i}`;
+                await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 3000 });
+                await otpFrame.click(inputSelector, { clickCount: 3 });
+                await otpFrame.type(inputSelector, backupCode[i], { delay: 1 });
+              }
+            }
+          } else {
+            await otpFrame.evaluate((code) => {
+              const input = document.querySelector("input[type='text'], input[type='tel'], input[type='number']");
+              if (!input) throw new Error('Backup code input field not found');
+              input.focus();
+              input.value = '';
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.value = code;
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+            }, backupCode);
           }
 
           // Mark the backup code as used now that it has been physically typed into the input
@@ -1476,28 +1567,34 @@ class PurchaseService {
             if (errorCheckErr.name === 'TimeoutError') {
               log.success('No error alert detected - waiting for navigation...');
 
-              // Now wait for navigation (give it up to 45 seconds for slow networks)
+              // Now wait for navigation (allow a longer window for slow payment confirmation redirects)
               try {
                 await page.waitForFunction(
-                  (gameUrl) => {
+                  (targetSlug) => {
                     const currentUrl = window.location.href;
-                    // Success: Navigated away from game page
-                    return !currentUrl.includes(gameUrl);
+                    const stillOnCatalog = targetSlug
+                      ? currentUrl.includes(`/gold/catalog/${targetSlug}`)
+                      : false;
+                    // Success: left catalog page OR reached known post-checkout URL.
+                    return currentUrl.includes('/transaction/') || currentUrl.includes('/gold/reload') || !stillOnCatalog;
                   },
-                  { timeout: 60000, polling: 300 },
-                  gameUrl
+                  { timeout: 90000, polling: 300 },
+                  targetGameId
                 );
 
                 log.success('Navigation detected - backup code accepted');
               } catch (navErr) {
-                // Navigation timeout - check where we are
-                log.debug('Navigation timeout - checking current URL...');
+                // Navigation wait ended or failed - check where we are before deciding backup code is invalid.
+                const waitReason = navErr && navErr.name === 'TimeoutError'
+                  ? 'Navigation timeout'
+                  : `Navigation check interrupted (${navErr && navErr.message ? navErr.message : 'unknown'})`;
+                log.debug(`${waitReason} - checking current URL...`);
                 const currentUrl = page.url();
 
                 if (currentUrl.includes('/transaction/')) {
                   log.success('Already on transaction page - backup code accepted');
-                } else if (currentUrl.includes(gameUrl)) {
-                  log.error('Still on game page after 45 seconds - backup code likely invalid');
+                } else if (isSameCatalogPage(currentUrl)) {
+                  log.error('Still on game page after 90 seconds - backup code likely invalid');
                   throw new InvalidBackupCodeError('The backup code validation timed out. The code may be incorrect or expired. Please enter another valid backup code.');
                 } else {
                   log.info('Navigated to unknown page - continuing...');
@@ -1508,17 +1605,24 @@ class PurchaseService {
               throw errorCheckErr;
             }
           }
+          } finally {
+            if (twoFactorPauseActive && shouldReleaseTwoFactorPause && onTwoFactorEnd) {
+              await onTwoFactorEnd();
+            }
+          }
         }
         else {
           // Unknown state - check current URL
           log.warn('Unknown state after checkout, checking current URL...');
           const currentCheckUrl = page.url();
 
-          if (!currentCheckUrl.includes('/transaction/') && !currentCheckUrl.includes(gameUrl)) {
+          if (!currentCheckUrl.includes('/transaction/') && !isSameCatalogPage(currentCheckUrl)) {
             throw new Error(`Unexpected state after checkout. URL: ${currentCheckUrl}`);
           }
         }
       }
+
+      postCheckoutResolutionActive = false;
 
       // Navigation successful - check where we landed
       log.success('Proceeding to check transaction result');
@@ -1716,7 +1820,9 @@ class PurchaseService {
 
     } catch (err) {
       // Log cancellations as info, other errors as error
-      if (err.message && err.message.includes('cancelled by user')) {
+      if (err instanceof TwoFactorVerificationRequiredError) {
+        log.debug(`2FA step requires shared backup code handoff at stage: ${currentStage}`);
+      } else if (err.message && err.message.includes('cancelled by user')) {
         log.info(`Purchase cancelled at stage: ${currentStage}`);
       } else {
         log.error(`Purchase failed at stage: ${currentStage}`);
@@ -1735,14 +1841,8 @@ class PurchaseService {
   }
 
   /**
-   * Process bulk purchases using parallel browsers (up to 10 simultaneous)
-   * NEW LOGIC: 1 backup code per browser, each browser session lasts ~15 minutes
-   * - Pre-validates at least 1 backup code exists
-   * - Distributes 1 code per browser upfront
-   * - First purchase per browser triggers 2FA (uses assigned code)
-   * - Subsequent purchases skip 2FA (session active ~15 min)
-   * - If 2FA requested again = session expired → close browser
-   * - If ALL browsers expired and order not complete → stop, return partial
+   * Process bulk purchases using one persistent browser with parallel pages.
+    * Backup codes are shared and consumed only when the active worker hits 2FA.
    */
   async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, onProgress, onCardCompleted, checkCancellation }) {
     const db = require('./DatabaseService');
@@ -1754,30 +1854,32 @@ class PurchaseService {
     }
     logger.purchase(`Using credentials for user ${telegramUserId}: ${credentials.email}`);
 
-    // Make sure ready pool exists for instant purchase start.
-    await this.ensureReadyBrowsers(telegramUserId, { forceRestart: false });
+    // Reuse only the already prepared persistent browser from /start.
+    // Do not auto-create a new browser during purchase.
+    const readySession = this.getReadySessions(telegramUserId)[0];
+    if (!readySession) {
+      throw new Error('No ready browser session found. Use /start first to open and login your persistent browser.');
+    }
 
-    // ===== STEP 1: VALIDATE & DISTRIBUTE BACKUP CODES =====
+    const browser = readySession.browser;
+    const readyPage = readySession.page;
+
+    if (!browser || !browser.isConnected() || !readyPage || readyPage.isClosed()) {
+      throw new Error('Ready browser session is not active. Please run /start to re-open your logged-in browser.');
+    }
+
+    // CRITICAL: all worker pages must be created from the same logged-in browser context.
+    const readyContext = readyPage.browserContext();
+
+    // ===== STEP 1: VALIDATE BACKUP CODES =====
     const allBackupCodes = await db.getAllActiveBackupCodes(telegramUserId);
 
     if (allBackupCodes.length === 0) {
       throw new Error('❌ No active backup codes available. Please add backup codes using /setbackupcodes before purchasing.');
     }
 
-    // NOTE: No need to check allBackupCodes.length >= quantity
-    // Each backup code gives a ~15 min browser session that can process many purchases.
-    // Even 1 backup code can handle dozens of cards sequentially.
-
-    // Configuration
-    const MAX_BROWSERS = this.MAX_READY_BROWSERS;
-
-    // Determine browser count: 1 code per browser, capped by the ready pool size
-    const browserCount = Math.min(quantity, MAX_BROWSERS, allBackupCodes.length);
-
-    // Distribute 1 backup code per browser (first N codes)
-    const browserBackupCodes = allBackupCodes.slice(0, browserCount);
-
-    logger.purchase(`Distributed ${browserCount} backup codes to ${browserCount} browsers`);
+    const workerCount = Math.min(quantity, this.MAX_PARALLEL_PAGES);
+    logger.purchase(`Using one browser with ${workerCount} parallel page(s)`);
 
     const sharedState = {
       cardQueue: Array.from({ length: quantity }, (_, i) => i + 1), // [1, 2, 3, ..., quantity]
@@ -1786,17 +1888,69 @@ class PurchaseService {
       failedCount: 0,
       processedCount: 0,
       cancelled: false,
-      browsers: [], // Track all browser instances for forceful cancellation
-      activeBrowserCount: browserCount, // Track how many browsers are still running
-      allBrowsersExpired: false, // Flag when all browsers closed due to expired sessions
-      pendingDbSaves: [] // Track all DB save promises to ensure they complete before exit
+      activeWorkerCount: workerCount,
+      allWorkersStopped: false,
+      pendingDbSaves: [], // Track all DB save promises to ensure they complete before exit
+      twoFactorPause: {
+        active: false,
+        owner: null,
+        activatedAt: 0,
+        releaseSeq: 0
+      }
+    };
+
+    const waitForTwoFactorPauseToClear = async (workerLabel) => {
+      let loggedWait = false;
+      while (
+        sharedState.twoFactorPause.active
+        && sharedState.twoFactorPause.owner !== workerLabel
+        && !sharedState.cancelled
+        && !(checkCancellation && checkCancellation())
+      ) {
+        if (!loggedWait) {
+          logger.warn(`${workerLabel} Pausing because ${sharedState.twoFactorPause.owner} is completing 2FA verification...`);
+          loggedWait = true;
+        }
+
+        const cancelled = await this.sleepCancellable(350, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
+        if (cancelled) {
+          sharedState.cancelled = true;
+          return false;
+        }
+      }
+
+      if (loggedWait) {
+        logger.success(`${workerLabel} 2FA pause released. Resuming purchase flow.`);
+      }
+
+      return true;
+    };
+
+    const startTwoFactorPause = async (workerLabel) => {
+      if (!sharedState.twoFactorPause.active) {
+        sharedState.twoFactorPause.active = true;
+        sharedState.twoFactorPause.owner = workerLabel;
+        sharedState.twoFactorPause.activatedAt = Date.now();
+        logger.warn(`${workerLabel} detected 2FA modal. Temporarily pausing other worker pages...`);
+      }
+    };
+
+    const endTwoFactorPause = async (workerLabel) => {
+      if (sharedState.twoFactorPause.active && sharedState.twoFactorPause.owner === workerLabel) {
+        const heldMs = Date.now() - sharedState.twoFactorPause.activatedAt;
+        sharedState.twoFactorPause.active = false;
+        sharedState.twoFactorPause.owner = null;
+        sharedState.twoFactorPause.activatedAt = 0;
+        sharedState.twoFactorPause.releaseSeq += 1;
+        logger.success(`${workerLabel} finished 2FA flow. Restarting worker pages to sync cookies before continuing (${heldMs}ms pause).`);
+      }
     };
 
     /**
      * Guaranteed DB save wrapper - tracks the promise so it completes even during shutdown
      * @param {Object} result - Purchase result
      * @param {number} cardNum - Card number
-     * @param {string} lbl - Browser label for logging
+     * @param {string} lbl - Worker label for logging
      */
     const trackedCardSave = async (result, cardNum, lbl) => {
       if (!onCardCompleted) return;
@@ -1814,118 +1968,178 @@ class PurchaseService {
 
     logger.purchase(`\n${'='.repeat(60)}`);
     logger.purchase(`Starting PARALLEL bulk purchase: ${quantity} x ${cardName}`);
-    logger.purchase(`Using ${browserCount} browsers with 1 backup code each`);
-    logger.purchase(`Each backup code session lasts ~15 minutes`);
+    logger.purchase(`One browser session shared by ${workerCount} parallel page(s)`);
+    logger.purchase(`Backup codes will be consumed only when 2FA appears`);
     logger.purchase(`${'='.repeat(60)}\n`);
 
-    /**
-     * Launch a fallback logged-in browser with shared retry/login logic.
-     */
-    const launchBrowserWithRetry = async (label) => {
-      if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-        sharedState.cancelled = true;
-        throw new Error('Purchase cancelled by user');
+    const getNextBackupCode = async () => {
+      const activeCodes = await db.getAllActiveBackupCodes(telegramUserId);
+      return activeCodes[0] || null;
+    };
+
+    const syncReadySessionCookies = async (page) => {
+      const cookies = await readyPage.cookies();
+      if (cookies && cookies.length > 0) {
+        await page.setCookie(...cookies);
+      }
+    };
+
+    const initializeWorkerPage = async (page, isPrimaryReadyPage) => {
+      await setupPage(page);
+      await page.setDefaultTimeout(45000);
+      await page.setDefaultNavigationTimeout(60000);
+
+      if (!isPrimaryReadyPage) {
+        // Safety net: mirror ready-page auth cookies into worker tabs.
+        await syncReadySessionCookies(page);
       }
 
-      const session = await this.launchReadyBrowserWithRetry(telegramUserId, credentials, label, {
-        keepPoolAtMaxOnDisconnect: false,
-        headless: false,
-        logPrefix: label
+      await withRetry(async () => {
+        await page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        if (await isBanned(page)) throw new Error('rate limited');
       });
 
-      return { browser: session.browser, page: session.page };
+      const sessionValid = await browserManager.checkSessionValid(page);
+      if (!sessionValid) {
+        throw new Error('Worker page is not authenticated with the ready browser session');
+      }
+
+      if (!isPrimaryReadyPage) {
+        this.trackPurchasePage(telegramUserId, page);
+      }
     };
 
     /**
-     * Single browser session - processes cards from queue using ONE backup code
-     * The backup code is used ONCE at the first 2FA prompt.
-     * After that, the session stays active for ~15 minutes.
-     * If 2FA is requested again, session expired → close browser.
+     * Open one worker page and process cards from the shared queue.
      */
     const runPurchaseSession = async (sessionIndex) => {
-      const label = `[Browser ${sessionIndex + 1}]`;
-      const assignedCode = browserBackupCodes[sessionIndex].code;
-      let browser = null;
+      const label = `[Page ${sessionIndex + 1}]`;
+      const isPrimaryReadyPage = sessionIndex === 0;
       let page = null;
-      let usingReadySession = false;
-      let isFirstPurchase = true;
       let cardsProcessed = 0;
+      let lastSeenTwoFactorReleaseSeq = 0;
+
+      const restartWorkerAfterTwoFactorIfNeeded = async () => {
+        const releaseSeq = sharedState.twoFactorPause.releaseSeq || 0;
+        if (releaseSeq <= lastSeenTwoFactorReleaseSeq) {
+          return true;
+        }
+
+        const restartDelay = sessionIndex === 0
+          ? 0
+          : this.getStaggerDelay(
+            sessionIndex - 1,
+            this.TWO_FACTOR_RESTART_STAGGER_MS,
+            this.TWO_FACTOR_RESTART_JITTER_MS
+          );
+
+        if (restartDelay > 0) {
+          logger.debug(`${label} Delaying post-2FA restart by ${restartDelay}ms to reduce rate-limit risk...`);
+          const cancelledDuringDelay = await this.sleepCancellable(
+            restartDelay,
+            () => sharedState.cancelled || (checkCancellation && checkCancellation())
+          );
+          if (cancelledDuringDelay) {
+            sharedState.cancelled = true;
+            return false;
+          }
+        }
+
+        logger.info(`${label} Restarting page after 2FA to refresh session cookies...`);
+
+        try {
+          await setupPage(page);
+
+          if (!isPrimaryReadyPage) {
+            await syncReadySessionCookies(page);
+          }
+
+          await withRetry(async () => {
+            await page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            if (await isBanned(page)) throw new Error('rate limited');
+          });
+
+          const sessionValid = await browserManager.checkSessionValid(page);
+          if (!sessionValid) {
+            throw new Error('session invalid after 2FA restart');
+          }
+
+          lastSeenTwoFactorReleaseSeq = releaseSeq;
+          logger.success(`${label} Restart complete after 2FA. Continuing purchase flow.`);
+          return true;
+        } catch (restartErr) {
+          logger.error(`${label} Failed to restart after 2FA: ${restartErr.message}`);
+          if (isPrimaryReadyPage) {
+            sharedState.cancelled = true;
+          }
+          return false;
+        }
+      };
 
       try {
-        // Check cancellation before launching
         if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
           sharedState.cancelled = true;
           logger.info(`${label} Order already cancelled - skipping`);
           return;
         }
 
-        const availableReadySessions = this.getReadySessions(telegramUserId);
-        const readySession = availableReadySessions[sessionIndex] || null;
-
-        // Step 1: Use pre-warmed browser if available, otherwise launch fallback browser.
-        if (readySession) {
-          browser = readySession.browser;
-          page = readySession.page;
-          usingReadySession = true;
-          logger.debug(`${label} Using pre-warmed ready browser`);
+        if (isPrimaryReadyPage) {
+          page = readyPage;
+          await initializeWorkerPage(page, true);
+          logger.purchase(`${label} Using logged-in ready page.`);
         } else {
-          const launchResult = await launchBrowserWithRetry(label);
-          browser = launchResult.browser;
-          page = launchResult.page;
-          logger.warn(`${label} Ready browser unavailable, launched fallback browser`);
+          page = await readyContext.newPage();
+          await initializeWorkerPage(page, false);
+          logger.purchase(`${label} Worker page ready in logged-in context.`);
         }
 
-        // Register only fallback browsers for forced cancellation tracking.
-        if (!usingReadySession) {
-          sharedState.browsers.push(browser);
-          if (!this.activeBrowsers.has(telegramUserId)) {
-            this.activeBrowsers.set(telegramUserId, []);
-          }
-          this.activeBrowsers.get(telegramUserId).push(browser);
-        }
-
-        logger.purchase(`${label} Ready with backup code. Session will last ~15 minutes after first purchase.`);
-
-        // Step 3: Process cards from queue
         while (true) {
-          // Check cancellation
           if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
             sharedState.cancelled = true;
             logger.info(`${label} Order cancelled - stopping`);
             break;
           }
 
-          // Check if browser is still alive
-          let browserDead = false;
+          const canContinue = await waitForTwoFactorPauseToClear(label);
+          if (!canContinue) {
+            break;
+          }
+
+          if (!(await restartWorkerAfterTwoFactorIfNeeded())) {
+            break;
+          }
+
+          let pageDead = false;
           try {
             if (!browser || !browser.isConnected() || !page || page.isClosed()) {
-              browserDead = true;
+              pageDead = true;
             } else {
               await page.evaluate(() => true); // Quick responsiveness check
             }
           } catch (aliveErr) {
-            browserDead = true;
+            pageDead = true;
           }
 
-          if (browserDead) {
-            logger.warn(`${label} Browser crashed - relaunching and logging in again...`);
+          if (pageDead) {
+            if (isPrimaryReadyPage) {
+              logger.error(`${label} Ready page is closed/disconnected. Stop purchase and run /start to login again.`);
+              sharedState.cancelled = true;
+              break;
+            }
+
+            logger.warn(`${label} Worker page crashed/closed - recreating from logged-in context...`);
             try {
-              if (browser) { try { await browser.close(); } catch (e) { } }
-              const relaunchResult = await launchBrowserWithRetry(label);
-              browser = relaunchResult.browser;
-              page = relaunchResult.page;
-              usingReadySession = false;
-
-              sharedState.browsers.push(browser);
-              if (!this.activeBrowsers.has(telegramUserId)) {
-                this.activeBrowsers.set(telegramUserId, []);
+              if (page && !page.isClosed()) {
+                await page.close().catch(() => { });
               }
-              this.activeBrowsers.get(telegramUserId).push(browser);
+              this.untrackPurchasePage(telegramUserId, page);
 
-              logger.success(`${label} Browser relaunched successfully`);
+              page = await readyContext.newPage();
+              await initializeWorkerPage(page, false);
+              logger.success(`${label} Worker page recreated`);
               continue;
-            } catch (relaunchErr) {
-              logger.error(`${label} Failed to relaunch browser: ${relaunchErr.message}`);
+            } catch (pageErr) {
+              logger.error(`${label} Failed to recreate worker page: ${pageErr.message}`);
               break;
             }
           }
@@ -1937,41 +2151,116 @@ class PurchaseService {
             break;
           }
 
-          // Add tiny per-browser stagger before each purchase cycle to avoid synchronized spikes.
+          const canStartCard = await waitForTwoFactorPauseToClear(label);
+          if (!canStartCard) {
+            sharedState.cardQueue.unshift(cardNumber);
+            break;
+          }
+
+          if (!(await restartWorkerAfterTwoFactorIfNeeded())) {
+            sharedState.cardQueue.unshift(cardNumber);
+            break;
+          }
+
+          // Add tiny per-page stagger before each purchase cycle to avoid synchronized spikes.
           const perCardStagger = this.getStaggerDelay(
             sessionIndex,
             this.PURCHASE_CARD_STAGGER_MS,
             this.PURCHASE_CARD_JITTER_MS
           );
           if (perCardStagger > 0) {
-            await this.sleep(perCardStagger);
+            const cancelled = await this.sleepCancellable(perCardStagger, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
+            if (cancelled) {
+              sharedState.cancelled = true;
+              break;
+            }
           }
 
           logger.purchase(`${label} Processing card ${cardNumber}/${quantity}...`);
 
           try {
-            // Complete the purchase
-            // First purchase: pass backup code for 2FA
-            // Subsequent purchases: pass null (no 2FA expected, session active)
-            const result = await this.completePurchase({
-              telegramUserId,
-              page,
-              gameUrl,
-              cardIndex,
-              backupCode: isFirstPurchase ? assignedCode : null,
-              backupCodeId: isFirstPurchase ? browserBackupCodes[sessionIndex].id : null,
-              checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-              cardNumber,
-              gameName,
-              cardName,
-              label
-            });
+            const runPurchase = async (backupCodeRecord = null) => {
+              return this.completePurchase({
+                telegramUserId,
+                page,
+                gameUrl,
+                cardIndex,
+                backupCode: backupCodeRecord ? backupCodeRecord.code : null,
+                backupCodeId: backupCodeRecord ? backupCodeRecord.id : null,
+                checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                cardNumber,
+                gameName,
+                cardName,
+                label,
+                onTwoFactorStart: async () => startTwoFactorPause(label),
+                onTwoFactorEnd: async () => endTwoFactorPause(label),
+                waitForTwoFactorPause: async () => waitForTwoFactorPauseToClear(label),
+                shouldDeferTwoFactor: async () => (
+                  sharedState.twoFactorPause.active
+                  && sharedState.twoFactorPause.owner
+                  && sharedState.twoFactorPause.owner !== label
+                )
+              });
+            };
 
-            // First purchase done successfully - backup code session now active!
-            if (isFirstPurchase) {
-              isFirstPurchase = false;
-              logger.success(`${label} ✅ Backup code accepted! Session active for ~15 minutes.`);
+            let result;
+            try {
+              result = await runPurchase(null);
+            } catch (err) {
+              if (!(err instanceof BackupCodeExpiredError) && !(err instanceof TwoFactorVerificationRequiredError)) {
+                throw err;
+              }
+
+              result = await this.runWithUserLock(telegramUserId, async () => {
+                let needsResumeFromTwoFactor = err instanceof TwoFactorVerificationRequiredError;
+
+                // If first error was not explicit 2FA handoff, give one more pre-2FA attempt under lock.
+                if (!needsResumeFromTwoFactor) {
+                  try {
+                    return await runPurchase(null);
+                  } catch (lockedErr) {
+                    if (!(lockedErr instanceof BackupCodeExpiredError) && !(lockedErr instanceof TwoFactorVerificationRequiredError)) {
+                      throw lockedErr;
+                    }
+                    needsResumeFromTwoFactor = lockedErr instanceof TwoFactorVerificationRequiredError;
+                  }
+                }
+
+                const nextBackupCode = await getNextBackupCode();
+                if (!nextBackupCode) {
+                  throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA. Add more backup codes and retry remaining cards.');
+                }
+
+                logger.warn(`${label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
+                await humanDelay(1000, 2200);
+
+                return this.completePurchase({
+                  telegramUserId,
+                  page,
+                  gameUrl,
+                  cardIndex,
+                  backupCode: nextBackupCode.code,
+                  backupCodeId: nextBackupCode.id,
+                  checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                  cardNumber,
+                  gameName,
+                  cardName,
+                  label,
+                  onTwoFactorStart: async () => startTwoFactorPause(label),
+                  onTwoFactorEnd: async () => endTwoFactorPause(label),
+                  waitForTwoFactorPause: async () => waitForTwoFactorPauseToClear(label),
+                  shouldDeferTwoFactor: async () => (
+                    sharedState.twoFactorPause.active
+                    && sharedState.twoFactorPause.owner
+                    && sharedState.twoFactorPause.owner !== label
+                  ),
+                  resumeFromTwoFactor: needsResumeFromTwoFactor
+                });
+              });
             }
+
+            // Safety release: if this worker owns the 2FA pause gate, unlock it now.
+            await endTwoFactorPause(label);
 
             // Handle result
             sharedState.purchases.push(result);
@@ -2014,7 +2303,6 @@ class PurchaseService {
             const checkoutAlreadyClicked = postCheckoutStages.includes(purchaseErr.stage);
 
             // ===== BACKUP CODE SESSION EXPIRED =====
-            // 2FA was requested again but we have no more codes for this browser
             if (purchaseErr instanceof BackupCodeExpiredError) {
               if (checkoutAlreadyClicked) {
                 // CRITICAL: Checkout was already clicked! Razer may have processed the purchase.
@@ -2041,17 +2329,25 @@ class PurchaseService {
                   try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
                 }
               } else {
-                // Checkout was NOT clicked yet - safe to return card to queue
+                // Checkout was NOT clicked yet - safe to return card to queue for another page.
                 sharedState.cardQueue.unshift(cardNumber);
-                logger.warn(`${label} 🔒 Backup code session expired BEFORE checkout. Card ${cardNumber} returned to queue.`);
+                logger.warn(`${label} 🔒 2FA required BEFORE checkout. Card ${cardNumber} returned to queue.`);
               }
-              logger.warn(`${label} Closing browser (session expired).`);
-              break; // Exit this browser's loop
+              continue;
+            }
+
+            // ===== 2FA DEFERRED TO ACTIVE OWNER =====
+            if (purchaseErr instanceof TwoFactorRestartRequiredError) {
+              // Checkout clicked and 2FA shown, but another page is currently handling verification.
+              // Re-queue this card and retry after owner finishes + restart queue sync.
+              sharedState.cardQueue.unshift(cardNumber);
+              logger.info(`${label} Deferred 2FA to active owner page. Card ${cardNumber} re-queued for retry after restart.`);
+              continue;
             }
 
             // ===== INSUFFICIENT BALANCE =====
             if (purchaseErr instanceof InsufficientBalanceError) {
-              logger.error(`${label} 💰 Insufficient balance - stopping ALL browsers`);
+              logger.error(`${label} 💰 Insufficient balance - stopping all pages`);
               sharedState.cancelled = true;
               sharedState.failedCount++;
               sharedState.processedCount++;
@@ -2100,7 +2396,7 @@ class PurchaseService {
                 sharedState.cardQueue.unshift(cardNumber);
                 logger.error(`${label} ❌ Invalid backup code BEFORE checkout. Card ${cardNumber} returned to queue.`);
               }
-              break;
+              continue;
             }
 
             // ===== CANCELLED BY USER =====
@@ -2186,114 +2482,67 @@ class PurchaseService {
             if (onProgress) {
               try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
             }
-
-            // Check if browser is still alive after error
-            let browserCrashed = false;
-            try {
-              if (!browser.isConnected() || page.isClosed()) {
-                browserCrashed = true;
-              }
-            } catch (checkErr) {
-              browserCrashed = true;
-            }
-
-            if (browserCrashed) {
-              logger.warn(`${label} Browser crashed during purchase - relaunching...`);
-              try {
-                if (browser) { try { await browser.close(); } catch (e) { } }
-                const relaunchResult = await launchBrowserWithRetry(label);
-                browser = relaunchResult.browser;
-                page = relaunchResult.page;
-                usingReadySession = false;
-
-                sharedState.browsers.push(browser);
-                if (!this.activeBrowsers.has(telegramUserId)) {
-                  this.activeBrowsers.set(telegramUserId, []);
-                }
-                this.activeBrowsers.get(telegramUserId).push(browser);
-
-                logger.success(`${label} Browser relaunched successfully`);
-                continue;
-              } catch (relaunchErr) {
-                logger.error(`${label} Failed to relaunch: ${relaunchErr.message}`);
-                break;
-              }
-            }
-
-            // If first purchase failed but browser is alive, it might be a page-level error
-            // (not a crash). The backup code hasn't been entered yet, so we can retry.
-            if (isFirstPurchase) {
-              logger.warn(`${label} First purchase failed but browser alive - will retry with same backup code`);
-              continue; // Retry, will pick next card and use the same backup code
-            }
           }
         }
 
-        logger.debug(`${label} Session ended - processed ${cardsProcessed} cards`);
+        logger.debug(`${label} Worker ended - processed ${cardsProcessed} cards`);
 
       } catch (err) {
-        logger.error(`${label} Browser session fatal error: ${err.message}`);
+        logger.error(`${label} Worker fatal error: ${err.message}`);
       } finally {
-        // Decrement active browser count
-        sharedState.activeBrowserCount--;
-        logger.debug(`${label} Closed. Active browsers remaining: ${sharedState.activeBrowserCount}`);
+        sharedState.activeWorkerCount--;
+        logger.debug(`${label} Closed. Active workers remaining: ${sharedState.activeWorkerCount}`);
 
-        // Check if all browsers are dead but queue still has items
-        if (sharedState.activeBrowserCount === 0 && sharedState.cardQueue.length > 0 && !sharedState.cancelled) {
-          sharedState.allBrowsersExpired = true;
+        if (sharedState.activeWorkerCount === 0 && sharedState.cardQueue.length > 0 && !sharedState.cancelled) {
+          sharedState.allWorkersStopped = true;
           const remaining = sharedState.cardQueue.length;
-          logger.error(`⚠️ ALL BROWSERS CLOSED! ${remaining} cards remaining in queue.`);
-          logger.error('All backup code sessions have expired (~15 min limit). Cannot complete remaining purchases.');
+          logger.error(`⚠️ ALL WORKERS STOPPED! ${remaining} cards remaining in queue.`);
         }
 
-        // Close only fallback browsers. Keep ready browsers alive for next purchases.
-        if (browser && !usingReadySession) {
+        if (!isPrimaryReadyPage && page) {
           try {
-            const index = sharedState.browsers.indexOf(browser);
-            if (index > -1) sharedState.browsers.splice(index, 1);
-            if (this.activeBrowsers.has(telegramUserId)) {
-              const userBrowsers = this.activeBrowsers.get(telegramUserId);
-              const userIndex = userBrowsers.indexOf(browser);
-              if (userIndex > -1) userBrowsers.splice(userIndex, 1);
-              if (userBrowsers.length === 0) this.activeBrowsers.delete(telegramUserId);
+            this.untrackPurchasePage(telegramUserId, page);
+            if (!page.isClosed()) {
+              await Promise.race([
+                page.close().catch(() => { }),
+                new Promise(resolve => setTimeout(resolve, 3000))
+              ]);
             }
-            await Promise.race([
-              browser.close(),
-              new Promise(resolve => setTimeout(resolve, 5000))
-            ]);
-            logger.debug(`${label} Browser closed`);
+            logger.debug(`${label} Worker page closed`);
           } catch (closeErr) {
-            logger.error(`${label} Error closing browser:`, closeErr.message);
+            logger.error(`${label} Error closing worker page:`, closeErr.message);
           }
-        } else if (usingReadySession) {
-          logger.debug(`${label} Keeping ready browser open for reuse`);
         }
       }
     };
 
     try {
-      // Launch all browser sessions with stagger
+      // Launch all worker pages with stagger
       const sessionPromises = [];
 
-      for (let i = 0; i < browserCount; i++) {
+      for (let i = 0; i < workerCount; i++) {
         if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
           sharedState.cancelled = true;
-          logger.info(`Cancellation detected - skipping browser ${i + 1}/${browserCount}`);
+          logger.info(`Cancellation detected - skipping page ${i + 1}/${workerCount}`);
           break;
         }
-        logger.debug(`Spawning browser ${i + 1}/${browserCount}...`);
+        logger.debug(`Spawning page worker ${i + 1}/${workerCount}...`);
 
         sessionPromises.push(
           (async () => {
-            const launchDelay = this.getStaggerDelay(i, this.PURCHASE_BROWSER_STAGGER_MS, this.PURCHASE_BROWSER_JITTER_MS);
+            const launchDelay = this.getStaggerDelay(i, this.PURCHASE_PAGE_STAGGER_MS, this.PURCHASE_PAGE_JITTER_MS);
             if (launchDelay > 0) {
-              logger.debug(`Delaying browser ${i + 1} purchase start by ${launchDelay}ms`);
-              await this.sleep(launchDelay);
+              logger.debug(`Delaying page ${i + 1} purchase start by ${launchDelay}ms`);
+              const cancelled = await this.sleepCancellable(launchDelay, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
+              if (cancelled) {
+                sharedState.cancelled = true;
+                sharedState.activeWorkerCount--;
+                return;
+              }
             }
             if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
               sharedState.cancelled = true;
-              // Still decrement active count since this browser never started
-              sharedState.activeBrowserCount--;
+              sharedState.activeWorkerCount--;
               return;
             }
             return runPurchaseSession(i);
@@ -2301,19 +2550,18 @@ class PurchaseService {
         );
       }
 
-      logger.success(`All ${browserCount} browsers launched - processing in parallel...`);
+      logger.success(`All ${workerCount} page workers launched - processing in parallel...`);
 
-      // Wait for all browsers to complete
+      // Wait for all workers to complete
       await Promise.all(sessionPromises);
 
       // ===== FINAL SUMMARY =====
       logger.purchase(`\n${'='.repeat(60)}`);
 
-      if (sharedState.allBrowsersExpired) {
+      if (sharedState.allWorkersStopped) {
         const remaining = sharedState.cardQueue.length;
         logger.error(`⚠️ ORDER INCOMPLETE: ${remaining} cards could NOT be purchased`);
-        logger.error('Reason: All backup code sessions expired (~15 min limit)');
-        logger.error('Tip: Purchase fewer cards per order, or ensure faster processing');
+        logger.error('Reason: All page workers stopped before queue finished');
       }
 
       logger.success(`Results: ✅ Success: ${sharedState.successCount} | ❌ Failed: ${sharedState.failedCount} | Total: ${sharedState.processedCount}/${quantity}`);
@@ -2342,57 +2590,59 @@ class PurchaseService {
         }
       }
 
-      // THEN close browsers (after DB saves are done)
-      if (sharedState.browsers && sharedState.browsers.length > 0) {
-        logger.system(`Cleaning up ${sharedState.browsers.length} remaining browsers...`);
-        const closePromises = sharedState.browsers.map(browser => {
-          return Promise.race([
-            browser.close().catch(() => { }),
-            new Promise(resolve => setTimeout(resolve, 2000))
-          ]);
-        });
-        await Promise.all(closePromises);
-        sharedState.browsers = [];
-      }
-
-      // Clean up user browser tracking
-      if (this.activeBrowsers.has(telegramUserId)) {
-        this.activeBrowsers.delete(telegramUserId);
-        logger.debug(`Cleared browser tracking for user ${telegramUserId}`);
+      // Best-effort cleanup for any remaining tracked worker pages.
+      const leftoverPages = this.activePurchasePages.get(telegramUserId) || [];
+      if (leftoverPages.length > 0) {
+        logger.system(`Cleaning up ${leftoverPages.length} remaining purchase page(s)...`);
+        await Promise.all(leftoverPages.map(async (activePage) => {
+          try {
+            if (activePage && !activePage.isClosed()) {
+              await Promise.race([
+                activePage.close().catch(() => { }),
+                new Promise(resolve => setTimeout(resolve, 2000))
+              ]);
+            }
+          } catch (err) {
+            logger.debug(`Failed to close leftover page: ${err.message}`);
+          }
+        }));
+        this.activePurchasePages.delete(telegramUserId);
       }
     }
   }
 
   /**
-   * Forcefully close all active browsers for a user (for cancellation)
+   * Forcefully close all active purchase pages for a user (for cancellation)
    * @param {string} telegramUserId - Telegram user ID
-   * @returns {Promise<number>} Number of browsers closed
+   * @returns {Promise<number>} Number of pages closed
    */
   async forceCloseUserBrowsers(telegramUserId) {
-    const browsers = this.activeBrowsers.get(telegramUserId);
-    if (!browsers || browsers.length === 0) {
-      logger.debug(`No active browsers to close for user ${telegramUserId}`);
+    const pages = this.activePurchasePages.get(telegramUserId);
+    if (!pages || pages.length === 0) {
+      logger.debug(`No active purchase pages to close for user ${telegramUserId}`);
       return 0;
     }
 
-    logger.system(`Force closing ${browsers.length} active browsers for user ${telegramUserId}...`);
+    logger.system(`Force closing ${pages.length} active purchase pages for user ${telegramUserId}...`);
 
-    const closePromises = browsers.map(async (browser) => {
+    const closePromises = pages.map(async (page) => {
       try {
-        await Promise.race([
-          browser.close(),
-          new Promise(resolve => setTimeout(resolve, 2000))
-        ]);
+        if (page && !page.isClosed()) {
+          await Promise.race([
+            page.close(),
+            new Promise(resolve => setTimeout(resolve, 2000))
+          ]);
+        }
       } catch (err) {
-        logger.debug('Error closing browser:', err.message);
+        logger.debug('Error closing purchase page:', err.message);
       }
     });
 
     await Promise.all(closePromises);
-    this.activeBrowsers.delete(telegramUserId);
+    this.activePurchasePages.delete(telegramUserId);
 
-    logger.success(`Closed ${browsers.length} browsers for user ${telegramUserId}`);
-    return browsers.length;
+    logger.success(`Closed ${pages.length} purchase pages for user ${telegramUserId}`);
+    return pages.length;
   }
 
   /**
@@ -2475,9 +2725,6 @@ class PurchaseService {
 
       try {
         await page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        // ANTI-BAN
-        await humanDelay();
-        // ANTI-BAN
         if (await isBanned(page)) throw new Error('rate limited');
       } catch (err) {
         logger.debug(`[Ready ${session.slot}] Could not restore home page after transactions: ${err.message}`);
@@ -2498,19 +2745,63 @@ class PurchaseService {
       { timeout: 45000 }
     );
 
-    // ANTI-BAN
-    await withRetry(async () => {
+    const navigationPromise = withRetry(async () => {
       await page.goto(this.TRANSACTIONS_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await humanDelay();
       if (await isBanned(page)) throw new Error('rate limited');
     });
-    const historyResponse = await historyResponsePromise;
+
+    // Resolve both promises together so waitForResponse cannot reject later as an unhandled promise.
+    const [historyResult, navigationResult] = await Promise.allSettled([
+      historyResponsePromise,
+      navigationPromise
+    ]);
+
+    if (navigationResult.status === 'rejected') {
+      throw navigationResult.reason;
+    }
+
+    if (historyResult.status === 'rejected') {
+      const timeoutLike = historyResult.reason && (
+        historyResult.reason.name === 'TimeoutError'
+        || String(historyResult.reason.message || '').toLowerCase().includes('timed out')
+      );
+
+      if (timeoutLike) {
+        throw new Error('Timed out waiting for transactions history API response. Please retry /transactions.');
+      }
+
+      throw historyResult.reason;
+    }
+
+    const historyResponse = historyResult.value;
 
     if (historyResponse.status() !== 200) {
       throw new Error(`Transactions history request failed with status ${historyResponse.status()}`);
     }
 
-    return historyResponse.json();
+    const requestHeaders = historyResponse.request().headers();
+    const passThroughHeaders = {};
+
+    // ANTI-BAN
+    // Reuse the same auth/context headers used by the successful history request.
+    const allowedHeaderKeys = [
+      'x-razer-accesstoken',
+      'x-razer-fpid',
+      'x-razer-razerid',
+      'authorization',
+      'accept-language'
+    ];
+
+    for (const key of allowedHeaderKeys) {
+      if (requestHeaders[key]) {
+        passThroughHeaders[key] = requestHeaders[key];
+      }
+    }
+
+    return {
+      payload: await historyResponse.json(),
+      apiHeaders: passThroughHeaders
+    };
   }
 
   /**
@@ -2526,7 +2817,6 @@ class PurchaseService {
     // ANTI-BAN
     await withRetry(async () => {
       await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await humanDelay();
       if (await isBanned(page)) throw new Error('rate limited');
     });
     await page.waitForSelector('.transaction-details___info ', { visible: true, timeout: 30000 });
@@ -2591,6 +2881,82 @@ class PurchaseService {
   }
 
   /**
+   * Fetch transaction detail from same-origin API directly.
+   * This avoids opening each transaction detail page and is significantly faster.
+   * @param {Object} page
+   * @param {string} txnNum
+   * @returns {Promise<{pinCode: string, serialNumber: string, productName: string, transactionId: string, status?: string, transactionDate?: string}>}
+   */
+  async fetchTransactionDetailViaApi(page, txnNum, apiHeaders = {}) {
+    // ANTI-BAN
+    await setupPage(page);
+
+    const payload = await withRetry(async () => {
+      const result = await page.evaluate(async ({ transactionNumber, extraHeaders }) => {
+        try {
+          const response = await fetch(`/api/webshopv2/${transactionNumber}`, {
+            method: 'GET',
+            credentials: 'include',
+            headers: {
+              Accept: 'application/json, text/plain, */*',
+              ...extraHeaders
+            }
+          });
+
+          const text = await response.text();
+          let data = null;
+          try {
+            data = JSON.parse(text);
+          } catch (parseErr) {
+            data = null;
+          }
+
+          return {
+            ok: response.ok,
+            statusCode: response.status,
+            data
+          };
+        } catch (err) {
+          return {
+            ok: false,
+            statusCode: 0,
+            error: err && err.message ? err.message : 'fetch failed'
+          };
+        }
+      }, { transactionNumber: txnNum, extraHeaders: apiHeaders });
+
+      if (!result || !result.ok || !result.data) {
+        throw new Error(`Transaction API request failed (${result ? result.statusCode : 'unknown'})`);
+      }
+
+      return result.data;
+    });
+
+    const firstPin = payload
+      && payload.fullfillment
+      && Array.isArray(payload.fullfillment.pins)
+      && payload.fullfillment.pins.length > 0
+      ? payload.fullfillment.pins[0]
+      : null;
+
+    const pinCode = firstPin && firstPin.pinCode1 ? String(firstPin.pinCode1).trim() : '';
+    const serialNumber = firstPin && firstPin.serialNumber1 ? String(firstPin.serialNumber1).trim() : '';
+
+    if (!pinCode) {
+      throw new Error('PIN not found in transaction API response');
+    }
+
+    return {
+      productName: String(payload.description || payload.productName || '').trim(),
+      pinCode,
+      serialNumber,
+      transactionId: String(payload.transactionNumber || txnNum || '').trim(),
+      status: String(payload.status || '').trim(),
+      transactionDate: String(payload.transactionDate || '').trim()
+    };
+  }
+
+  /**
    * Fetch successful webshop transactions for a given date and extract their PINs.
    * Uses the ready browser pool only.
    * @param {string} telegramUserId
@@ -2636,9 +3002,9 @@ class PurchaseService {
 
       await emitProgress({ phase: 'loading_history', processed: 0, total: 0, matched: 0, failures: 0, cancelled: false });
 
-      const historyPayload = await this.fetchTransactionsHistoryPayload(usableSessions[0].page);
-      const allTransactions = Array.isArray(historyPayload && historyPayload.Transactions)
-        ? historyPayload.Transactions
+      const historyResult = await this.fetchTransactionsHistoryPayload(usableSessions[0].page);
+      const allTransactions = Array.isArray(historyResult && historyResult.payload && historyResult.payload.Transactions)
+        ? historyResult.payload.Transactions
         : [];
 
       await emitProgress({
@@ -2667,10 +3033,9 @@ class PurchaseService {
         };
       }
 
-      const transactionQueue = matchedTransactions.map(transaction => ({ ...transaction }));
-      const workerSessions = usableSessions.slice(0, Math.min(usableSessions.length, transactionQueue.length));
-      const totalDetails = transactionQueue.length;
+      const totalDetails = matchedTransactions.length;
       let processedCount = 0;
+      const primarySession = usableSessions[0];
 
       await emitProgress({
         phase: 'fetching',
@@ -2681,75 +3046,60 @@ class PurchaseService {
         cancelled: false
       });
 
-      const workers = workerSessions.map((session, workerIndex) => (async () => {
-        // Stagger worker start once to avoid simultaneous bursts while keeping workers parallel.
-        const workerStartBase = Math.max(1000, Math.floor(this.TRANSACTION_DETAIL_STAGGER_MS * 0.4));
-        const workerStartJitter = Math.max(300, Math.floor(this.TRANSACTION_DETAIL_JITTER_MS * 0.35));
-        const initialDelay = this.getStaggerDelay(workerIndex, workerStartBase, workerStartJitter);
-        if (initialDelay > 0) {
-          const cancelledDuringWorkerDelay = await this.sleepCancellable(initialDelay, checkCancellation);
-          if (cancelledDuringWorkerDelay) {
-            return;
+      for (let i = 0; i < matchedTransactions.length; i++) {
+        if (checkCancellation && checkCancellation()) break;
+
+        const transaction = matchedTransactions[i];
+
+        try {
+          // ANTI-BAN
+          let detail;
+          try {
+            detail = await this.fetchTransactionDetailViaApi(primarySession.page, transaction.txnNum, historyResult.apiHeaders || {});
+          } catch (apiErr) {
+            logger.debug(`API detail fetch fallback for ${transaction.txnNum}: ${apiErr.message}`);
+            detail = await this.fetchTransactionDetail(primarySession.page, transaction.txnNum);
           }
-        }
 
-        while (true) {
-          if (checkCancellation && checkCancellation()) break;
+          const description = this.normalizeTransactionDescription(transaction.description || detail.productName);
 
-          const transaction = transactionQueue.shift();
-          if (!transaction) break;
+          if (!groupedPins.has(description)) {
+            groupedPins.set(description, []);
+          }
 
-          // Delay between actions, but do not multiply by global index (keeps true parallelism).
-          const actionBaseDelay = Math.max(800, Math.floor(this.TRANSACTION_DETAIL_STAGGER_MS * 0.35));
-          const actionJitter = this.TRANSACTION_DETAIL_JITTER_MS;
-          const startDelay = actionBaseDelay + Math.floor(Math.random() * (actionJitter + 1));
-          if (startDelay > 0) {
-            logger.debug(`[Ready ${session.slot}] Delaying transaction ${transaction.txnNum} fetch by ${startDelay}ms`);
-            const cancelledDuringDelay = await this.sleepCancellable(startDelay, checkCancellation);
+          groupedPins.get(description).push({
+            pinCode: detail.pinCode,
+            serialNumber: detail.serialNumber,
+            txnNum: transaction.txnNum,
+            description
+          });
+        } catch (err) {
+          logger.warn(`Failed to fetch transaction detail for ${transaction.txnNum}: ${err.message}`);
+          failures.push({
+            txnNum: transaction.txnNum,
+            description: this.normalizeTransactionDescription(transaction.description),
+            error: err.message
+          });
+        } finally {
+          processedCount += 1;
+          await emitProgress({
+            phase: 'fetching',
+            processed: processedCount,
+            total: totalDetails,
+            matched: matchedTransactions.length,
+            failures: failures.length,
+            cancelled: !!(checkCancellation && checkCancellation())
+          });
+
+          // ANTI-BAN
+          if (i < matchedTransactions.length - 1) {
+            const cancelledDuringDelay = await this.sleepCancellable(this.TRANSACTION_API_RATE_DELAY_MS, checkCancellation);
             if (cancelledDuringDelay) {
               break;
             }
           }
-
-          if (checkCancellation && checkCancellation()) break;
-
-          try {
-            // ANTI-BAN
-            const detail = await queue.add(() => this.fetchTransactionDetail(session.page, transaction.txnNum));
-            const description = this.normalizeTransactionDescription(transaction.description || detail.productName);
-
-            if (!groupedPins.has(description)) {
-              groupedPins.set(description, []);
-            }
-
-            groupedPins.get(description).push({
-              pinCode: detail.pinCode,
-              serialNumber: detail.serialNumber,
-              txnNum: transaction.txnNum,
-              description
-            });
-          } catch (err) {
-            logger.warn(`Failed to fetch transaction detail for ${transaction.txnNum}: ${err.message}`);
-            failures.push({
-              txnNum: transaction.txnNum,
-              description: this.normalizeTransactionDescription(transaction.description),
-              error: err.message
-            });
-          } finally {
-            processedCount += 1;
-            await emitProgress({
-              phase: 'fetching',
-              processed: processedCount,
-              total: totalDetails,
-              matched: matchedTransactions.length,
-              failures: failures.length,
-              cancelled: !!(checkCancellation && checkCancellation())
-            });
-          }
         }
-      })());
-
-      await Promise.all(workers);
+      }
 
       const groupedPinsObject = Object.fromEntries(
         Array.from(groupedPins.entries()).sort(([left], [right]) => left.localeCompare(right))

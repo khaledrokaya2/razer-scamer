@@ -24,6 +24,7 @@ const logger = require('../utils/logger');
 const fileGenerator = require('../utils/FileGenerator');
 const messageFormatter = require('../utils/MessageFormatter');
 const errorHandler = require('../utils/ErrorHandler');
+const appConfig = require('../config/app-config');
 
 class OrderFlowHandler {
   constructor() {
@@ -43,7 +44,7 @@ class OrderFlowHandler {
     this.cardMenuMessages = new Map(); // chatId -> messageId
 
     // Session timeout and cleanup for memory optimization
-    this.SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+    this.SESSION_TIMEOUT = appConfig.orderFlow.sessionTimeoutMs;
     this.startSessionCleanup();
   }
 
@@ -83,7 +84,7 @@ class OrderFlowHandler {
       if (cleaned > 0) {
         logger.order(`OrderFlow cleanup: ${cleaned} old sessions removed`);
       }
-    }, 10 * 60 * 1000); // Check every 10 minutes
+    }, appConfig.orderFlow.cleanupIntervalMs);
   }
 
   /**
@@ -385,22 +386,18 @@ class OrderFlowHandler {
     // Mark as cancelled FIRST
     this.markAsCancelled(chatId);
 
-    // Force close ALL browsers (parallel + session)
+    // Force close active purchase pages only (keep persistent browser session).
     if (telegramUserId) {
       const purchaseService = require('../services/PurchaseService');
-      const browserManager = require('../services/BrowserManager');
 
       try {
-        // Close parallel purchase browsers
+        // Close parallel purchase pages
         const browsersClosed = await purchaseService.forceCloseUserBrowsers(telegramUserId);
         if (browsersClosed > 0) {
-          logger.system(`Force closed ${browsersClosed} parallel browsers during cancel`);
+          logger.system(`Force closed ${browsersClosed} active purchase page(s) during cancel`);
         }
-
-        // Close session browser
-        await browserManager.closeBrowser(telegramUserId);
       } catch (err) {
-        logger.error('Error closing browsers during cancel:', err.message);
+        logger.error('Error closing purchase pages during cancel:', err.message);
       }
     }
 
@@ -470,27 +467,22 @@ class OrderFlowHandler {
     // Mark as cancelled FIRST (stops new operations)
     this.markAsCancelled(chatId);
 
-    // Force close ALL parallel browsers immediately
+    // Force close active purchase pages immediately (keep persistent browser alive)
     const purchaseService = require('../services/PurchaseService');
-    const browserManager = require('../services/BrowserManager');
 
     try {
-      // Close parallel purchase browsers
+      // Close parallel purchase pages
       const browsersClosed = await purchaseService.forceCloseUserBrowsers(telegramUserId);
       if (browsersClosed > 0) {
-        logger.system(`Force closed ${browsersClosed} parallel browsers for user ${telegramUserId}`);
+        logger.system(`Force closed ${browsersClosed} purchase page(s) for user ${telegramUserId}`);
       }
-
-      // Also close the user's session browser (if any)
-      await browserManager.closeBrowser(telegramUserId);
-      logger.debug(`Closed session browser for user ${telegramUserId}`);
     } catch (err) {
-      logger.error('Error closing browsers during cancellation:', err.message);
+      logger.error('Error closing purchase pages during cancellation:', err.message);
     }
 
     try {
       const cancelMsg = await bot.sendMessage(chatId,
-        `🛑 *Cancelling order...*\n\n_Stopping all browsers and saving progress_`,
+        `🛑 *Cancelling order...*\n\n_Stopping active purchase pages and saving progress_`,
         { parse_mode: 'Markdown' }
       );
 
@@ -1234,166 +1226,6 @@ class OrderFlowHandler {
       this.cancellingMessages.delete(chatId);
 
       throw err;
-    }
-  }
-
-  /**
-   * Handle backup code input (DEPRECATED - now uses database)
-   * @param {Object} bot - Telegram bot instance
-   * @param {number} chatId - Chat ID
-   * @param {user} user - User Object
-   * @param {string} text - User input
-   */
-  async handleBackupCodeInput(bot, chatId, telegramUserId, text) {
-    const session = this.getSession(chatId);
-
-    if (!session || session.step !== 'enter_backup_code') {
-      return; // Not in backup code input step
-    }
-
-    // Parse backup codes (one per line)
-    const inputText = text.trim();
-    const backupCodes = inputText.split('\n')
-      .map(code => code.trim())
-      .filter(code => code.length > 0); // Remove empty lines
-
-    // Validate: need 5-10 codes
-    if (backupCodes.length < 5 || backupCodes.length > 10) {
-      try {
-        await bot.sendMessage(chatId,
-          `⚠️ *INVALID INPUT*\n\nEnter 5-10 backup codes (got ${backupCodes.length})\n\nExample:\n12345678\n87654321\n...`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (err) {
-        logger.error('Error sending count validation message:', err);
-      }
-      return;
-    }
-
-    // Validate format: each code must be exactly 8 digits
-    const invalidCodes = [];
-    for (let i = 0; i < backupCodes.length; i++) {
-      if (!/^\d{8}$/.test(backupCodes[i])) {
-        invalidCodes.push(i + 1);
-      }
-    }
-
-    if (invalidCodes.length > 0) {
-      try {
-        await bot.sendMessage(chatId,
-          `⚠️ *INVALID FORMAT*\n\nCodes at position ${invalidCodes.join(', ')} must be 8 digits\n\nTry again:`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (err) {
-        logger.error('Error sending invalid code message:', err);
-      }
-      return;
-    }
-
-    // Additional validation: reject codes with all same digit
-    const invalidPatterns = [];
-    for (let i = 0; i < backupCodes.length; i++) {
-      if (/^(.)\1{7}$/.test(backupCodes[i])) {
-        invalidPatterns.push(i + 1);
-      }
-    }
-
-    if (invalidPatterns.length > 0) {
-      try {
-        await bot.sendMessage(chatId,
-          `⚠️ *INVALID PATTERN*\n\nCodes at position ${invalidPatterns.join(', ')} are invalid patterns\n\nEnter valid codes:`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (err) {
-        logger.error('Error sending invalid pattern message:', err);
-      }
-      return;
-    }
-
-    // Check for duplicate codes
-    const uniqueCodes = new Set(backupCodes);
-    if (uniqueCodes.size !== backupCodes.length) {
-      try {
-        await bot.sendMessage(chatId,
-          `⚠️ *DUPLICATE CODES*\n\nEach code must be unique\n\nEnter different codes:`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (err) {
-        logger.error('Error sending duplicate message:', err);
-      }
-      return;
-    }
-
-    // Update session with array of backup codes
-    this.updateSession(chatId, {
-      step: 'processing',
-      backupCodes: backupCodes, // Changed from backupCode to backupCodes (array)
-      backupCodeIndex: 0 // Track which code to use next
-    });
-
-    // Send ORDER SUMMARY and store message ID for later deletion
-    try {
-      const summaryMsg = await bot.sendMessage(chatId,
-        `📋 *ORDER SUMMARY*\n` +
-        `🎮 ${session.gameName}\n` +
-        `💎 ${session.cardName}\n` +
-        `📦 ${session.quantity} ${session.quantity === 1 ? 'card' : 'cards'}\n\n` +
-        `⏳ *Processing...*`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[
-              { text: '🛑 Cancel Order', callback_data: 'order_cancel_processing' }
-            ]]
-          }
-        }
-      );
-      // Store message ID for deletion later
-      this.orderSummaryMessages.set(chatId, summaryMsg.message_id);
-    } catch (err) {
-      logger.error('Error sending order summary:', err);
-    }
-
-    // Process order using unified method (REFACTORED: eliminates duplicate code)
-    try {
-      await this._executeOrder({
-        bot,
-        chatId,
-        telegramUserId,
-        gameName: session.gameName,
-        gameUrl: session.gameUrl,
-        cardName: session.cardName,
-        cardIndex: session.cardIndex,
-        quantity: session.quantity,
-        isScheduled: false
-      });
-
-      // Clear session on success
-      this.clearSession(chatId);
-
-    } catch (err) {
-      // Unified method handles all error scenarios
-      // Only need to handle special case: InvalidBackupCodeError for retry
-      if (err.name === 'InvalidBackupCodeError') {
-        // Keep session data, go back to backup code step
-        this.updateSession(chatId, {
-          step: 'enter_backup_code',
-          backupCode: null
-        });
-
-        try {
-          await bot.sendMessage(chatId,
-            `🔐 *RETRY BACKUP CODE*\n\nPrevious code invalid. Enter new code.\n\n_Type /start to cancel_`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (sendErr) {
-          logger.error('Error sending retry prompt:', sendErr);
-        }
-        return;
-      }
-
-      // For all other errors (including cancellation), clear session
-      this.clearSession(chatId);
     }
   }
 

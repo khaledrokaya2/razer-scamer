@@ -7,9 +7,6 @@ const logger = require('../utils/logger');
 const db = require('./DatabaseService');
 const orderFlowHandler = require('../controllers/OrderFlowHandler');
 
-// SOLID Principle: Single Responsibility - Use shared utilities
-const fileGenerator = require('../utils/FileGenerator');
-const messageFormatter = require('../utils/MessageFormatter');
 const errorHandler = require('../utils/ErrorHandler');
 
 class ScheduledOrderService {
