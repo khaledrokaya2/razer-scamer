@@ -50,7 +50,7 @@ class PurchaseService {
     this.twoFactorLocks = new Map(); // userId -> Promise chain lock
     this.intentionalReadyCloseUsers = new Set();
     this.MAX_READY_BROWSERS = 1;
-    this.MAX_PARALLEL_PAGES = 5;
+    this.MAX_PARALLEL_PAGES = 10;
 
     // Anti-ban staggering between pages/workers.
     this.READY_LOGIN_STAGGER_MS = appConfig.purchase.readyLoginStaggerMs;
@@ -1299,40 +1299,61 @@ class PurchaseService {
 
         const waitForCheckoutOutcome = async (timeoutMs = 25000) => {
           const startedAt = Date.now();
+          let transientNavigationErrors = 0;
 
           while (Date.now() - startedAt < timeoutMs) {
             await waitIfTwoFactorPaused();
 
-            const state = await page.evaluate(() => {
-              const href = window.location.href;
-              const modal = document.querySelector('#purchaseOtpModal');
-              const body = document.body;
+            let state;
+            try {
+              state = await page.evaluate(() => {
+                const href = window.location.href;
+                const modal = document.querySelector('#purchaseOtpModal');
+                const body = document.body;
 
-              let modalVisible = false;
-              if (modal) {
-                const style = window.getComputedStyle(modal);
-                const hasShowClass = modal.classList.contains('show');
-                const hasFadeClass = modal.classList.contains('fade');
-                const isDisplayed = style.display !== 'none' && style.visibility !== 'hidden' && modal.getBoundingClientRect().height > 0;
-                const bodyModalOpen = !!body && body.classList.contains('modal-open');
-                const iframe = modal.querySelector("iframe[id^='otp-iframe-']");
-                const iframeVisible = !!iframe && iframe.getBoundingClientRect().height > 0;
+                let modalVisible = false;
+                if (modal) {
+                  const style = window.getComputedStyle(modal);
+                  const hasShowClass = modal.classList.contains('show');
+                  const hasFadeClass = modal.classList.contains('fade');
+                  const isDisplayed = style.display !== 'none' && style.visibility !== 'hidden' && modal.getBoundingClientRect().height > 0;
+                  const bodyModalOpen = !!body && body.classList.contains('modal-open');
+                  const iframe = modal.querySelector("iframe[id^='otp-iframe-']");
+                  const iframeVisible = !!iframe && iframe.getBoundingClientRect().height > 0;
 
-                // Accept multiple valid visibility signatures to avoid false negatives.
-                modalVisible = isDisplayed && (
-                  hasShowClass ||
-                  (hasFadeClass && bodyModalOpen) ||
-                  iframeVisible
-                );
+                  // Accept multiple valid visibility signatures to avoid false negatives.
+                  modalVisible = isDisplayed && (
+                    hasShowClass ||
+                    (hasFadeClass && bodyModalOpen) ||
+                    iframeVisible
+                  );
+                }
+
+                return {
+                  href,
+                  modalVisible,
+                  hasTransaction: href.includes('/transaction/'),
+                  hasReload: href.includes('/gold/reload')
+                };
+              });
+            } catch (evalErr) {
+              const message = String((evalErr && evalErr.message) || '').toLowerCase();
+              const isTransientNavigationError = message.includes('execution context was destroyed')
+                || message.includes('cannot find context with specified id')
+                || message.includes('inspected target navigated or closed');
+
+              if (!isTransientNavigationError) {
+                throw evalErr;
               }
 
-              return {
-                href,
-                modalVisible,
-                hasTransaction: href.includes('/transaction/'),
-                hasReload: href.includes('/gold/reload')
-              };
-            });
+              transientNavigationErrors += 1;
+              if (transientNavigationErrors <= 3) {
+                log.debug('Checkout outcome check interrupted by in-flight navigation, retrying...');
+              }
+
+              await this.sleep(250);
+              continue;
+            }
 
             if (state.modalVisible) {
               return { type: '2fa' };
