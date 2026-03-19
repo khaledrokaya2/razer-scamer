@@ -329,7 +329,7 @@ class PurchaseService {
     const maxAttempts = 5;
     const {
       keepPoolAtMaxOnDisconnect = true,
-      headless = false,
+      headless = true,
       logPrefix = `[Ready ${slot}]`
     } = options;
 
