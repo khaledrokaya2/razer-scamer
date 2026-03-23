@@ -54,6 +54,8 @@ class PurchaseService {
     this.SEQUENTIAL_STEP_DELAY_MS = appConfig.purchase.sequentialStepDelayMs ?? 120;
     this.ACTION_GAP_MS = appConfig.purchase.actionGapMs ?? 260;
     this.ACTION_JITTER_MS = appConfig.purchase.actionJitterMs ?? 120;
+    this.ACTION_LOCK_WAIT_TIMEOUT_MS = appConfig.purchase.actionLockWaitTimeoutMs ?? 30000;
+    this.ACTION_TASK_TIMEOUT_MS = appConfig.purchase.actionTaskTimeoutMs ?? 30000;
     this.NAV_JITTER_MIN_MS = appConfig.purchase.navJitterMinMs ?? 250;
     this.NAV_JITTER_MAX_MS = appConfig.purchase.navJitterMaxMs ?? 700;
 
@@ -157,10 +159,19 @@ class PurchaseService {
    * Serialize browser actions per user to avoid same-moment multi-page activity.
    * @param {string} telegramUserId - Telegram user ID
    * @param {Function} task - Async page action
-   * @param {{skipGap?: boolean}} options
+   * @param {{skipGap?: boolean, lockWaitTimeoutMs?: number, taskTimeoutMs?: number, taskLabel?: string}} options
    * @returns {Promise<any>}
    */
-  async runWithActionGate(telegramUserId, task, { skipGap = false } = {}) {
+  async runWithActionGate(
+    telegramUserId,
+    task,
+    {
+      skipGap = false,
+      lockWaitTimeoutMs = this.ACTION_LOCK_WAIT_TIMEOUT_MS,
+      taskTimeoutMs = this.ACTION_TASK_TIMEOUT_MS,
+      taskLabel = 'browser action'
+    } = {}
+  ) {
     const previous = this.actionLocks.get(telegramUserId) || Promise.resolve();
     let release;
     const current = new Promise(resolve => {
@@ -168,7 +179,15 @@ class PurchaseService {
     });
 
     this.actionLocks.set(telegramUserId, current);
-    await previous;
+
+    await Promise.race([
+      previous,
+      new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`Action gate wait timed out while waiting for previous action (${taskLabel})`));
+        }, lockWaitTimeoutMs);
+      })
+    ]);
 
     try {
       if (!skipGap) {
@@ -181,7 +200,14 @@ class PurchaseService {
         }
       }
 
-      return await task();
+      return await Promise.race([
+        task(),
+        new Promise((_, reject) => {
+          setTimeout(() => {
+            reject(new Error(`Action task timed out (${taskLabel})`));
+          }, taskTimeoutMs);
+        })
+      ]);
     } finally {
       release();
       if (this.actionLocks.get(telegramUserId) === current) {
@@ -1261,7 +1287,14 @@ class PurchaseService {
         throw new Error('❌ Could not find checkout button');
       }
 
-      await this.runWithActionGate(telegramUserId, () => checkoutButton.click());
+      await this.runWithActionGate(
+        telegramUserId,
+        () => checkoutButton.click(),
+        {
+          taskTimeoutMs: 45000,
+          taskLabel: 'checkout button click'
+        }
+      );
       log.success('Checkout button clicked successfully');
 
       // Wait for navigation after checkout (optimized timeout)
@@ -2313,6 +2346,12 @@ class PurchaseService {
 
       logger.success(`Results: ✅ Success: ${sharedState.successCount} | ❌ Failed: ${sharedState.failedCount} | Total: ${sharedState.processedCount}/${quantity}`);
       logger.purchase(`${'='.repeat(60)}\n`);
+
+      if (sharedState.cancelled && checkCancellation && checkCancellation()) {
+        const cancelledErr = new Error('Order cancelled by user');
+        cancelledErr.purchases = sharedState.purchases;
+        throw cancelledErr;
+      }
 
       return sharedState.purchases;
 

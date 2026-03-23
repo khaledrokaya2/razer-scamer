@@ -12,11 +12,11 @@ const APP_CONFIG = {
     backoffMultiplier: 2
   },
   antiban: {
-    humanDelayMinMs: 900,
-    humanDelayMaxMs: 2400,
+    humanDelayMinMs: 350,
+    humanDelayMaxMs: 900,
     typingDelayMinMs: 45,
     typingDelayRangeMs: 35,
-    longPauseChance: 0.03,
+    longPauseChance: 0.01,
     longPauseMinMs: 1500,
     longPauseMaxMs: 3200,
     viewport: {
@@ -35,12 +35,14 @@ const APP_CONFIG = {
     ]
   },
   purchase: {
-    maxParallelPages: 5,
-    sequentialStepDelayMs: 100,
-    actionGapMs: 100,
-    actionJitterMs: 100,
-    navJitterMinMs: 100,
-    navJitterMaxMs: 150,
+    maxParallelPages: 4,
+    sequentialStepDelayMs: 60,
+    actionGapMs: 80,
+    actionJitterMs: 60,
+    navJitterMinMs: 80,
+    navJitterMaxMs: 140,
+    actionLockWaitTimeoutMs: 20000,
+    actionTaskTimeoutMs: 25000,
     readyLoginStaggerMs: 1400,
     readyLoginJitterMs: 900,
     purchasePageStaggerMs: 5200,
