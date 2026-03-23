@@ -47,11 +47,13 @@ class PurchaseService {
     this.readyBrowsersByUser = new Map(); // userId -> {browser, page, slot}
     this.readyInitLocks = new Map(); // userId -> Promise
     this.twoFactorLocks = new Map(); // userId -> Promise chain lock
+    this.twoFactorWindowByUser = new Map(); // userId -> last successful 2FA timestamp
     this.actionLocks = new Map(); // userId -> Promise chain lock for page actions
     this.intentionalReadyCloseUsers = new Set();
     this.MAX_READY_BROWSERS = 1;
     this.MAX_PARALLEL_PAGES = appConfig.purchase.maxParallelPages ?? 3;
     this.SEQUENTIAL_STEP_DELAY_MS = appConfig.purchase.sequentialStepDelayMs ?? 120;
+    this.SEQUENTIAL_STEP_JITTER_MS = appConfig.purchase.sequentialStepJitterMs ?? 40;
     this.ACTION_GAP_MS = appConfig.purchase.actionGapMs ?? 260;
     this.ACTION_JITTER_MS = appConfig.purchase.actionJitterMs ?? 120;
     this.ACTION_LOCK_WAIT_TIMEOUT_MS = appConfig.purchase.actionLockWaitTimeoutMs ?? 30000;
@@ -69,6 +71,12 @@ class PurchaseService {
     this.TRANSACTION_DETAIL_STAGGER_MS = appConfig.purchase.transactionDetailStaggerMs;
     this.TRANSACTION_DETAIL_JITTER_MS = appConfig.purchase.transactionDetailJitterMs;
     this.TRANSACTION_API_RATE_DELAY_MS = appConfig.purchase.transactionApiRateDelayMs;
+    this.POST_TRANSACTION_CONGRATS_TIMEOUT_MS = appConfig.purchase.postTransactionCongratsTimeoutMs ?? 2200;
+    this.POST_TRANSACTION_PIN_WAIT_TIMEOUT_MS = appConfig.purchase.postTransactionPinWaitTimeoutMs ?? 1200;
+    this.CHECKOUT_BATCH_DELAY_MS = appConfig.purchase.checkoutBatchDelayMs ?? 20;
+    this.TWO_FACTOR_LOCK_HUMAN_DELAY_MIN_MS = appConfig.purchase.twoFactorLockHumanDelayMinMs ?? 120;
+    this.TWO_FACTOR_LOCK_HUMAN_DELAY_MAX_MS = appConfig.purchase.twoFactorLockHumanDelayMaxMs ?? 260;
+    this.TWO_FACTOR_WINDOW_MS = appConfig.purchase.twoFactorWindowMs ?? (15 * 60 * 1000);
     this.TRANSACTIONS_PAGE_URL = 'https://gold.razer.com/global/en/transactions';
     this.TRANSACTION_DETAIL_URL_PREFIX = 'https://gold.razer.com/global/en/transaction/purchase/';
     this.READY_BROWSER_HOME_URL = 'https://gold.razer.com/global/en';
@@ -126,6 +134,36 @@ class PurchaseService {
     }
 
     return [];
+  }
+
+  /**
+   * Record that user has just completed a successful 2FA challenge.
+   * @param {string} telegramUserId
+   * @param {string} reason
+   */
+  markTwoFactorSuccessNow(telegramUserId, reason = '2FA success') {
+    const ts = Date.now();
+    this.twoFactorWindowByUser.set(telegramUserId, ts);
+    logger.debug(`2FA window updated for user ${telegramUserId} (${reason}) at ${new Date(ts).toISOString()}`);
+  }
+
+  /**
+   * Return true when the user's in-memory 2FA grace window is still active.
+   * @param {string} telegramUserId
+   * @returns {boolean}
+   */
+  isTwoFactorWindowActive(telegramUserId) {
+    const lastTs = this.twoFactorWindowByUser.get(telegramUserId);
+    if (!lastTs) return false;
+    return (Date.now() - lastTs) < this.TWO_FACTOR_WINDOW_MS;
+  }
+
+  /**
+   * Remove in-memory 2FA window timestamp for user.
+   * @param {string} telegramUserId
+   */
+  clearTwoFactorWindowState(telegramUserId) {
+    this.twoFactorWindowByUser.delete(telegramUserId);
   }
 
   /**
@@ -437,6 +475,8 @@ class PurchaseService {
 
         let loggedIn = await verifyAuthenticatedSession();
         if (!loggedIn) {
+          // Session/cookies are no longer valid; reset in-memory 2FA window.
+          this.clearTwoFactorWindowState(telegramUserId);
           logger.system(`${logPrefix} Session is not authenticated yet for user ${telegramUserId}; signing in...`);
 
           await page.goto('https://razerid.razer.com', { waitUntil: 'load', timeout: 60000 });
@@ -490,6 +530,7 @@ class PurchaseService {
               logger.debug(`${logPrefix} Ignoring disconnect recovery for intentional close (user ${telegramUserId})`);
               return;
             }
+            this.clearTwoFactorWindowState(telegramUserId);
             logger.warn(`${logPrefix} Browser disconnected for user ${telegramUserId}. Recreating...`);
             setTimeout(() => {
               if (this.intentionalReadyCloseUsers.has(telegramUserId)) {
@@ -509,6 +550,7 @@ class PurchaseService {
         logger.error(`${logPrefix} Launch/login failed: ${err.message}`);
         // Never close managed browser from this flow unless it became disconnected.
         if (browser && !browser.isConnected()) {
+          this.clearTwoFactorWindowState(telegramUserId);
           try { await browserManager.closeBrowser(telegramUserId); } catch (closeErr) { }
         }
         if (attempt === maxAttempts) {
@@ -529,6 +571,7 @@ class PurchaseService {
   async closeReadyBrowsersForUser(telegramUserId) {
     const session = this.readyBrowsersByUser.get(telegramUserId);
     this.intentionalReadyCloseUsers.add(telegramUserId);
+    this.clearTwoFactorWindowState(telegramUserId);
 
     if (!session) {
       // Keep BrowserManager in sync on forced resets even when no ready map entry exists.
@@ -1689,6 +1732,7 @@ class PurchaseService {
                 );
 
                 log.success('Navigation detected - backup code accepted');
+                this.markTwoFactorSuccessNow(telegramUserId, 'backup code accepted (navigation)');
               } catch (navErr) {
                 // Navigation wait ended or failed - check where we are before deciding backup code is invalid.
                 const waitReason = navErr && navErr.name === 'TimeoutError'
@@ -1699,6 +1743,7 @@ class PurchaseService {
 
                 if (currentUrl.includes('/transaction/')) {
                   log.success('Already on transaction page - backup code accepted');
+                  this.markTwoFactorSuccessNow(telegramUserId, 'backup code accepted (already on transaction)');
                 } else if (isSameCatalogPage(currentUrl)) {
                   log.error('Still on game page after 90 seconds - backup code likely invalid');
                   throw new InvalidBackupCodeError('The backup code validation timed out. The code may be incorrect or expired. Please enter another valid backup code.');
@@ -1772,17 +1817,17 @@ class PurchaseService {
               page.waitForFunction(() => {
                 const h2 = document.querySelector('h2[data-v-621e38f9]');
                 return h2 && h2.textContent.includes('Congratulations');
-              }, { timeout: 5000 }),
-              new Promise((resolve) => setTimeout(resolve, 5000))
+              }, { timeout: this.POST_TRANSACTION_CONGRATS_TIMEOUT_MS }),
+              new Promise((resolve) => setTimeout(resolve, this.POST_TRANSACTION_CONGRATS_TIMEOUT_MS))
             ]);
             log.success('Order processing completed - "Congratulations!" page loaded');
           } catch (waitErr) {
-            log.warn('Timeout (5s) waiting for congratulations message, will try extraction anyway...');
+            log.warn(`Timeout (${this.POST_TRANSACTION_CONGRATS_TIMEOUT_MS}ms) waiting for congratulations message, will try extraction anyway...`);
           }
 
           // Additional wait for PIN block to be visible with shorter timeout
           try {
-            await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: 3000 });
+            await page.waitForSelector('.pin-block.product-pin', { visible: true, timeout: this.POST_TRANSACTION_PIN_WAIT_TIMEOUT_MS });
             log.success('PIN block is visible');
           } catch (pinWaitErr) {
             log.warn('PIN block not found with selector, will try extraction anyway...');
@@ -2032,7 +2077,7 @@ class PurchaseService {
     const waitStepDelay = async (phaseLabel, idx, total) => {
       if (idx >= total - 1) return true;
 
-      const delayMs = this.SEQUENTIAL_STEP_DELAY_MS + Math.floor(Math.random() * 160);
+      const delayMs = this.SEQUENTIAL_STEP_DELAY_MS + Math.floor(Math.random() * (this.SEQUENTIAL_STEP_JITTER_MS + 1));
       logger.debug(`Phase delay after ${phaseLabel}: ${delayMs}ms`);
       const cancelled = await this.sleepCancellable(delayMs, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
       if (cancelled) {
@@ -2289,60 +2334,64 @@ class PurchaseService {
 
         // Phase C: Checkout prepared pages with configurable concurrency (default 2 simultaneous).
         const maxConcurrentCheckouts = appConfig.purchase.maxConcurrentCheckouts || 2;
-        
-        const processCheckoutBatch = async (batchAssignments) => {
-          const batchTasks = [];
-          
-          for (const assignment of batchAssignments) {
-            if (assignment.failedInPrepare) continue;
-            if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-              sharedState.cancelled = true;
-              sharedState.cardQueue.unshift(assignment.cardNumber);
-              continue;
-            }
 
-            const checkoutTask = (async () => {
-              logger.purchase(`${assignment.label} Checkout for card ${assignment.cardNumber}/${quantity}...`);
+        const executeCheckoutForAssignment = async (assignment) => {
+          logger.purchase(`${assignment.label} Checkout for card ${assignment.cardNumber}/${quantity}...`);
 
-              try {
-                let result;
+          try {
+            let result;
 
-                try {
-                  result = await this.completePurchase({
-                    telegramUserId,
-                    page: assignment.page,
-                    gameUrl,
-                    cardIndex,
-                    backupCode: null,
-                    backupCodeId: null,
-                    checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                    cardNumber: assignment.cardNumber,
-                    gameName,
-                    cardName,
-                    label: assignment.label,
-                    resumeFromCheckout: true
-                  });
-                } catch (err) {
-                  if (!(err instanceof BackupCodeExpiredError) && !(err instanceof TwoFactorVerificationRequiredError)) {
-                    throw err;
-                  }
+            try {
+              result = await this.completePurchase({
+                telegramUserId,
+                page: assignment.page,
+                gameUrl,
+                cardIndex,
+                backupCode: null,
+                backupCodeId: null,
+                checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                cardNumber: assignment.cardNumber,
+                gameName,
+                cardName,
+                label: assignment.label,
+                resumeFromCheckout: true
+              });
+            } catch (err) {
+              if (!(err instanceof BackupCodeExpiredError) && !(err instanceof TwoFactorVerificationRequiredError)) {
+                throw err;
+              }
 
-                  result = await this.runWithUserLock(telegramUserId, async () => {
-                    const nextBackupCode = await getNextBackupCode();
-                    if (!nextBackupCode) {
-                      throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA. Add more backup codes and retry remaining cards.');
-                    }
-
-                    logger.warn(`${assignment.label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
-                    await humanDelay(900, 1700);
-
+              // Fast path: some tabs auto-navigate to transaction page shortly after checkout.
+              // Skip backup-code lock/code reservation when this has already happened.
+              const urlBeforeLock = assignment.page.url();
+              if (urlBeforeLock.includes('/transaction/')) {
+                logger.debug(`${assignment.label} Reached transaction page before 2FA lock; skipping backup-code reservation.`);
+                result = await this.completePurchase({
+                  telegramUserId,
+                  page: assignment.page,
+                  gameUrl,
+                  cardIndex,
+                  backupCode: null,
+                  backupCodeId: null,
+                  checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                  cardNumber: assignment.cardNumber,
+                  gameName,
+                  cardName,
+                  label: assignment.label,
+                  resumeFromTwoFactor: true
+                });
+              } else {
+                result = await this.runWithUserLock(telegramUserId, async () => {
+                  const urlAfterLock = assignment.page.url();
+                  if (urlAfterLock.includes('/transaction/')) {
+                    logger.debug(`${assignment.label} Reached transaction page while waiting for 2FA lock; skipping backup code.`);
                     return this.completePurchase({
                       telegramUserId,
                       page: assignment.page,
                       gameUrl,
                       cardIndex,
-                      backupCode: nextBackupCode.code,
-                      backupCodeId: nextBackupCode.id,
+                      backupCode: null,
+                      backupCodeId: null,
                       checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
                       cardNumber: assignment.cardNumber,
                       gameName,
@@ -2350,31 +2399,127 @@ class PurchaseService {
                       label: assignment.label,
                       resumeFromTwoFactor: true
                     });
-                  });
-                }
-
-                sharedState.purchases.push(result);
-                sharedState.processedCount++;
-
-                if (result.success) {
-                  sharedState.successCount++;
-                  logger.success(`${assignment.label} Card ${assignment.cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
-                  await trackedCardSave(result, assignment.cardNumber, assignment.label);
-                  result.savedToDb = true;
-                } else {
-                  sharedState.failedCount++;
-                  logger.warn(`${assignment.label} Card ${assignment.cardNumber}/${quantity} reached transaction but extraction FAILED`);
-                  if (result.transactionId) {
-                    await trackedCardSave(result, assignment.cardNumber, assignment.label);
-                    result.savedToDb = true;
                   }
-                }
 
-                await bumpProgress();
-              } catch (checkoutErr) {
-                await processPurchaseError(checkoutErr, assignment, 'checkout');
+                  const nextBackupCode = await getNextBackupCode();
+                  if (!nextBackupCode) {
+                    throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA. Add more backup codes and retry remaining cards.');
+                  }
+
+                  logger.warn(`${assignment.label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
+                  await humanDelay(this.TWO_FACTOR_LOCK_HUMAN_DELAY_MIN_MS, this.TWO_FACTOR_LOCK_HUMAN_DELAY_MAX_MS);
+
+                  return this.completePurchase({
+                    telegramUserId,
+                    page: assignment.page,
+                    gameUrl,
+                    cardIndex,
+                    backupCode: nextBackupCode.code,
+                    backupCodeId: nextBackupCode.id,
+                    checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                    cardNumber: assignment.cardNumber,
+                    gameName,
+                    cardName,
+                    label: assignment.label,
+                    resumeFromTwoFactor: true
+                  });
+                });
               }
-            })();
+            }
+
+            sharedState.purchases.push(result);
+            sharedState.processedCount++;
+
+            if (result.success) {
+              sharedState.successCount++;
+              logger.success(`${assignment.label} Card ${assignment.cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
+              await trackedCardSave(result, assignment.cardNumber, assignment.label);
+              result.savedToDb = true;
+            } else {
+              sharedState.failedCount++;
+              logger.warn(`${assignment.label} Card ${assignment.cardNumber}/${quantity} reached transaction but extraction FAILED`);
+              if (result.transactionId) {
+                await trackedCardSave(result, assignment.cardNumber, assignment.label);
+                result.savedToDb = true;
+              }
+            }
+
+            await bumpProgress();
+            return {
+              ok: true,
+              reachedTransaction: !!(result && result.transactionId),
+              twoFactorWindowActive: this.isTwoFactorWindowActive(telegramUserId)
+            };
+          } catch (checkoutErr) {
+            await processPurchaseError(checkoutErr, assignment, 'checkout');
+            return {
+              ok: false,
+              reachedTransaction: !!(checkoutErr && checkoutErr.transactionId),
+              twoFactorWindowActive: this.isTwoFactorWindowActive(telegramUserId),
+              error: checkoutErr
+            };
+          }
+        };
+        
+        const processCheckoutBatch = async (batchAssignments) => {
+          const validAssignments = batchAssignments.filter(a => !a.failedInPrepare);
+          if (validAssignments.length === 0) {
+            return;
+          }
+
+          // If 2FA window expired, use one leader checkout first to prime the 15-minute window,
+          // then continue other prepared pages in parallel without re-preparing flow.
+          const requireLeaderPrime = !this.isTwoFactorWindowActive(telegramUserId) && validAssignments.length > 1;
+          let pendingAssignments = validAssignments;
+
+          if (requireLeaderPrime) {
+            const windowMinutes = Math.round(this.TWO_FACTOR_WINDOW_MS / 60000);
+            const leaderCandidates = [...validAssignments];
+            let unlocked = false;
+            pendingAssignments = [];
+
+            while (leaderCandidates.length > 0 && !unlocked) {
+              const leader = leaderCandidates.shift();
+              logger.purchase(`${leader.label} Leader checkout: 2FA window expired, priming ${windowMinutes}m session before releasing other pages...`);
+
+              const leaderOutcome = await executeCheckoutForAssignment(leader);
+
+              if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+                sharedState.cancelled = true;
+                return;
+              }
+
+              const unlockedNow = !!(
+                leaderOutcome
+                && (leaderOutcome.twoFactorWindowActive || leaderOutcome.reachedTransaction)
+              );
+
+              if (unlockedNow) {
+                unlocked = true;
+                pendingAssignments = leaderCandidates;
+                logger.success(`${leader.label} Leader unlocked checkout flow; releasing ${pendingAssignments.length} prepared page(s) in parallel.`);
+                break;
+              }
+
+              logger.warn(`${leader.label} Leader did not unlock 2FA window/transaction; trying next prepared page as leader...`);
+            }
+
+            if (!unlocked) {
+              logger.warn('No prepared leader page unlocked checkout flow in this batch. Skipping parallel release for this batch.');
+              return;
+            }
+          }
+
+          const batchTasks = [];
+          
+          for (const assignment of pendingAssignments) {
+            if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+              sharedState.cancelled = true;
+              sharedState.cardQueue.unshift(assignment.cardNumber);
+              continue;
+            }
+
+            const checkoutTask = executeCheckoutForAssignment(assignment);
             
             batchTasks.push(checkoutTask);
           }
@@ -2397,7 +2542,7 @@ class PurchaseService {
           
           // Add small delay between batches for stealth (but not after last batch)
           if (batchEnd < assignments.length && maxConcurrentCheckouts > 1) {
-            await sleep(appConfig.purchase.sequentialStepDelayMs || 60);
+            await sleep(this.CHECKOUT_BATCH_DELAY_MS);
           }
         }
       }

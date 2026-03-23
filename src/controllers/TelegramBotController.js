@@ -436,7 +436,7 @@ class TelegramBotController {
       const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
 
       if (!hasActiveBrowser) {
-        const loginMsg = await this.bot.sendMessage(chatId, '⏳ Opening browser and logging in...');
+        const loginMsg = await this.bot.sendMessage(chatId, `⏳ Opening browser and logging in with ${credentials.email}...`);
         await scraperService.login(telegramUserId, credentials.email, credentials.password);
         await this.bot.deleteMessage(chatId, loginMsg.message_id).catch(() => { });
       }
@@ -1056,6 +1056,9 @@ class TelegramBotController {
 
           } else if (callbackData === 'order_back_to_games') {
             await orderFlowHandler.handleBack(this.bot, chatId);
+
+          } else if (callbackData === 'order_back_to_cards') {
+            await orderFlowHandler.handleBackToCards(this.bot, chatId);
 
           } else if (callbackData === 'order_confirm_continue') {
             // User confirmed to continue despite low backup codes

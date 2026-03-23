@@ -42,6 +42,8 @@ class OrderFlowHandler {
     this.gameMenuMessages = new Map(); // chatId -> messageId
     // Track card menu message IDs for deletion
     this.cardMenuMessages = new Map(); // chatId -> messageId
+    // Track quantity prompt message IDs for deletion
+    this.quantityPromptMessages = new Map(); // chatId -> messageId
 
     // Session timeout and cleanup for memory optimization
     this.SESSION_TIMEOUT = appConfig.orderFlow.sessionTimeoutMs;
@@ -76,6 +78,7 @@ class OrderFlowHandler {
           this.progressMessages.delete(chatId);
           this.cancellingMessages.delete(chatId);
           this.orderSummaryMessages.delete(chatId);
+          this.quantityPromptMessages.delete(chatId);
           this.cancellationRequests.delete(chatId);
           cleaned++;
         }
@@ -192,6 +195,7 @@ class OrderFlowHandler {
     this.orderSessions.delete(chatId);
     this.gameMenuMessages.delete(chatId);
     this.cardMenuMessages.delete(chatId);
+    this.quantityPromptMessages.delete(chatId);
   }
 
   /**
@@ -675,15 +679,68 @@ class OrderFlowHandler {
 
     // Ask for quantity
     try {
-      await bot.sendMessage(chatId,
+      const quantityPromptMsg = await bot.sendMessage(chatId,
         `📦 *ENTER QUANTITY:*`,
         {
           parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '⬅️ Back', callback_data: 'order_back_to_cards' }]
+            ]
+          }
         }
       );
+      this.quantityPromptMessages.set(chatId, quantityPromptMsg.message_id);
     } catch (err) {
       logger.error('Error sending quantity prompt:', err);
     }
+  }
+
+  /**
+   * Handle back to cards from quantity step
+   * @param {Object} bot - Telegram bot instance
+   * @param {number} chatId - Chat ID
+   */
+  async handleBackToCards(bot, chatId) {
+    const session = this.getSession(chatId);
+
+    const quantityPromptMsgId = this.quantityPromptMessages.get(chatId);
+    if (quantityPromptMsgId) {
+      try {
+        await bot.deleteMessage(chatId, quantityPromptMsgId);
+      } catch (delErr) {
+        logger.debug('Could not delete quantity prompt message');
+      } finally {
+        this.quantityPromptMessages.delete(chatId);
+      }
+    }
+
+    if (!session || !session.gameUrl) {
+      await this.showGameSelection(bot, chatId);
+      return;
+    }
+
+    // Reset quantity/card choice and return to card list for current game.
+    this.updateSession(chatId, {
+      step: 'select_card',
+      cardIndex: null,
+      cardName: null,
+      quantity: null
+    });
+
+    const telegramUserId = session.telegramUserId || chatId;
+
+    if (session.gameId === 'custom') {
+      await this.handleCustomUrlInput(bot, chatId, telegramUserId, session.gameUrl);
+      return;
+    }
+
+    if (session.gameId) {
+      await this.handleGameSelection(bot, chatId, session.gameId, telegramUserId);
+      return;
+    }
+
+    await this.showGameSelection(bot, chatId);
   }
 
   /**
@@ -710,6 +767,17 @@ class OrderFlowHandler {
     this.updateSession(chatId, {
       quantity: quantity
     });
+
+    const quantityPromptMsgId = this.quantityPromptMessages.get(chatId);
+    if (quantityPromptMsgId) {
+      try {
+        await bot.deleteMessage(chatId, quantityPromptMsgId);
+      } catch (delErr) {
+        logger.debug('Could not delete quantity prompt message after input');
+      } finally {
+        this.quantityPromptMessages.delete(chatId);
+      }
+    }
 
     // Check if user has backup codes in database
     const db = require('../services/DatabaseService');
