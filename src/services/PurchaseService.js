@@ -1542,8 +1542,45 @@ class PurchaseService {
           // Step 2: Wait for OTP iframe inside the modal
           // The iframe is always id="otp-iframe-1" across all 2FA steps
           log.debug('Waiting for OTP iframe to appear...');
-          await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 8000 });
+          let skipTwoFactorIframeFlow = false;
+          try {
+            // Presence is more reliable than visible=true because modal/iframe animations can race.
+            await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { timeout: 8000 });
+          } catch (otpWaitErr) {
+            const urlDuringOtpWait = page.url();
+            if (urlDuringOtpWait.includes('/transaction/')) {
+              log.success('Reached transaction page while waiting for OTP iframe - continuing without 2FA steps');
+              skipTwoFactorIframeFlow = true;
+            } else if (urlDuringOtpWait.includes('/gold/reload')) {
+              throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
+            } else {
+              // Retry once with a DOM-based wait to handle iframe remounts.
+              await page.waitForFunction(() => {
+                const modal = document.querySelector('#purchaseOtpModal');
+                const iframe = document.querySelector('#purchaseOtpModal iframe[id^="otp-iframe-"]');
+                return !!(modal && iframe);
+              }, { timeout: 7000, polling: 200 });
+            }
+          }
+
+          // Re-check in case page moved directly to transaction/reload during waits.
+          const urlAfterOtpWait = page.url();
+          if (urlAfterOtpWait.includes('/transaction/')) {
+            log.success('Transaction page reached before OTP frame interaction - skipping 2FA iframe flow');
+            skipTwoFactorIframeFlow = true;
+          } else if (urlAfterOtpWait.includes('/gold/reload')) {
+            throw new InsufficientBalanceError('Insufficient Razer Gold balance. Please reload your account and try again.');
+          }
+
+          if (skipTwoFactorIframeFlow) {
+            log.debug('Skipping OTP iframe flow because checkout already advanced to transaction page');
+          }
+
+          if (!skipTwoFactorIframeFlow) {
           let frameHandle = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
+          if (!frameHandle) {
+            throw new Error('OTP iframe handle not found after detection');
+          }
           let frame = await frameHandle.contentFrame();
 
           if (!frame) throw new Error('Could not access OTP iframe content');
@@ -1624,7 +1661,7 @@ class PurchaseService {
           await new Promise(resolve => setTimeout(resolve, 500)); // Brief wait for content transition
 
           // Re-acquire iframe reference for the backup code input page
-          await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { visible: true, timeout: 6000 });
+          await page.waitForSelector('#purchaseOtpModal iframe[id^="otp-iframe-"]', { timeout: 6000 });
           const otpFrameElement = await page.$('#purchaseOtpModal iframe[id^="otp-iframe-"]');
           const otpFrame = await otpFrameElement.contentFrame();
 
@@ -1755,6 +1792,7 @@ class PurchaseService {
               // This was the InvalidBackupCodeError we threw above
               throw errorCheckErr;
             }
+          }
           }
           } finally {
             if (twoFactorPauseActive && shouldReleaseTwoFactorPause && onTwoFactorEnd) {
