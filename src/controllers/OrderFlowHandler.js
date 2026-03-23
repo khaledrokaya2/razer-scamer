@@ -445,6 +445,16 @@ class OrderFlowHandler {
       }
     }
 
+    // Delete quantity prompt message if exists
+    const quantityPromptMsgId = this.quantityPromptMessages.get(chatId);
+    if (quantityPromptMsgId) {
+      try {
+        await bot.deleteMessage(chatId, quantityPromptMsgId);
+      } catch (delErr) {
+        logger.debug('Could not delete quantity prompt message');
+      }
+    }
+
     // Now clear session and maps
     this.clearSession(chatId);
     this.clearCancellation(chatId);
@@ -683,7 +693,10 @@ class OrderFlowHandler {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
-              [{ text: '⬅️ Back', callback_data: 'order_back_to_cards' }]
+                [
+                  { text: '⬅️ Back', callback_data: 'order_back_to_cards' },
+                  { text: '❌ Cancel', callback_data: 'order_cancel' }
+                ]
             ]
           }
         }
