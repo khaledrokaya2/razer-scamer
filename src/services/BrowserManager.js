@@ -152,7 +152,7 @@ class BrowserManager {
    */
   async launchBrowser() {
     const configuredHeadlessMode = appConfig.browser.headlessMode;
-    const headlessMode = configuredHeadlessMode ?? 'new';
+    const headlessMode = configuredHeadlessMode ?? 'true';
 
     const launchArgs = [
       '--no-sandbox',
