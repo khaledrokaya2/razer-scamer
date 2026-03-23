@@ -1,6 +1,6 @@
 const APP_CONFIG = {
   browser: {
-    headlessMode: 'true',
+    headlessMode: 'false',
     defaultTimeoutMs: 30000,
     reloadCheckIntervalMs: 500,
     maxReloadAttempts: 600,
@@ -35,8 +35,8 @@ const APP_CONFIG = {
     ]
   },
   purchase: {
-    maxParallelPages: 10,
-    maxConcurrentCheckouts: 5,
+    maxParallelPages: 1,
+    maxConcurrentCheckouts: 1,
     sequentialStepDelayMs: 40,
     sequentialStepJitterMs: 25,
     pageOpenStepDelayMs: 260,

@@ -173,7 +173,7 @@ class BrowserManager {
 
 
     const browser = await puppeteer.launch({
-      headless: headlessMode,
+      headless: false,
       protocolTimeout: 180000,
       args: launchArgs
     });

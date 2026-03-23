@@ -935,7 +935,7 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters {userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber}
    * @returns {Promise<Object>} Purchase data
    */
-  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '', onTwoFactorStart = null, onTwoFactorEnd = null, waitForTwoFactorPause = null, resumeFromTwoFactor = false, resumeFromCheckout = false, stopBeforeCheckout = false }) {
+  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '', onTwoFactorStart = null, onTwoFactorEnd = null, waitForTwoFactorPause = null, resumeFromTwoFactor = false, resumeFromCheckout = false, stopBeforeCheckout = false, preferExistingSelection = false }) {
     // ANTI-BAN
     await setupPage(page);
     let currentStage = this.STAGES.IDLE;
@@ -1080,21 +1080,37 @@ class PurchaseService {
       currentStage = this.STAGES.SELECTING_CARD;
       log.debug(`Stage: ${currentStage}`);
 
-      // Check if card is in stock, wait if not
-      const isInStock = await page.evaluate((index) => {
-        const radioInputs = document.querySelectorAll("input[type='radio'][name='paymentAmountItem'], #webshop_step_sku input[type='radio']");
-        return radioInputs[index] ? !radioInputs[index].disabled : false;
+      const readCardSelectionState = async () => page.evaluate((index) => {
+        const isTileSelected = (radio) => {
+          if (!radio) return false;
+          const tile = radio.closest('.selection-tile');
+          if (!tile) return false;
+          return tile.classList.contains('selected')
+            || !!tile.querySelector('.selection-tile__content.selected');
+        };
+
+        const getCardText = (radio) => {
+          const tile = radio && radio.closest('.selection-tile');
+          const txtEl = tile && tile.querySelector('.selection-tile__text');
+          return txtEl ? String(txtEl.textContent || '').trim() : '';
+        };
+
+        const radios = Array.from(document.querySelectorAll("input[type='radio'][name='paymentAmountItem'], #webshop_step_sku input[type='radio']"));
+        const target = radios[index];
+        const selectedIndex = radios.findIndex(r => !!r.checked || isTileSelected(r));
+        const selectedText = selectedIndex >= 0 ? getCardText(radios[selectedIndex]) : '';
+
+        return {
+          exists: !!target,
+          disabled: target ? !!target.disabled : false,
+          selectedIndex,
+          selectedText,
+          targetSelected: target ? (!!target.checked || isTileSelected(target) || selectedIndex === index) : false,
+          total: radios.length
+        };
       }, cardIndex);
 
-      if (!isInStock) {
-        log.warn('Card is OUT OF STOCK, waiting for restock...');
-        await this.waitForCardInStock(page, cardIndex, checkCancellation);
-      }
-
-      // Select card - ensure we click the right one based on actual HTML structure
-      log.purchase(`Selecting card at index ${cardIndex}...`);
-
-      const selectionResult = await this.runWithActionGate(telegramUserId, () => page.evaluate((index) => {
+      const forceSelectCardByIndex = async () => this.runWithActionGate(telegramUserId, () => page.evaluate((index) => {
         const radios = Array.from(document.querySelectorAll("input[type='radio'][name='paymentAmountItem'], #webshop_step_sku input[type='radio']"));
         const target = radios[index];
 
@@ -1112,6 +1128,7 @@ class PurchaseService {
 
         clickTarget.click();
         target.checked = true;
+        target.dispatchEvent(new Event('input', { bubbles: true }));
         target.dispatchEvent(new Event('change', { bubbles: true }));
 
         return { ok: true, total: radios.length };
@@ -1121,20 +1138,70 @@ class PurchaseService {
         taskLabel: 'select card'
       });
 
-      if (!selectionResult.ok) {
-        if (selectionResult.reason === 'not_found') {
-          throw new Error(`Card index ${cardIndex} is out of range. Available cards: ${selectionResult.total}`);
-        }
-        throw new Error(`Card index ${cardIndex} is currently unavailable (${selectionResult.reason})`);
+      // Check if card is in stock, wait if not
+      const isInStock = await page.evaluate((index) => {
+        const radioInputs = document.querySelectorAll("input[type='radio'][name='paymentAmountItem'], #webshop_step_sku input[type='radio']");
+        return radioInputs[index] ? !radioInputs[index].disabled : false;
+      }, cardIndex);
+
+      if (!isInStock) {
+        log.warn('Card is OUT OF STOCK, waiting for restock...');
+        await this.waitForCardInStock(page, cardIndex, checkCancellation);
       }
 
-      log.debug(`Found ${selectionResult.total} card radio options`);
+      let cardAlreadySelected = false;
+      if (preferExistingSelection) {
+        const cardState = await readCardSelectionState().catch(() => null);
 
-      log.success(`Card ${cardIndex} selected successfully`);
+        if (cardState && cardState.exists && !cardState.disabled && cardState.targetSelected) {
+          cardAlreadySelected = true;
+          log.success(`Card ${cardIndex} already selected (verify-only fast path${cardState.selectedText ? `: ${cardState.selectedText}` : ''})`);
+        }
+      }
+
+      if (!cardAlreadySelected) {
+        // Select card - ensure we click the right one based on actual HTML structure
+        log.purchase(`Selecting card at index ${cardIndex}...`);
+
+        const MAX_SELECT_REASSERT_ATTEMPTS = 3;
+        let lastSelectionState = null;
+
+        for (let attempt = 1; attempt <= MAX_SELECT_REASSERT_ATTEMPTS; attempt++) {
+          const selectionResult = await forceSelectCardByIndex();
+
+          if (!selectionResult.ok) {
+            if (selectionResult.reason === 'not_found') {
+              throw new Error(`Card index ${cardIndex} is out of range. Available cards: ${selectionResult.total}`);
+            }
+            throw new Error(`Card index ${cardIndex} is currently unavailable (${selectionResult.reason})`);
+          }
+
+          // Allow reactive UI updates to settle before confirming final selected tile.
+          await this.sleep(170 + (attempt * 60));
+          lastSelectionState = await readCardSelectionState().catch(() => null);
+
+          if (lastSelectionState && lastSelectionState.targetSelected) {
+            log.debug(`Found ${selectionResult.total} card radio options`);
+            log.success(`Card ${cardIndex} selected successfully${lastSelectionState.selectedText ? `: ${lastSelectionState.selectedText}` : ''}`);
+            break;
+          }
+
+          if (attempt < MAX_SELECT_REASSERT_ATTEMPTS) {
+            log.warn(`Card selection drift detected (selected index=${lastSelectionState ? lastSelectionState.selectedIndex : 'unknown'}). Re-asserting target index ${cardIndex}...`);
+          }
+        }
+
+        if (!lastSelectionState || !lastSelectionState.targetSelected) {
+          const selectedDesc = lastSelectionState
+            ? `selected index=${lastSelectionState.selectedIndex}, selected="${lastSelectionState.selectedText || 'unknown'}"`
+            : 'selected index unknown';
+          throw new Error(`Could not lock target card selection at index ${cardIndex} after retries (${selectedDesc})`);
+        }
+      }
 
       // Fast path: attempt payment selection immediately after card click.
       // If payment channels are already hydrated we can skip extra waits.
-      const quickPaymentSelection = await this.runWithActionGate(telegramUserId, () => page.evaluate(() => {
+      const quickPaymentSelection = await this.runWithActionGate(telegramUserId, () => page.evaluate((verifyOnly) => {
         const radios = Array.from(document.querySelectorAll("input[type='radio'][name='paymentChannelItem']"));
         if (radios.length === 0) {
           return { ok: false, reason: 'payment_not_ready' };
@@ -1173,6 +1240,18 @@ class PurchaseService {
           return { ok: false, reason: 'razer_gold_channel_not_found' };
         }
 
+        const tile = targetRadio.closest('.selection-tile');
+        const tileSelected = !!tile && (tile.classList.contains('selected') || !!tile.querySelector('.selection-tile__content.selected'));
+
+        if (verifyOnly) {
+          return {
+            ok: !!targetRadio.checked || tileSelected,
+            reason: (targetRadio.checked || tileSelected) ? 'already_selected' : 'not_selected',
+            channels: radios.length,
+            csMatches: csMatches.length
+          };
+        }
+
         const label = targetRadio.id ? document.querySelector(`label[for="${targetRadio.id}"]`) : null;
         const clickTarget = label || targetRadio;
 
@@ -1183,13 +1262,16 @@ class PurchaseService {
           targetRadio.dispatchEvent(new Event('change', { bubbles: true }));
         }
 
+        const tileAfter = targetRadio.closest('.selection-tile');
+        const tileSelectedAfter = !!tileAfter && (tileAfter.classList.contains('selected') || !!tileAfter.querySelector('.selection-tile__content.selected'));
+
         return {
-          ok: !!targetRadio.checked,
-          reason: targetRadio.checked ? 'selected' : 'selection_not_stuck',
+          ok: !!targetRadio.checked || tileSelectedAfter,
+          reason: (targetRadio.checked || tileSelectedAfter) ? 'selected' : 'selection_not_stuck',
           channels: radios.length,
           csMatches: csMatches.length
         };
-      }), {
+      }, !!preferExistingSelection), {
         skipGap: true,
         taskTimeoutMs: 9000,
         taskLabel: 'quick payment preselect'
@@ -1197,7 +1279,11 @@ class PurchaseService {
 
       const paymentAlreadySelected = !!(quickPaymentSelection && quickPaymentSelection.ok);
       if (paymentAlreadySelected) {
-        log.success('✅ Razer Gold payment method selected successfully (fast path)');
+        if (quickPaymentSelection.reason === 'already_selected') {
+          log.success('✅ Razer Gold payment already selected (verify-only fast path)');
+        } else {
+          log.success('✅ Razer Gold payment method selected successfully (fast path)');
+        }
       }
 
       // Check cancellation
@@ -1302,19 +1388,25 @@ class PurchaseService {
           return { ok: false, reason: 'razer_gold_channel_not_found', channels: radios.length, csMatches: csMatches.length };
         }
 
+        const tile = targetRadio.closest('.selection-tile');
+        const tileSelected = !!tile && (tile.classList.contains('selected') || !!tile.querySelector('.selection-tile__content.selected'));
+
         const label = targetRadio.id ? document.querySelector(`label[for="${targetRadio.id}"]`) : null;
         const clickTarget = (label && isVisible(label)) ? label : targetRadio;
 
-        if (!targetRadio.checked) {
+        if (!targetRadio.checked && !tileSelected) {
           clickTarget.click();
           targetRadio.checked = true;
           targetRadio.dispatchEvent(new Event('input', { bubbles: true }));
           targetRadio.dispatchEvent(new Event('change', { bubbles: true }));
         }
 
+        const tileAfter = targetRadio.closest('.selection-tile');
+        const tileSelectedAfter = !!tileAfter && (tileAfter.classList.contains('selected') || !!tileAfter.querySelector('.selection-tile__content.selected'));
+
         return {
-          ok: !!targetRadio.checked,
-          reason: targetRadio.checked ? 'selected' : 'selection_not_stuck',
+          ok: !!targetRadio.checked || tileSelectedAfter,
+          reason: (targetRadio.checked || tileSelectedAfter) ? 'selected' : 'selection_not_stuck',
           channels: radios.length,
           csMatches: csMatches.length
         };
@@ -2407,7 +2499,7 @@ class PurchaseService {
 
         try {
           await initializeWorkerPage(page, isPrimaryReadyPage);
-          workerPages.push({ page, label, isPrimaryReadyPage, slot: i + 1 });
+          workerPages.push({ page, label, isPrimaryReadyPage, slot: i + 1, selectionPrimed: false });
           logger.purchase(`${label} opened and ready.`);
         } catch (initErr) {
           const isRateLimitError = String(initErr && initErr.message ? initErr.message : '').toLowerCase().includes('rate limited');
@@ -2443,6 +2535,7 @@ class PurchaseService {
             cardNumber,
             page: workerPages[i].page,
             label: workerPages[i].label,
+            worker: workerPages[i],
             failedInPrepare: false
           });
         }
@@ -2456,7 +2549,10 @@ class PurchaseService {
             break;
           }
 
-          logger.purchase(`${assignment.label} Preparing card ${assignment.cardNumber}/${quantity} (navigate + select)...`);
+          const prepareMode = assignment.worker && assignment.worker.selectionPrimed
+            ? 'verify selection + checkout-ready'
+            : 'navigate + select';
+          logger.purchase(`${assignment.label} Preparing card ${assignment.cardNumber}/${quantity} (${prepareMode})...`);
 
           try {
             await this.completePurchase({
@@ -2471,10 +2567,17 @@ class PurchaseService {
               gameName,
               cardName,
               label: assignment.label,
-              stopBeforeCheckout: true
+              stopBeforeCheckout: true,
+              preferExistingSelection: !!(assignment.worker && assignment.worker.selectionPrimed)
             });
+            if (assignment.worker) {
+              assignment.worker.selectionPrimed = true;
+            }
           } catch (prepareErr) {
             assignment.failedInPrepare = true;
+            if (assignment.worker) {
+              assignment.worker.selectionPrimed = false;
+            }
             await processPurchaseError(prepareErr, assignment, 'prepare');
           }
 
