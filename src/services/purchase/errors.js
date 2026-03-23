@@ -31,17 +31,9 @@ class TwoFactorVerificationRequiredError extends Error {
   }
 }
 
-class TwoFactorRestartRequiredError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'TwoFactorRestartRequiredError';
-  }
-}
-
 module.exports = {
   InsufficientBalanceError,
   InvalidBackupCodeError,
   BackupCodeExpiredError,
-  TwoFactorVerificationRequiredError,
-  TwoFactorRestartRequiredError
+  TwoFactorVerificationRequiredError
 };

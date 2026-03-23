@@ -17,8 +17,7 @@ const {
   InsufficientBalanceError,
   InvalidBackupCodeError,
   BackupCodeExpiredError,
-  TwoFactorVerificationRequiredError,
-  TwoFactorRestartRequiredError
+  TwoFactorVerificationRequiredError
 } = require('./purchase/errors');
 const {
   sleep,
@@ -48,9 +47,15 @@ class PurchaseService {
     this.readyBrowsersByUser = new Map(); // userId -> {browser, page, slot}
     this.readyInitLocks = new Map(); // userId -> Promise
     this.twoFactorLocks = new Map(); // userId -> Promise chain lock
+    this.actionLocks = new Map(); // userId -> Promise chain lock for page actions
     this.intentionalReadyCloseUsers = new Set();
     this.MAX_READY_BROWSERS = 1;
-    this.MAX_PARALLEL_PAGES = 10;
+    this.MAX_PARALLEL_PAGES = appConfig.purchase.maxParallelPages ?? 3;
+    this.SEQUENTIAL_STEP_DELAY_MS = appConfig.purchase.sequentialStepDelayMs ?? 120;
+    this.ACTION_GAP_MS = appConfig.purchase.actionGapMs ?? 260;
+    this.ACTION_JITTER_MS = appConfig.purchase.actionJitterMs ?? 120;
+    this.NAV_JITTER_MIN_MS = appConfig.purchase.navJitterMinMs ?? 250;
+    this.NAV_JITTER_MAX_MS = appConfig.purchase.navJitterMaxMs ?? 700;
 
     // Anti-ban staggering between pages/workers.
     this.READY_LOGIN_STAGGER_MS = appConfig.purchase.readyLoginStaggerMs;
@@ -62,8 +67,6 @@ class PurchaseService {
     this.TRANSACTION_DETAIL_STAGGER_MS = appConfig.purchase.transactionDetailStaggerMs;
     this.TRANSACTION_DETAIL_JITTER_MS = appConfig.purchase.transactionDetailJitterMs;
     this.TRANSACTION_API_RATE_DELAY_MS = appConfig.purchase.transactionApiRateDelayMs;
-    this.TWO_FACTOR_RESTART_STAGGER_MS = Math.max(600, Math.floor(this.PURCHASE_PAGE_STAGGER_MS / 2));
-    this.TWO_FACTOR_RESTART_JITTER_MS = Math.max(150, Math.floor(this.PURCHASE_PAGE_JITTER_MS / 4));
     this.TRANSACTIONS_PAGE_URL = 'https://gold.razer.com/global/en/transactions';
     this.TRANSACTION_DETAIL_URL_PREFIX = 'https://gold.razer.com/global/en/transaction/purchase/';
     this.READY_BROWSER_HOME_URL = 'https://gold.razer.com/global/en';
@@ -146,6 +149,43 @@ class PurchaseService {
       release();
       if (this.twoFactorLocks.get(telegramUserId) === current) {
         this.twoFactorLocks.delete(telegramUserId);
+      }
+    }
+  }
+
+  /**
+   * Serialize browser actions per user to avoid same-moment multi-page activity.
+   * @param {string} telegramUserId - Telegram user ID
+   * @param {Function} task - Async page action
+   * @param {{skipGap?: boolean}} options
+   * @returns {Promise<any>}
+   */
+  async runWithActionGate(telegramUserId, task, { skipGap = false } = {}) {
+    const previous = this.actionLocks.get(telegramUserId) || Promise.resolve();
+    let release;
+    const current = new Promise(resolve => {
+      release = resolve;
+    });
+
+    this.actionLocks.set(telegramUserId, current);
+    await previous;
+
+    try {
+      if (!skipGap) {
+        const jitter = this.ACTION_JITTER_MS > 0
+          ? Math.floor(Math.random() * (this.ACTION_JITTER_MS + 1))
+          : 0;
+        const actionDelay = Math.max(0, this.ACTION_GAP_MS + jitter);
+        if (actionDelay > 0) {
+          await this.sleep(actionDelay);
+        }
+      }
+
+      return await task();
+    } finally {
+      release();
+      if (this.actionLocks.get(telegramUserId) === current) {
+        this.actionLocks.delete(telegramUserId);
       }
     }
   }
@@ -784,6 +824,7 @@ class PurchaseService {
     // ANTI-BAN
     await setupPage(page);
     let attempts = 0;
+    const cardSelector = "input[type='radio'][name='paymentAmountItem'], #webshop_step_sku input[type='radio']";
 
     while (attempts < this.MAX_RELOAD_ATTEMPTS) {
       // Check if order was cancelled
@@ -794,10 +835,10 @@ class PurchaseService {
 
       logger.debug(`Checking stock status... (Attempt ${attempts + 1}/${this.MAX_RELOAD_ATTEMPTS})`);
 
-      const isInStock = await page.evaluate((index) => {
-        const radioInputs = document.querySelectorAll("input[type='radio'][data-v-498979e2]");
+      const isInStock = await page.evaluate((index, selector) => {
+        const radioInputs = document.querySelectorAll(selector);
         return radioInputs[index] ? !radioInputs[index].disabled : false;
-      }, cardIndex);
+      }, cardIndex, cardSelector);
 
       if (isInStock) {
         logger.success('Card is IN STOCK!');
@@ -805,12 +846,12 @@ class PurchaseService {
       }
 
       logger.debug('Out of stock, waiting 0.5 seconds before retry...');
-      await new Promise(resolve => setTimeout(resolve, this.RELOAD_CHECK_INTERVAL));
+      await this.sleep(this.RELOAD_CHECK_INTERVAL);
 
       // Reload page
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
       // Wait until card inputs are present (returns early when ready).
-      await page.waitForSelector("input[type='radio'][data-v-498979e2]", { timeout: 1200 }).catch(() => { });
+      await page.waitForSelector(cardSelector, { timeout: 1800 }).catch(() => { });
 
       attempts++;
     }
@@ -823,7 +864,7 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters {userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber}
    * @returns {Promise<Object>} Purchase data
    */
-  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '', onTwoFactorStart = null, onTwoFactorEnd = null, waitForTwoFactorPause = null, shouldDeferTwoFactor = null, resumeFromTwoFactor = false }) {
+  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '', onTwoFactorStart = null, onTwoFactorEnd = null, waitForTwoFactorPause = null, resumeFromTwoFactor = false, resumeFromCheckout = false, stopBeforeCheckout = false }) {
     // ANTI-BAN
     await setupPage(page);
     let currentStage = this.STAGES.IDLE;
@@ -844,9 +885,12 @@ class PurchaseService {
     try {
       let currentUrl = page.url();
       const isSameCatalogPage = createCatalogPageMatcher(gameUrl);
+      const targetGameId = gameUrl.split('/').pop();
 
       if (resumeFromTwoFactor) {
         log.purchase('Resuming purchase process from 2FA checkpoint...');
+      } else if (resumeFromCheckout) {
+        log.purchase('Resuming purchase process from checkout checkpoint...');
       } else {
         log.purchase('Starting purchase process...');
       }
@@ -871,8 +915,8 @@ class PurchaseService {
 
       await waitIfTwoFactorPaused();
 
-      // STAGE 1-4: Full checkout flow (skip in 2FA resume mode)
-      if (!resumeFromTwoFactor) {
+      // STAGE 1-3: Prepare checkout flow (skip in resume modes)
+      if (!resumeFromTwoFactor && !resumeFromCheckout) {
       // STAGE 1: Navigate to game page (skip if already there - HUGE speed boost!)
       currentStage = this.STAGES.NAVIGATING;
       log.debug(`Stage: ${currentStage}`);
@@ -882,22 +926,21 @@ class PurchaseService {
       log.debug(`Target game URL: ${gameUrl}`);
 
       // Extract game identifier (last part of URL) to compare across different regions
-      const targetGameId = gameUrl.split('/').pop();
       const currentGameId = currentUrl.split('/').pop();
       const isSameGame = currentGameId === targetGameId;
 
-      // Anti-rate-limit: random delay (1-4s) before navigation to stagger browser requests
-      // This prevents all browsers in the ready pool from hitting Razer's CDN at the exact same moment
-      const navJitter = 1000 + Math.floor(Math.random() * 3000);
-      await new Promise(resolve => setTimeout(resolve, navJitter));
+      // Short navigation jitter keeps cadence natural without large latency.
+      const navSpan = Math.max(0, this.NAV_JITTER_MAX_MS - this.NAV_JITTER_MIN_MS);
+      const navJitter = this.NAV_JITTER_MIN_MS + (navSpan > 0 ? Math.floor(Math.random() * (navSpan + 1)) : 0);
+      await this.sleep(navJitter);
 
       if (!isSameGame) {
         log.debug('Not on game page, navigating...');
-        await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
+        await this.runWithActionGate(telegramUserId, () => page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 }));
         log.debug(`Navigated to: ${page.url()}`);
       } else {
         log.debug('Already on correct game page, refreshing to ensure clean state...');
-        await page.reload({ waitUntil: 'load', timeout: 60000 });
+        await this.runWithActionGate(telegramUserId, () => page.reload({ waitUntil: 'load', timeout: 60000 }));
         log.debug(`Page refreshed: ${page.url()}`);
       }
 
@@ -914,27 +957,34 @@ class PurchaseService {
             }
             const backoffDelay = (adRetry + 1) * 10000 + Math.floor(Math.random() * 5000);
             log.warn(`Access Denied detected (attempt ${adRetry + 1}/${MAX_ACCESS_DENIED_RETRIES}). Waiting ${Math.round(backoffDelay / 1000)}s...`);
-            await new Promise(resolve => setTimeout(resolve, backoffDelay));
-            await page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 });
+            await this.sleep(backoffDelay);
+            await this.runWithActionGate(telegramUserId, () => page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 }));
             continue; // Retry the check
           }
 
-          // First wait for the main content area to be visible
-          await page.waitForSelector('#webshop_step_sku', { visible: true, timeout: 25000 });
-          log.debug('Main webshop area loaded');
+          // Headless-safe readiness: wait for either denomination radios or card tiles in DOM.
+          await page.evaluate(() => {
+            const section = document.querySelector('#webshop_step_sku, #webshop_step_sku_and_payment_channels');
+            if (section) {
+              section.scrollIntoView({ behavior: 'auto', block: 'center' });
+            }
+          }).catch(() => { });
 
-          // Wait for actual interactive card tiles (the ones with labels and radio inputs)
-          await page.waitForSelector('#webshop_step_sku .selection-tile', {
-            visible: true,
-            timeout: 25000
+          await page.waitForFunction(() => {
+            const radios = document.querySelectorAll("input[name='paymentAmountItem'], #webshop_step_sku input[type='radio']").length;
+            const tiles = document.querySelectorAll('#webshop_step_sku .selection-tile, div[class*="selection-tile"]').length;
+            return radios > 0 || tiles > 0;
+          }, {
+            timeout: 30000,
+            polling: 250
           });
-          log.debug('Card tile containers loaded');
 
-          // Wait for radio inputs to be rendered inside the tiles
-          await page.waitForSelector('#webshop_step_sku .selection-tile input[type="radio"]', {
-            visible: true,
-            timeout: 25000
-          });
+          const detectedCounts = await page.evaluate(() => ({
+            radios: document.querySelectorAll("input[name='paymentAmountItem'], #webshop_step_sku input[type='radio']").length,
+            tiles: document.querySelectorAll('#webshop_step_sku .selection-tile, div[class*="selection-tile"]').length
+          }));
+
+          log.debug(`Card DOM ready (radios=${detectedCounts.radios}, tiles=${detectedCounts.tiles})`);
           log.success('Card tiles loaded successfully');
           break; // Success - exit retry loop
         } catch (err) {
@@ -961,7 +1011,7 @@ class PurchaseService {
 
       // Check if card is in stock, wait if not
       const isInStock = await page.evaluate((index) => {
-        const radioInputs = document.querySelectorAll("input[type='radio'][data-v-498979e2]");
+        const radioInputs = document.querySelectorAll("input[type='radio'][name='paymentAmountItem'], #webshop_step_sku input[type='radio']");
         return radioInputs[index] ? !radioInputs[index].disabled : false;
       }, cardIndex);
 
@@ -973,59 +1023,37 @@ class PurchaseService {
       // Select card - ensure we click the right one based on actual HTML structure
       log.purchase(`Selecting card at index ${cardIndex}...`);
 
-      // Wait for card containers to be fully loaded and clickable
-      await page.waitForSelector('#webshop_step_sku .selection-tile', {
-        visible: true,
-        timeout: 15000
-      });
+      const selectionResult = await this.runWithActionGate(telegramUserId, () => page.evaluate((index) => {
+        const radios = Array.from(document.querySelectorAll("input[type='radio'][name='paymentAmountItem'], #webshop_step_sku input[type='radio']"));
+        const target = radios[index];
 
-      // Get all card containers from the cards section
-      const cardContainers = await page.$$('#webshop_step_sku .selection-tile');
-      log.debug(`Found ${cardContainers.length} card containers`);
-
-      if (cardIndex >= cardContainers.length) {
-        throw new Error(`Card index ${cardIndex} is out of range. Available cards: ${cardContainers.length}`);
-      }
-
-      // Get the specific card container
-      const selectedCardContainer = cardContainers[cardIndex];
-
-      // Try multiple selection methods for reliability
-      let cardSelected = false;
-
-      // Method 1: Click the label (most reliable for radio inputs)
-      try {
-        log.debug('Trying to click card label...');
-        const label = await selectedCardContainer.$('label');
-        if (label) {
-          await label.click();
-          log.success('Clicked card label');
-          cardSelected = true;
+        if (!target) {
+          return { ok: false, reason: 'not_found', total: radios.length };
         }
-      } catch (err) {
-        log.debug('Label click failed, trying radio input...');
-      }
 
-      // Method 2: Click the radio input directly
-      if (!cardSelected) {
-        try {
-          const radioInput = await selectedCardContainer.$('input[type="radio"][name="paymentAmountItem"]');
-          if (radioInput) {
-            await radioInput.click();
-            log.success('Clicked card radio input');
-            cardSelected = true;
-          }
-        } catch (err) {
-          log.debug('Radio input click failed, trying container...');
+        if (target.disabled) {
+          return { ok: false, reason: 'disabled', total: radios.length };
         }
+
+        const clickTarget = target.id
+          ? document.querySelector(`label[for="${target.id}"]`) || target
+          : target;
+
+        clickTarget.click();
+        target.checked = true;
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+
+        return { ok: true, total: radios.length };
+      }, cardIndex));
+
+      if (!selectionResult.ok) {
+        if (selectionResult.reason === 'not_found') {
+          throw new Error(`Card index ${cardIndex} is out of range. Available cards: ${selectionResult.total}`);
+        }
+        throw new Error(`Card index ${cardIndex} is currently unavailable (${selectionResult.reason})`);
       }
 
-      // Method 3: Click the container itself
-      if (!cardSelected) {
-        await selectedCardContainer.click();
-        log.success('Clicked card container');
-        cardSelected = true;
-      }
+      log.debug(`Found ${selectionResult.total} card radio options`);
 
       // Wait until the selected card radio is actually checked.
       await page.waitForFunction((index) => {
@@ -1048,19 +1076,17 @@ class PurchaseService {
       currentStage = this.STAGES.SELECTING_PAYMENT;
       log.debug(`Stage: ${currentStage}`);
 
-      // Wait for payment methods section to load and become interactive
-      await page.waitForSelector("#webshop_step_payment_channels", {
-        visible: true,
-        timeout: 6000
-      });
-
       // Select Razer Gold as payment method
       log.purchase('Selecting Razer Gold payment...');
 
-      // Wait for payment methods container to load
-      await page.waitForSelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']", {
-        visible: true,
-        timeout: 6000
+      // Wait for payment channels to hydrate; this is more reliable than a single hardcoded container selector.
+      await page.waitForFunction(() => {
+        const section = document.querySelector('#webshop_step_payment_channels');
+        const channelRadios = document.querySelectorAll("input[type='radio'][name='paymentChannelItem']");
+        return !!section && channelRadios.length > 0;
+      }, {
+        timeout: 20000,
+        polling: 250
       });
 
       // Scroll the payment section into view
@@ -1071,115 +1097,92 @@ class PurchaseService {
         }
       });
 
-      log.debug('Looking for Razer Gold payment method...');
+      const paymentStats = await page.evaluate(() => ({
+        channelCount: document.querySelectorAll("input[type='radio'][name='paymentChannelItem']").length,
+        rzByCsId: document.querySelectorAll("[data-cs-override-id*='razergold']").length,
+        rzByLabel: Array.from(document.querySelectorAll('label')).filter(l => (l.textContent || '').toLowerCase().includes('razer gold')).length
+      }));
+      log.debug(`Payment DOM ready (channels=${paymentStats.channelCount}, csIdMatches=${paymentStats.rzByCsId}, labelMatches=${paymentStats.rzByLabel})`);
 
-      // Try multiple selection methods with JavaScript clicks for reliability
-      let paymentSelected = false;
+      const paymentSelection = await this.runWithActionGate(telegramUserId, () => page.evaluate(() => {
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+        };
 
-      // Method 1: Direct JavaScript click on radio input (most reliable)
-      try {
-        log.debug('Method 1: Trying JavaScript click on radio input...');
-        paymentSelected = await page.evaluate(() => {
-          const container = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
-          if (!container) return false;
-
-          const radioInput = container.querySelector('input[type="radio"][name="paymentChannelItem"]');
-          if (radioInput) {
-            radioInput.click();
-            radioInput.checked = true;
-            // Trigger change event
-            const event = new Event('change', { bubbles: true });
-            radioInput.dispatchEvent(event);
-            return radioInput.checked;
-          }
-          return false;
-        });
-
-        if (paymentSelected) {
-          log.success('✓ Razer Gold radio input clicked via JavaScript');
+        const channelsSection = document.querySelector('#webshop_step_payment_channels');
+        if (!channelsSection) {
+          return { ok: false, reason: 'payment_section_missing' };
         }
-      } catch (err) {
-        log.debug('Method 1 failed:', err.message);
-      }
 
-      // Method 2: JavaScript click on label
-      if (!paymentSelected) {
-        try {
-          log.debug('Method 2: Trying JavaScript click on label...');
-          paymentSelected = await page.evaluate(() => {
-            const container = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
-            if (!container) return false;
+        const radios = Array.from(document.querySelectorAll("input[type='radio'][name='paymentChannelItem']"));
+        if (radios.length === 0) {
+          return { ok: false, reason: 'no_payment_radios' };
+        }
 
-            const label = container.querySelector('label');
-            if (label) {
-              label.click();
-              // Check if radio is now selected
-              const radioInput = container.querySelector('input[type="radio"][name="paymentChannelItem"]');
-              return radioInput ? radioInput.checked : false;
-            }
-            return false;
+        const csMatches = Array.from(document.querySelectorAll("[data-cs-override-id]"))
+          .filter(el => String(el.getAttribute('data-cs-override-id') || '').toLowerCase().includes('razergold'));
+
+        const findRazerGoldRadio = () => {
+          for (const host of csMatches) {
+            const radio = host.querySelector("input[type='radio'][name='paymentChannelItem']");
+            if (radio) return radio;
+          }
+
+          const labelMatch = Array.from(document.querySelectorAll('label')).find(label => {
+            const txt = (label.textContent || '').toLowerCase();
+            return txt.includes('razer gold');
           });
 
-          if (paymentSelected) {
-            log.success('✓ Razer Gold label clicked via JavaScript');
-          }
-        } catch (err) {
-          log.debug('Method 2 failed:', err.message);
-        }
-      }
-
-      // Method 3: Puppeteer click on label
-      if (!paymentSelected) {
-        try {
-          log.debug('Method 3: Trying Puppeteer click on label...');
-          const container = await page.$("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
-          if (container) {
-            const label = await container.$('label');
-            if (label) {
-              await label.click();
-              // Verify selection
-              paymentSelected = await page.evaluate(() => {
-                const radioInput = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet'] input[type='radio']");
-                return radioInput ? radioInput.checked : false;
-              });
-
-              if (paymentSelected) {
-                log.success('✓ Razer Gold label clicked via Puppeteer');
-              }
+          if (labelMatch) {
+            const forId = labelMatch.getAttribute('for');
+            if (forId) {
+              const radio = document.getElementById(forId);
+              if (radio && radio.name === 'paymentChannelItem') return radio;
             }
+
+            const nested = labelMatch.querySelector("input[type='radio'][name='paymentChannelItem']");
+            if (nested) return nested;
           }
-        } catch (err) {
-          log.debug('Method 3 failed:', err.message);
-        }
-      }
 
-      // Method 4: Puppeteer click on radio input
-      if (!paymentSelected) {
-        try {
-          log.debug('Method 4: Trying Puppeteer click on radio input...');
-          const container = await page.$("div[data-cs-override-id='purchase-paychann-razergoldwallet']");
-          if (container) {
-            const radioInput = await container.$('input[type="radio"][name="paymentChannelItem"]');
-            if (radioInput) {
-              await radioInput.click();
-              // Verify selection
-              paymentSelected = await page.evaluate(() => {
-                const radioInput = document.querySelector("div[data-cs-override-id='purchase-paychann-razergoldwallet'] input[type='radio']");
-                return radioInput ? radioInput.checked : false;
-              });
-
-              if (paymentSelected) {
-                log.success('✓ Razer Gold radio input clicked via Puppeteer');
-              }
-            }
+          const imgMatch = Array.from(document.querySelectorAll("img[alt]"))
+            .find(img => (img.getAttribute('alt') || '').toLowerCase().includes('razer gold'));
+          if (imgMatch) {
+            const host = imgMatch.closest('[data-cs-override-id], .selection-tile, .col-12, .col-sm-6');
+            const radio = host && host.querySelector("input[type='radio'][name='paymentChannelItem']");
+            if (radio) return radio;
           }
-        } catch (err) {
-          log.debug('Method 4 failed:', err.message);
-        }
-      }
 
-      if (!paymentSelected) {
-        throw new Error('❌ Failed to select Razer Gold payment method - all methods failed');
+          return null;
+        };
+
+        const targetRadio = findRazerGoldRadio();
+        if (!targetRadio) {
+          return { ok: false, reason: 'razer_gold_channel_not_found', channels: radios.length, csMatches: csMatches.length };
+        }
+
+        const label = targetRadio.id ? document.querySelector(`label[for="${targetRadio.id}"]`) : null;
+        const clickTarget = (label && isVisible(label)) ? label : targetRadio;
+
+        if (!targetRadio.checked) {
+          clickTarget.click();
+          targetRadio.checked = true;
+          targetRadio.dispatchEvent(new Event('input', { bubbles: true }));
+          targetRadio.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        return {
+          ok: !!targetRadio.checked,
+          reason: targetRadio.checked ? 'selected' : 'selection_not_stuck',
+          channels: radios.length,
+          csMatches: csMatches.length
+        };
+      }));
+
+      if (!paymentSelection.ok) {
+        throw new Error(`Failed to select Razer Gold payment method (${paymentSelection.reason}, channels=${paymentSelection.channels || 0}, matches=${paymentSelection.csMatches || 0})`);
       }
 
       log.success('✅ Razer Gold payment method selected successfully');
@@ -1191,7 +1194,22 @@ class PurchaseService {
 
       await waitIfTwoFactorPaused();
 
-      // STAGE 4: Click checkout
+      // Allow phased orchestration to stop here and checkout later.
+      if (stopBeforeCheckout) {
+        log.success('Pre-checkout stages complete. Waiting for orchestrator to trigger checkout.');
+        return {
+          success: null,
+          preparedForCheckout: true,
+          stage: currentStage,
+          gameName,
+          cardValue: cardName,
+          cardNumber
+        };
+      }
+      }
+
+      // STAGE 4: Click checkout (skip only when resuming directly from 2FA)
+      if (!resumeFromTwoFactor) {
       currentStage = this.STAGES.CLICKING_CHECKOUT;
       log.debug(`Stage: ${currentStage}`);
 
@@ -1243,7 +1261,7 @@ class PurchaseService {
         throw new Error('❌ Could not find checkout button');
       }
 
-      await checkoutButton.click();
+      await this.runWithActionGate(telegramUserId, () => checkoutButton.click());
       log.success('Checkout button clicked successfully');
 
       // Wait for navigation after checkout (optimized timeout)
@@ -1388,11 +1406,6 @@ class PurchaseService {
         }
         // Handle 2FA flow  
         else if (checkoutResult.type === '2fa') {
-          if (shouldDeferTwoFactor && await shouldDeferTwoFactor()) {
-            log.warn('2FA detected but another page owns active verification; deferring this page until restart queue');
-            throw new TwoFactorRestartRequiredError('2FA detected while another page handles verification; defer and retry after restart');
-          }
-
           let twoFactorPauseActive = false;
           let shouldReleaseTwoFactorPause = true;
           if (onTwoFactorStart) {
@@ -1863,7 +1876,10 @@ class PurchaseService {
 
   /**
    * Process bulk purchases using one persistent browser with parallel pages.
-    * Backup codes are shared and consumed only when the active worker hits 2FA.
+   * Flow is intentionally phased to look sequential while still using multiple pages.
+   * Phase A: open pages one-by-one
+   * Phase B: prepare each page (navigate -> card -> payment) one-by-one
+   * Phase C: checkout each prepared page one-by-one (2FA handled serially)
    */
   async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, onProgress, onCardCompleted, checkCancellation }) {
     const db = require('./DatabaseService');
@@ -1900,7 +1916,7 @@ class PurchaseService {
     }
 
     const workerCount = Math.min(quantity, this.MAX_PARALLEL_PAGES);
-    logger.purchase(`Using one browser with ${workerCount} parallel page(s)`);
+    logger.purchase(`Using phased purchase flow with ${workerCount} parallel page(s)`);
 
     const sharedState = {
       cardQueue: Array.from({ length: quantity }, (_, i) => i + 1), // [1, 2, 3, ..., quantity]
@@ -1909,62 +1925,7 @@ class PurchaseService {
       failedCount: 0,
       processedCount: 0,
       cancelled: false,
-      activeWorkerCount: workerCount,
-      allWorkersStopped: false,
-      pendingDbSaves: [], // Track all DB save promises to ensure they complete before exit
-      twoFactorPause: {
-        active: false,
-        owner: null,
-        activatedAt: 0,
-        releaseSeq: 0
-      }
-    };
-
-    const waitForTwoFactorPauseToClear = async (workerLabel) => {
-      let loggedWait = false;
-      while (
-        sharedState.twoFactorPause.active
-        && sharedState.twoFactorPause.owner !== workerLabel
-        && !sharedState.cancelled
-        && !(checkCancellation && checkCancellation())
-      ) {
-        if (!loggedWait) {
-          logger.warn(`${workerLabel} Pausing because ${sharedState.twoFactorPause.owner} is completing 2FA verification...`);
-          loggedWait = true;
-        }
-
-        const cancelled = await this.sleepCancellable(350, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
-        if (cancelled) {
-          sharedState.cancelled = true;
-          return false;
-        }
-      }
-
-      if (loggedWait) {
-        logger.success(`${workerLabel} 2FA pause released. Resuming purchase flow.`);
-      }
-
-      return true;
-    };
-
-    const startTwoFactorPause = async (workerLabel) => {
-      if (!sharedState.twoFactorPause.active) {
-        sharedState.twoFactorPause.active = true;
-        sharedState.twoFactorPause.owner = workerLabel;
-        sharedState.twoFactorPause.activatedAt = Date.now();
-        logger.warn(`${workerLabel} detected 2FA modal. Temporarily pausing other worker pages...`);
-      }
-    };
-
-    const endTwoFactorPause = async (workerLabel) => {
-      if (sharedState.twoFactorPause.active && sharedState.twoFactorPause.owner === workerLabel) {
-        const heldMs = Date.now() - sharedState.twoFactorPause.activatedAt;
-        sharedState.twoFactorPause.active = false;
-        sharedState.twoFactorPause.owner = null;
-        sharedState.twoFactorPause.activatedAt = 0;
-        sharedState.twoFactorPause.releaseSeq += 1;
-        logger.success(`${workerLabel} finished 2FA flow. Restarting worker pages to sync cookies before continuing (${heldMs}ms pause).`);
-      }
+      pendingDbSaves: [] // Track all DB save promises to ensure they complete before exit
     };
 
     /**
@@ -1987,10 +1948,33 @@ class PurchaseService {
       return savePromise;
     };
 
+    const bumpProgress = async () => {
+      if (!onProgress) return;
+      try {
+        await onProgress(sharedState.processedCount, quantity);
+      } catch (progressErr) {
+        logger.debug(`Progress callback error: ${progressErr.message}`);
+      }
+    };
+
+    const waitStepDelay = async (phaseLabel, idx, total) => {
+      if (idx >= total - 1) return true;
+
+      const delayMs = this.SEQUENTIAL_STEP_DELAY_MS + Math.floor(Math.random() * 160);
+      logger.debug(`Phase delay after ${phaseLabel}: ${delayMs}ms`);
+      const cancelled = await this.sleepCancellable(delayMs, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
+      if (cancelled) {
+        sharedState.cancelled = true;
+        return false;
+      }
+
+      return true;
+    };
+
     logger.purchase(`\n${'='.repeat(60)}`);
-    logger.purchase(`Starting PARALLEL bulk purchase: ${quantity} x ${cardName}`);
-    logger.purchase(`One browser session shared by ${workerCount} parallel page(s)`);
-    logger.purchase(`Backup codes will be consumed only when 2FA appears`);
+    logger.purchase(`Starting PHASED bulk purchase: ${quantity} x ${cardName}`);
+    logger.purchase(`One browser session shared by ${workerCount} page(s)`);
+    logger.purchase(`Each stage runs page-by-page to keep flow sequential and stable`);
     logger.purchase(`${'='.repeat(60)}\n`);
 
     const getNextBackupCode = async () => {
@@ -2016,7 +2000,7 @@ class PurchaseService {
       }
 
       await withRetry(async () => {
-        await page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await this.runWithActionGate(telegramUserId, () => page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }));
         if (await isBanned(page)) throw new Error('rate limited');
       });
 
@@ -2030,559 +2014,301 @@ class PurchaseService {
       }
     };
 
-    /**
-     * Open one worker page and process cards from the shared queue.
-     */
-    const runPurchaseSession = async (sessionIndex) => {
-      const label = `[Page ${sessionIndex + 1}]`;
-      const isPrimaryReadyPage = sessionIndex === 0;
-      let page = null;
-      let cardsProcessed = 0;
-      let lastSeenTwoFactorReleaseSeq = 0;
+    const postCheckoutStages = ['clicking_checkout', 'processing_2fa', 'reached_transaction_page', 'extracting_pin_data'];
+    const workerPages = [];
 
-      const restartWorkerAfterTwoFactorIfNeeded = async () => {
-        const releaseSeq = sharedState.twoFactorPause.releaseSeq || 0;
-        if (releaseSeq <= lastSeenTwoFactorReleaseSeq) {
-          return true;
-        }
+    const processPurchaseError = async (purchaseErr, assignment, phase) => {
+      const { cardNumber, label } = assignment;
+      const checkoutAlreadyClicked = postCheckoutStages.includes(purchaseErr.stage);
 
-        const restartDelay = sessionIndex === 0
-          ? 0
-          : this.getStaggerDelay(
-            sessionIndex - 1,
-            this.TWO_FACTOR_RESTART_STAGGER_MS,
-            this.TWO_FACTOR_RESTART_JITTER_MS
-          );
+      if (purchaseErr instanceof InsufficientBalanceError) {
+        logger.error(`${label} 💰 Insufficient balance - stopping all pages`);
+        sharedState.cancelled = true;
+        sharedState.failedCount++;
+        sharedState.processedCount++;
+        sharedState.purchases.push({
+          success: false,
+          transactionId: purchaseErr.transactionId || null,
+          pinCode: 'FAILED',
+          serial: 'FAILED',
+          error: purchaseErr.message,
+          stage: purchaseErr.stage,
+          requiresManualCheck: false
+        });
+        await bumpProgress();
+        return;
+      }
 
-        if (restartDelay > 0) {
-          logger.debug(`${label} Delaying post-2FA restart by ${restartDelay}ms to reduce rate-limit risk...`);
-          const cancelledDuringDelay = await this.sleepCancellable(
-            restartDelay,
-            () => sharedState.cancelled || (checkCancellation && checkCancellation())
-          );
-          if (cancelledDuringDelay) {
-            sharedState.cancelled = true;
-            return false;
-          }
-        }
-
-        logger.info(`${label} Restarting page after 2FA to refresh session cookies...`);
-
-        try {
-          await setupPage(page);
-
-          if (!isPrimaryReadyPage) {
-            await syncReadySessionCookies(page);
-          }
-
-          await withRetry(async () => {
-            await page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            if (await isBanned(page)) throw new Error('rate limited');
-          });
-
-          const sessionValid = await browserManager.checkSessionValid(page);
-          if (!sessionValid) {
-            throw new Error('session invalid after 2FA restart');
-          }
-
-          lastSeenTwoFactorReleaseSeq = releaseSeq;
-          logger.success(`${label} Restart complete after 2FA. Continuing purchase flow.`);
-          return true;
-        } catch (restartErr) {
-          logger.error(`${label} Failed to restart after 2FA: ${restartErr.message}`);
-          if (isPrimaryReadyPage) {
-            sharedState.cancelled = true;
-          }
-          return false;
-        }
-      };
-
-      try {
-        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-          sharedState.cancelled = true;
-          logger.info(`${label} Order already cancelled - skipping`);
+      if (purchaseErr instanceof BackupCodeExpiredError || purchaseErr instanceof InvalidBackupCodeError) {
+        if (!checkoutAlreadyClicked) {
+          sharedState.cardQueue.unshift(cardNumber);
+          logger.warn(`${label} ${phase} backup-code error before checkout. Card ${cardNumber} re-queued.`);
           return;
         }
 
-        if (isPrimaryReadyPage) {
-          page = readyPage;
-          await initializeWorkerPage(page, true);
-          logger.purchase(`${label} Using logged-in ready page.`);
+        const requiresManualResult = {
+          success: false,
+          transactionId: purchaseErr.transactionId || null,
+          pinCode: 'FAILED',
+          serialNumber: 'FAILED',
+          requiresManualCheck: true,
+          error: `${purchaseErr.message}. Checkout was already clicked; do not auto-retry this card.`,
+          gameName,
+          cardValue: cardName,
+          stage: purchaseErr.stage
+        };
+
+        sharedState.failedCount++;
+        sharedState.processedCount++;
+        sharedState.purchases.push(requiresManualResult);
+        await trackedCardSave(requiresManualResult, cardNumber, label);
+        requiresManualResult.savedToDb = true;
+        await bumpProgress();
+        return;
+      }
+
+      if (purchaseErr instanceof TwoFactorVerificationRequiredError) {
+        // Should normally be handled by the checkout lock path.
+        sharedState.cardQueue.unshift(cardNumber);
+        logger.warn(`${label} 2FA still pending during ${phase}. Card ${cardNumber} re-queued.`);
+        return;
+      }
+
+      if (purchaseErr.message && purchaseErr.message.includes('cancelled by user')) {
+        if (purchaseErr.transactionId) {
+          const rescuedResult = {
+            success: false,
+            transactionId: purchaseErr.transactionId,
+            pinCode: 'FAILED',
+            serialNumber: 'FAILED',
+            requiresManualCheck: true,
+            error: 'Purchase confirmed but cancelled before PIN extraction',
+            gameName,
+            cardValue: cardName
+          };
+          sharedState.purchases.push(rescuedResult);
+          sharedState.failedCount++;
+          sharedState.processedCount++;
+          await trackedCardSave(rescuedResult, cardNumber, label);
+          rescuedResult.savedToDb = true;
+          await bumpProgress();
         } else {
-          page = await readyContext.newPage();
-          await initializeWorkerPage(page, false);
-          logger.purchase(`${label} Worker page ready in logged-in context.`);
+          sharedState.cardQueue.unshift(cardNumber);
         }
 
-        while (true) {
+        sharedState.cancelled = true;
+        logger.info(`${label} Order cancelled by user`);
+        return;
+      }
+
+      let otherErrorSavedToDb = false;
+      if (purchaseErr.transactionId) {
+        const rescuedResult = {
+          success: false,
+          transactionId: purchaseErr.transactionId,
+          pinCode: 'FAILED',
+          serialNumber: 'FAILED',
+          requiresManualCheck: true,
+          error: `Purchase confirmed but error during processing: ${purchaseErr.message}`,
+          gameName,
+          cardValue: cardName
+        };
+        await trackedCardSave(rescuedResult, cardNumber, label);
+        otherErrorSavedToDb = true;
+      } else if (checkoutAlreadyClicked) {
+        const ghostResult = {
+          success: false,
+          transactionId: null,
+          pinCode: 'FAILED',
+          serialNumber: 'FAILED',
+          requiresManualCheck: true,
+          error: `Error after checkout clicked (${purchaseErr.stage}): ${purchaseErr.message}. Purchase may have gone through - check transaction history.`,
+          gameName,
+          cardValue: cardName
+        };
+        await trackedCardSave(ghostResult, cardNumber, label);
+        otherErrorSavedToDb = true;
+      }
+
+      logger.error(`${label} Card ${cardNumber} failed during ${phase}: ${purchaseErr.message}`);
+      sharedState.failedCount++;
+      sharedState.processedCount++;
+      sharedState.purchases.push({
+        success: false,
+        transactionId: purchaseErr.transactionId || null,
+        pinCode: 'FAILED',
+        serial: 'FAILED',
+        error: purchaseErr.message,
+        stage: purchaseErr.stage,
+        requiresManualCheck: true,
+        savedToDb: otherErrorSavedToDb
+      });
+      await bumpProgress();
+    };
+
+    try {
+      // Phase A: Open and initialize pages sequentially with delay between each page.
+      for (let i = 0; i < workerCount; i++) {
+        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+          sharedState.cancelled = true;
+          break;
+        }
+
+        const label = `[Page ${i + 1}]`;
+        const isPrimaryReadyPage = i === 0;
+        const page = isPrimaryReadyPage ? readyPage : await readyContext.newPage();
+
+        await initializeWorkerPage(page, isPrimaryReadyPage);
+        workerPages.push({ page, label, isPrimaryReadyPage, slot: i + 1 });
+        logger.purchase(`${label} opened and ready.`);
+
+        const shouldContinue = await waitStepDelay('page open', i, workerCount);
+        if (!shouldContinue) break;
+      }
+
+      // Phased card processing loop.
+      while (!sharedState.cancelled && !(checkCancellation && checkCancellation()) && sharedState.cardQueue.length > 0) {
+        const assignments = [];
+
+        for (let i = 0; i < workerPages.length && sharedState.cardQueue.length > 0; i++) {
+          const cardNumber = sharedState.cardQueue.shift();
+          assignments.push({
+            cardNumber,
+            page: workerPages[i].page,
+            label: workerPages[i].label,
+            failedInPrepare: false
+          });
+        }
+
+        // Phase B: Prepare each page (navigate, select card, select payment) sequentially.
+        for (let i = 0; i < assignments.length; i++) {
+          const assignment = assignments[i];
           if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
             sharedState.cancelled = true;
-            logger.info(`${label} Order cancelled - stopping`);
+            sharedState.cardQueue.unshift(assignment.cardNumber);
             break;
           }
 
-          const canContinue = await waitForTwoFactorPauseToClear(label);
-          if (!canContinue) {
-            break;
-          }
+          logger.purchase(`${assignment.label} Preparing card ${assignment.cardNumber}/${quantity} (navigate + select)...`);
 
-          if (!(await restartWorkerAfterTwoFactorIfNeeded())) {
-            break;
-          }
-
-          let pageDead = false;
           try {
-            if (!browser || !browser.isConnected() || !page || page.isClosed()) {
-              pageDead = true;
-            } else {
-              await page.evaluate(() => true); // Quick responsiveness check
-            }
-          } catch (aliveErr) {
-            pageDead = true;
+            await this.completePurchase({
+              telegramUserId,
+              page: assignment.page,
+              gameUrl,
+              cardIndex,
+              backupCode: null,
+              backupCodeId: null,
+              checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+              cardNumber: assignment.cardNumber,
+              gameName,
+              cardName,
+              label: assignment.label,
+              stopBeforeCheckout: true
+            });
+          } catch (prepareErr) {
+            assignment.failedInPrepare = true;
+            await processPurchaseError(prepareErr, assignment, 'prepare');
           }
 
-          if (pageDead) {
-            if (isPrimaryReadyPage) {
-              logger.error(`${label} Ready page is closed/disconnected. Stop purchase and run /start to login again.`);
-              sharedState.cancelled = true;
-              break;
-            }
+          const shouldContinue = await waitStepDelay('prepare stage', i, assignments.length);
+          if (!shouldContinue) break;
+        }
 
-            logger.warn(`${label} Worker page crashed/closed - recreating from logged-in context...`);
+        // Phase C: Checkout prepared pages one-by-one, including serialized 2FA handling.
+        for (let i = 0; i < assignments.length; i++) {
+          const assignment = assignments[i];
+          if (assignment.failedInPrepare) continue;
+          if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+            sharedState.cancelled = true;
+            sharedState.cardQueue.unshift(assignment.cardNumber);
+            break;
+          }
+
+          logger.purchase(`${assignment.label} Checkout for card ${assignment.cardNumber}/${quantity}...`);
+
+          try {
+            let result;
+
             try {
-              if (page && !page.isClosed()) {
-                await page.close().catch(() => { });
-              }
-              this.untrackPurchasePage(telegramUserId, page);
-
-              page = await readyContext.newPage();
-              await initializeWorkerPage(page, false);
-              logger.success(`${label} Worker page recreated`);
-              continue;
-            } catch (pageErr) {
-              logger.error(`${label} Failed to recreate worker page: ${pageErr.message}`);
-              break;
-            }
-          }
-
-          // Get next card from queue
-          const cardNumber = sharedState.cardQueue.shift();
-          if (cardNumber === undefined) {
-            logger.debug(`${label} Queue empty - finished after ${cardsProcessed} cards`);
-            break;
-          }
-
-          const canStartCard = await waitForTwoFactorPauseToClear(label);
-          if (!canStartCard) {
-            sharedState.cardQueue.unshift(cardNumber);
-            break;
-          }
-
-          if (!(await restartWorkerAfterTwoFactorIfNeeded())) {
-            sharedState.cardQueue.unshift(cardNumber);
-            break;
-          }
-
-          // Add tiny per-page stagger before each purchase cycle to avoid synchronized spikes.
-          const perCardStagger = this.getStaggerDelay(
-            sessionIndex,
-            this.PURCHASE_CARD_STAGGER_MS,
-            this.PURCHASE_CARD_JITTER_MS
-          );
-          if (perCardStagger > 0) {
-            const cancelled = await this.sleepCancellable(perCardStagger, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
-            if (cancelled) {
-              sharedState.cancelled = true;
-              break;
-            }
-          }
-
-          logger.purchase(`${label} Processing card ${cardNumber}/${quantity}...`);
-
-          try {
-            const runPurchase = async (backupCodeRecord = null) => {
-              return this.completePurchase({
+              result = await this.completePurchase({
                 telegramUserId,
-                page,
+                page: assignment.page,
                 gameUrl,
                 cardIndex,
-                backupCode: backupCodeRecord ? backupCodeRecord.code : null,
-                backupCodeId: backupCodeRecord ? backupCodeRecord.id : null,
+                backupCode: null,
+                backupCodeId: null,
                 checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                cardNumber,
+                cardNumber: assignment.cardNumber,
                 gameName,
                 cardName,
-                label,
-                onTwoFactorStart: async () => startTwoFactorPause(label),
-                onTwoFactorEnd: async () => endTwoFactorPause(label),
-                waitForTwoFactorPause: async () => waitForTwoFactorPauseToClear(label),
-                shouldDeferTwoFactor: async () => (
-                  sharedState.twoFactorPause.active
-                  && sharedState.twoFactorPause.owner
-                  && sharedState.twoFactorPause.owner !== label
-                )
+                label: assignment.label,
+                resumeFromCheckout: true
               });
-            };
-
-            let result;
-            try {
-              result = await runPurchase(null);
             } catch (err) {
               if (!(err instanceof BackupCodeExpiredError) && !(err instanceof TwoFactorVerificationRequiredError)) {
                 throw err;
               }
 
               result = await this.runWithUserLock(telegramUserId, async () => {
-                let needsResumeFromTwoFactor = err instanceof TwoFactorVerificationRequiredError;
-
-                // If first error was not explicit 2FA handoff, give one more pre-2FA attempt under lock.
-                if (!needsResumeFromTwoFactor) {
-                  try {
-                    return await runPurchase(null);
-                  } catch (lockedErr) {
-                    if (!(lockedErr instanceof BackupCodeExpiredError) && !(lockedErr instanceof TwoFactorVerificationRequiredError)) {
-                      throw lockedErr;
-                    }
-                    needsResumeFromTwoFactor = lockedErr instanceof TwoFactorVerificationRequiredError;
-                  }
-                }
-
                 const nextBackupCode = await getNextBackupCode();
                 if (!nextBackupCode) {
                   throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA. Add more backup codes and retry remaining cards.');
                 }
 
-                logger.warn(`${label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
-                await humanDelay(1000, 2200);
+                logger.warn(`${assignment.label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
+                await humanDelay(900, 1700);
 
                 return this.completePurchase({
                   telegramUserId,
-                  page,
+                  page: assignment.page,
                   gameUrl,
                   cardIndex,
                   backupCode: nextBackupCode.code,
                   backupCodeId: nextBackupCode.id,
                   checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                  cardNumber,
+                  cardNumber: assignment.cardNumber,
                   gameName,
                   cardName,
-                  label,
-                  onTwoFactorStart: async () => startTwoFactorPause(label),
-                  onTwoFactorEnd: async () => endTwoFactorPause(label),
-                  waitForTwoFactorPause: async () => waitForTwoFactorPauseToClear(label),
-                  shouldDeferTwoFactor: async () => (
-                    sharedState.twoFactorPause.active
-                    && sharedState.twoFactorPause.owner
-                    && sharedState.twoFactorPause.owner !== label
-                  ),
-                  resumeFromTwoFactor: needsResumeFromTwoFactor
+                  label: assignment.label,
+                  resumeFromTwoFactor: true
                 });
               });
             }
 
-            // Safety release: if this worker owns the 2FA pause gate, unlock it now.
-            await endTwoFactorPause(label);
-
-            // Handle result
             sharedState.purchases.push(result);
-            cardsProcessed++;
+            sharedState.processedCount++;
 
             if (result.success) {
               sharedState.successCount++;
-              logger.success(`${label} Card ${cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
-
-              // GUARANTEED DB save - tracked and cannot be interrupted
-              await trackedCardSave(result, cardNumber, label);
+              logger.success(`${assignment.label} Card ${assignment.cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
+              await trackedCardSave(result, assignment.cardNumber, assignment.label);
               result.savedToDb = true;
             } else {
               sharedState.failedCount++;
-              logger.warn(`${label} Card ${cardNumber}/${quantity} reached transaction but extraction FAILED`);
-
-              // CRITICAL: If extraction failed but we have a transaction ID, save to DB anyway
-              // This means money was spent - must be tracked for manual PIN recovery
+              logger.warn(`${assignment.label} Card ${assignment.cardNumber}/${quantity} reached transaction but extraction FAILED`);
               if (result.transactionId) {
-                await trackedCardSave(result, cardNumber, label);
+                await trackedCardSave(result, assignment.cardNumber, assignment.label);
                 result.savedToDb = true;
               }
             }
 
-            // Update progress
-            sharedState.processedCount++;
-            if (onProgress) {
-              try {
-                await onProgress(sharedState.processedCount, quantity);
-              } catch (progressErr) {
-                logger.debug(`${label} Progress callback error:`, progressErr.message);
-              }
-            }
-
-          } catch (purchaseErr) {
-            // Helper: determine if checkout was already clicked (point of no return)
-            // If checkout was clicked, the purchase MAY have gone through on Razer's side
-            // even if we got an error. NEVER retry/return card to queue after checkout!
-            const postCheckoutStages = ['clicking_checkout', 'processing_2fa', 'reached_transaction_page', 'extracting_pin_data'];
-            const checkoutAlreadyClicked = postCheckoutStages.includes(purchaseErr.stage);
-
-            // ===== BACKUP CODE SESSION EXPIRED =====
-            if (purchaseErr instanceof BackupCodeExpiredError) {
-              if (checkoutAlreadyClicked) {
-                // CRITICAL: Checkout was already clicked! Razer may have processed the purchase.
-                // Do NOT return card to queue - that would cause a DUPLICATE purchase.
-                logger.warn(`${label} 🔒 Session expired AFTER checkout was clicked! Card ${cardNumber} marked as requires manual check (possible duplicate risk).`);
-                sharedState.failedCount++;
-                sharedState.processedCount++;
-                cardsProcessed++;
-                const expiredResult = {
-                  success: false,
-                  transactionId: purchaseErr.transactionId || null,
-                  pinCode: 'FAILED',
-                  serialNumber: 'FAILED',
-                  requiresManualCheck: true,
-                  error: `Session expired after checkout - purchase may have gone through on Razer. DO NOT RETRY.`,
-                  gameName: gameName,
-                  cardValue: cardName,
-                  stage: purchaseErr.stage
-                };
-                sharedState.purchases.push(expiredResult);
-                await trackedCardSave(expiredResult, cardNumber, label);
-                expiredResult.savedToDb = true;
-                if (onProgress) {
-                  try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
-                }
-              } else {
-                // Checkout was NOT clicked yet - safe to return card to queue for another page.
-                sharedState.cardQueue.unshift(cardNumber);
-                logger.warn(`${label} 🔒 2FA required BEFORE checkout. Card ${cardNumber} returned to queue.`);
-              }
-              continue;
-            }
-
-            // ===== 2FA DEFERRED TO ACTIVE OWNER =====
-            if (purchaseErr instanceof TwoFactorRestartRequiredError) {
-              // Checkout clicked and 2FA shown, but another page is currently handling verification.
-              // Re-queue this card and retry after owner finishes + restart queue sync.
-              sharedState.cardQueue.unshift(cardNumber);
-              logger.info(`${label} Deferred 2FA to active owner page. Card ${cardNumber} re-queued for retry after restart.`);
-              continue;
-            }
-
-            // ===== INSUFFICIENT BALANCE =====
-            if (purchaseErr instanceof InsufficientBalanceError) {
-              logger.error(`${label} 💰 Insufficient balance - stopping all pages`);
-              sharedState.cancelled = true;
-              sharedState.failedCount++;
-              sharedState.processedCount++;
-              sharedState.purchases.push({
-                success: false,
-                transactionId: purchaseErr.transactionId || null,
-                pinCode: 'FAILED',
-                serial: 'FAILED',
-                error: purchaseErr.message,
-                stage: purchaseErr.stage,
-                requiresManualCheck: false
-              });
-              if (onProgress) {
-                try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
-              }
-              break;
-            }
-
-            // ===== INVALID BACKUP CODE =====
-            if (purchaseErr instanceof InvalidBackupCodeError) {
-              if (checkoutAlreadyClicked) {
-                // CRITICAL: Checkout was already clicked! Do NOT return card to queue.
-                logger.warn(`${label} ❌ Invalid backup code AFTER checkout! Card ${cardNumber} marked as requires manual check.`);
-                sharedState.failedCount++;
-                sharedState.processedCount++;
-                cardsProcessed++;
-                const invalidCodeResult = {
-                  success: false,
-                  transactionId: purchaseErr.transactionId || null,
-                  pinCode: 'FAILED',
-                  serialNumber: 'FAILED',
-                  requiresManualCheck: true,
-                  error: `Invalid backup code after checkout - purchase may have gone through. DO NOT RETRY.`,
-                  gameName: gameName,
-                  cardValue: cardName,
-                  stage: purchaseErr.stage
-                };
-                sharedState.purchases.push(invalidCodeResult);
-                await trackedCardSave(invalidCodeResult, cardNumber, label);
-                invalidCodeResult.savedToDb = true;
-                if (onProgress) {
-                  try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
-                }
-              } else {
-                // Checkout was NOT clicked yet - safe to return card to queue
-                sharedState.cardQueue.unshift(cardNumber);
-                logger.error(`${label} ❌ Invalid backup code BEFORE checkout. Card ${cardNumber} returned to queue.`);
-              }
-              continue;
-            }
-
-            // ===== CANCELLED BY USER =====
-            if (purchaseErr.message && purchaseErr.message.includes('cancelled by user')) {
-              // CRITICAL: If purchase had a transactionId, it went through!
-              // Save it to DB before stopping, even though user cancelled.
-              if (purchaseErr.transactionId) {
-                logger.warn(`${label} ⚠️ Order cancelled but transaction ${purchaseErr.transactionId} was confirmed! Saving to DB...`);
-                const rescuedResult = {
-                  success: false,
-                  transactionId: purchaseErr.transactionId,
-                  pinCode: 'FAILED',
-                  serialNumber: 'FAILED',
-                  requiresManualCheck: true,
-                  error: 'Purchase confirmed but cancelled before PIN extraction',
-                  gameName: gameName,
-                  cardValue: cardName
-                };
-                sharedState.purchases.push(rescuedResult);
-                sharedState.failedCount++;
-                sharedState.processedCount++;
-                cardsProcessed++;
-                await trackedCardSave(rescuedResult, cardNumber, label);
-                rescuedResult.savedToDb = true;
-              }
-              sharedState.cancelled = true;
-              logger.info(`${label} Order cancelled by user`);
-              break;
-            }
-
-            // ===== OTHER ERRORS =====
-            // CRITICAL: If error has transactionId, the purchase went through!
-            // Save to DB immediately before doing anything else.
-            let otherErrorSavedToDb = false;
-            if (purchaseErr.transactionId) {
-              logger.warn(`${label} ⚠️ Error occurred but transaction ${purchaseErr.transactionId} was confirmed! Saving to DB...`);
-              const rescuedResult = {
-                success: false,
-                transactionId: purchaseErr.transactionId,
-                pinCode: 'FAILED',
-                serialNumber: 'FAILED',
-                requiresManualCheck: true,
-                error: `Purchase confirmed but error during processing: ${purchaseErr.message}`,
-                gameName: gameName,
-                cardValue: cardName
-              };
-              await trackedCardSave(rescuedResult, cardNumber, label);
-              otherErrorSavedToDb = true;
-            } else if (checkoutAlreadyClicked) {
-              // No transactionId but checkout WAS clicked - purchase may have gone through on Razer!
-              // Save to DB so the user knows to check manually on Razer's transaction history.
-              logger.warn(`${label} ⚠️ Error AFTER checkout was clicked (stage: ${purchaseErr.stage})! No TX ID but purchase may have gone through. Saving to DB for manual check...`);
-              const ghostResult = {
-                success: false,
-                transactionId: null,
-                pinCode: 'FAILED',
-                serialNumber: 'FAILED',
-                requiresManualCheck: true,
-                error: `Error after checkout clicked (${purchaseErr.stage}): ${purchaseErr.message}. Purchase may have gone through - check Razer transaction history.`,
-                gameName: gameName,
-                cardValue: cardName
-              };
-              await trackedCardSave(ghostResult, cardNumber, label);
-              otherErrorSavedToDb = true;
-            }
-
-            // Mark card as failed but continue with next card from queue
-            logger.error(`${label} Card ${cardNumber} failed: ${purchaseErr.message}`);
-            sharedState.failedCount++;
-            sharedState.processedCount++;
-            sharedState.purchases.push({
-              success: false,
-              transactionId: purchaseErr.transactionId || null,
-              pinCode: 'FAILED',
-              serial: 'FAILED',
-              error: purchaseErr.message,
-              stage: purchaseErr.stage,
-              requiresManualCheck: true,
-              savedToDb: otherErrorSavedToDb
-            });
-            cardsProcessed++;
-
-            if (onProgress) {
-              try { await onProgress(sharedState.processedCount, quantity); } catch (e) { }
-            }
+            await bumpProgress();
+          } catch (checkoutErr) {
+            await processPurchaseError(checkoutErr, assignment, 'checkout');
           }
-        }
 
-        logger.debug(`${label} Worker ended - processed ${cardsProcessed} cards`);
-
-      } catch (err) {
-        logger.error(`${label} Worker fatal error: ${err.message}`);
-      } finally {
-        sharedState.activeWorkerCount--;
-        logger.debug(`${label} Closed. Active workers remaining: ${sharedState.activeWorkerCount}`);
-
-        if (sharedState.activeWorkerCount === 0 && sharedState.cardQueue.length > 0 && !sharedState.cancelled) {
-          sharedState.allWorkersStopped = true;
-          const remaining = sharedState.cardQueue.length;
-          logger.error(`⚠️ ALL WORKERS STOPPED! ${remaining} cards remaining in queue.`);
-        }
-
-        if (!isPrimaryReadyPage && page) {
-          try {
-            this.untrackPurchasePage(telegramUserId, page);
-            if (!page.isClosed()) {
-              await Promise.race([
-                page.close().catch(() => { }),
-                new Promise(resolve => setTimeout(resolve, 3000))
-              ]);
-            }
-            logger.debug(`${label} Worker page closed`);
-          } catch (closeErr) {
-            logger.error(`${label} Error closing worker page:`, closeErr.message);
-          }
+          const shouldContinue = await waitStepDelay('checkout stage', i, assignments.length);
+          if (!shouldContinue) break;
         }
       }
-    };
-
-    try {
-      // Launch all worker pages with stagger
-      const sessionPromises = [];
-
-      for (let i = 0; i < workerCount; i++) {
-        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-          sharedState.cancelled = true;
-          logger.info(`Cancellation detected - skipping page ${i + 1}/${workerCount}`);
-          break;
-        }
-        logger.debug(`Spawning page worker ${i + 1}/${workerCount}...`);
-
-        sessionPromises.push(
-          (async () => {
-            const launchDelay = this.getStaggerDelay(i, this.PURCHASE_PAGE_STAGGER_MS, this.PURCHASE_PAGE_JITTER_MS);
-            if (launchDelay > 0) {
-              logger.debug(`Delaying page ${i + 1} purchase start by ${launchDelay}ms`);
-              const cancelled = await this.sleepCancellable(launchDelay, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
-              if (cancelled) {
-                sharedState.cancelled = true;
-                sharedState.activeWorkerCount--;
-                return;
-              }
-            }
-            if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-              sharedState.cancelled = true;
-              sharedState.activeWorkerCount--;
-              return;
-            }
-            return runPurchaseSession(i);
-          })()
-        );
-      }
-
-      logger.success(`All ${workerCount} page workers launched - processing in parallel...`);
-
-      // Wait for all workers to complete
-      await Promise.all(sessionPromises);
 
       // ===== FINAL SUMMARY =====
       logger.purchase(`\n${'='.repeat(60)}`);
 
-      if (sharedState.allWorkersStopped) {
-        const remaining = sharedState.cardQueue.length;
-        logger.error(`⚠️ ORDER INCOMPLETE: ${remaining} cards could NOT be purchased`);
-        logger.error('Reason: All page workers stopped before queue finished');
+      const remaining = sharedState.cardQueue.length;
+      if (remaining > 0) {
+        logger.warn(`ORDER PARTIAL: ${remaining} card(s) remained in queue`);
       }
 
       logger.success(`Results: ✅ Success: ${sharedState.successCount} | ❌ Failed: ${sharedState.failedCount} | Total: ${sharedState.processedCount}/${quantity}`);
@@ -2600,6 +2326,23 @@ class PurchaseService {
       err.purchases = sharedState.purchases;
       throw err;
     } finally {
+      // Close worker pages except the persistent primary ready page.
+      await Promise.allSettled(workerPages.map(async ({ page, label, isPrimaryReadyPage }) => {
+        if (isPrimaryReadyPage || !page) return;
+        try {
+          this.untrackPurchasePage(telegramUserId, page);
+          if (!page.isClosed()) {
+            await Promise.race([
+              page.close().catch(() => { }),
+              new Promise(resolve => setTimeout(resolve, 2500))
+            ]);
+          }
+          logger.debug(`${label} Worker page closed`);
+        } catch (closeErr) {
+          logger.error(`${label} Error closing worker page: ${closeErr.message}`);
+        }
+      }));
+
       // CRITICAL SAFETY NET: Wait for ALL pending card tracking saves to complete before exit.
       if (sharedState.pendingDbSaves.length > 0) {
         logger.system(`⏳ Waiting for ${sharedState.pendingDbSaves.length} pending card save(s) to complete...`);

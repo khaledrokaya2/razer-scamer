@@ -1,5 +1,6 @@
 const APP_CONFIG = {
   browser: {
+    headlessMode: 'new',
     defaultTimeoutMs: 30000,
     reloadCheckIntervalMs: 500,
     maxReloadAttempts: 600,
@@ -34,6 +35,12 @@ const APP_CONFIG = {
     ]
   },
   purchase: {
+    maxParallelPages: 5,
+    sequentialStepDelayMs: 100,
+    actionGapMs: 100,
+    actionJitterMs: 100,
+    navJitterMinMs: 100,
+    navJitterMaxMs: 150,
     readyLoginStaggerMs: 1400,
     readyLoginJitterMs: 900,
     purchasePageStaggerMs: 5200,
@@ -42,7 +49,7 @@ const APP_CONFIG = {
     purchaseCardJitterMs: 1000,
     transactionDetailStaggerMs: 5200,
     transactionDetailJitterMs: 2600,
-    transactionApiRateDelayMs: 220
+    transactionApiRateDelayMs: 100
   },
   orderFlow: {
     sessionTimeoutMs: 30 * 60 * 1000,

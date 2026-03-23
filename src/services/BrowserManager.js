@@ -151,7 +151,8 @@ class BrowserManager {
    * @returns {Promise<Browser>} Puppeteer browser instance
    */
   async launchBrowser() {
-    const isDevelopment = process.env.NODE_ENV === 'development';
+    const configuredHeadlessMode = appConfig.browser.headlessMode;
+    const headlessMode = configuredHeadlessMode ?? 'new';
 
     const launchArgs = [
       '--no-sandbox',
@@ -163,6 +164,8 @@ class BrowserManager {
       '--disable-translate',
       '--no-first-run',
       '--mute-audio',
+      '--lang=en-US,en',
+      '--window-size=1366,900',
       '--disable-blink-features=AutomationControlled',
       // Memory optimization (reasonable limits)
       '--js-flags=--max-old-space-size=256'
@@ -170,7 +173,7 @@ class BrowserManager {
 
 
     const browser = await puppeteer.launch({
-      headless: true,
+      headless: headlessMode,
       protocolTimeout: 180000,
       args: launchArgs
     });
