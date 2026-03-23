@@ -1,6 +1,6 @@
 const APP_CONFIG = {
   browser: {
-    headlessMode: 'false',
+    headlessMode: 'true',
     defaultTimeoutMs: 30000,
     reloadCheckIntervalMs: 500,
     maxReloadAttempts: 600,
