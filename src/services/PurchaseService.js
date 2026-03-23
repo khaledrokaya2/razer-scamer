@@ -1270,31 +1270,70 @@ class PurchaseService {
       }
 
       if (!checkoutButton) {
-        // Fallback: try to find by text content
-        checkoutButton = await page.evaluateHandle(() => {
-          const buttons = document.querySelectorAll("button");
-          for (const btn of buttons) {
-            const text = btn.textContent.toLowerCase().trim();
-            if (text.includes('checkout') || text.includes('reload to checkout')) {
-              return btn;
+        // Keep logging consistent if direct selector lookup fails.
+        log.debug('Checkout button not found via strict selectors, using text-based fallback click');
+      }
+
+      const checkoutClickResult = await this.runWithActionGate(
+        telegramUserId,
+        () => page.evaluate((selectors) => {
+          const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+          };
+
+          const matchesText = (btn) => {
+            const text = String(btn.textContent || '').toLowerCase().trim();
+            return text.includes('checkout') || text.includes('reload to checkout');
+          };
+
+          let target = null;
+          for (const selector of selectors) {
+            const candidate = document.querySelector(selector);
+            if (candidate && isVisible(candidate)) {
+              target = candidate;
+              break;
             }
           }
-          return null;
-        });
-      }
 
-      if (!checkoutButton || checkoutButton.asElement() === null) {
-        throw new Error('❌ Could not find checkout button');
-      }
+          if (!target) {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            target = buttons.find(btn => isVisible(btn) && matchesText(btn)) || null;
+          }
 
-      await this.runWithActionGate(
-        telegramUserId,
-        () => checkoutButton.click(),
+          if (!target) {
+            return { ok: false, reason: 'button_not_found' };
+          }
+
+          const ariaDisabled = String(target.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+          const disabled = !!target.disabled || ariaDisabled;
+          if (disabled) {
+            return { ok: false, reason: 'button_disabled' };
+          }
+
+          target.scrollIntoView({ behavior: 'auto', block: 'center' });
+          target.focus();
+          target.click();
+          target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+
+          return {
+            ok: true,
+            reason: 'clicked',
+            text: String(target.textContent || '').trim().slice(0, 64)
+          };
+        }, checkoutSelectors),
         {
-          taskTimeoutMs: 45000,
-          taskLabel: 'checkout button click'
+          taskTimeoutMs: 12000,
+          taskLabel: 'checkout js click'
         }
       );
+
+      if (!checkoutClickResult || !checkoutClickResult.ok) {
+        throw new Error(`Could not trigger checkout (${(checkoutClickResult && checkoutClickResult.reason) || 'unknown'})`);
+      }
+
       log.success('Checkout button clicked successfully');
 
       // Wait for navigation after checkout (optimized timeout)
