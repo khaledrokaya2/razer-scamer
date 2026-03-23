@@ -36,6 +36,7 @@ const APP_CONFIG = {
   },
   purchase: {
     maxParallelPages: 4,
+    maxConcurrentCheckouts: 2,
     sequentialStepDelayMs: 60,
     actionGapMs: 80,
     actionJitterMs: 60,

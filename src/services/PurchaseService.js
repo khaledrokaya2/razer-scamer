@@ -2287,91 +2287,118 @@ class PurchaseService {
           if (!shouldContinue) break;
         }
 
-        // Phase C: Checkout prepared pages one-by-one, including serialized 2FA handling.
-        for (let i = 0; i < assignments.length; i++) {
-          const assignment = assignments[i];
-          if (assignment.failedInPrepare) continue;
-          if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-            sharedState.cancelled = true;
-            sharedState.cardQueue.unshift(assignment.cardNumber);
-            break;
-          }
+        // Phase C: Checkout prepared pages with configurable concurrency (default 2 simultaneous).
+        const maxConcurrentCheckouts = appConfig.purchase.maxConcurrentCheckouts || 2;
+        
+        const processCheckoutBatch = async (batchAssignments) => {
+          const batchTasks = [];
+          
+          for (const assignment of batchAssignments) {
+            if (assignment.failedInPrepare) continue;
+            if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+              sharedState.cancelled = true;
+              sharedState.cardQueue.unshift(assignment.cardNumber);
+              continue;
+            }
 
-          logger.purchase(`${assignment.label} Checkout for card ${assignment.cardNumber}/${quantity}...`);
+            const checkoutTask = (async () => {
+              logger.purchase(`${assignment.label} Checkout for card ${assignment.cardNumber}/${quantity}...`);
 
-          try {
-            let result;
+              try {
+                let result;
 
-            try {
-              result = await this.completePurchase({
-                telegramUserId,
-                page: assignment.page,
-                gameUrl,
-                cardIndex,
-                backupCode: null,
-                backupCodeId: null,
-                checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                cardNumber: assignment.cardNumber,
-                gameName,
-                cardName,
-                label: assignment.label,
-                resumeFromCheckout: true
-              });
-            } catch (err) {
-              if (!(err instanceof BackupCodeExpiredError) && !(err instanceof TwoFactorVerificationRequiredError)) {
-                throw err;
-              }
+                try {
+                  result = await this.completePurchase({
+                    telegramUserId,
+                    page: assignment.page,
+                    gameUrl,
+                    cardIndex,
+                    backupCode: null,
+                    backupCodeId: null,
+                    checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                    cardNumber: assignment.cardNumber,
+                    gameName,
+                    cardName,
+                    label: assignment.label,
+                    resumeFromCheckout: true
+                  });
+                } catch (err) {
+                  if (!(err instanceof BackupCodeExpiredError) && !(err instanceof TwoFactorVerificationRequiredError)) {
+                    throw err;
+                  }
 
-              result = await this.runWithUserLock(telegramUserId, async () => {
-                const nextBackupCode = await getNextBackupCode();
-                if (!nextBackupCode) {
-                  throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA. Add more backup codes and retry remaining cards.');
+                  result = await this.runWithUserLock(telegramUserId, async () => {
+                    const nextBackupCode = await getNextBackupCode();
+                    if (!nextBackupCode) {
+                      throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA. Add more backup codes and retry remaining cards.');
+                    }
+
+                    logger.warn(`${assignment.label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
+                    await humanDelay(900, 1700);
+
+                    return this.completePurchase({
+                      telegramUserId,
+                      page: assignment.page,
+                      gameUrl,
+                      cardIndex,
+                      backupCode: nextBackupCode.code,
+                      backupCodeId: nextBackupCode.id,
+                      checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                      cardNumber: assignment.cardNumber,
+                      gameName,
+                      cardName,
+                      label: assignment.label,
+                      resumeFromTwoFactor: true
+                    });
+                  });
                 }
 
-                logger.warn(`${assignment.label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
-                await humanDelay(900, 1700);
+                sharedState.purchases.push(result);
+                sharedState.processedCount++;
 
-                return this.completePurchase({
-                  telegramUserId,
-                  page: assignment.page,
-                  gameUrl,
-                  cardIndex,
-                  backupCode: nextBackupCode.code,
-                  backupCodeId: nextBackupCode.id,
-                  checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                  cardNumber: assignment.cardNumber,
-                  gameName,
-                  cardName,
-                  label: assignment.label,
-                  resumeFromTwoFactor: true
-                });
-              });
-            }
+                if (result.success) {
+                  sharedState.successCount++;
+                  logger.success(`${assignment.label} Card ${assignment.cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
+                  await trackedCardSave(result, assignment.cardNumber, assignment.label);
+                  result.savedToDb = true;
+                } else {
+                  sharedState.failedCount++;
+                  logger.warn(`${assignment.label} Card ${assignment.cardNumber}/${quantity} reached transaction but extraction FAILED`);
+                  if (result.transactionId) {
+                    await trackedCardSave(result, assignment.cardNumber, assignment.label);
+                    result.savedToDb = true;
+                  }
+                }
 
-            sharedState.purchases.push(result);
-            sharedState.processedCount++;
-
-            if (result.success) {
-              sharedState.successCount++;
-              logger.success(`${assignment.label} Card ${assignment.cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
-              await trackedCardSave(result, assignment.cardNumber, assignment.label);
-              result.savedToDb = true;
-            } else {
-              sharedState.failedCount++;
-              logger.warn(`${assignment.label} Card ${assignment.cardNumber}/${quantity} reached transaction but extraction FAILED`);
-              if (result.transactionId) {
-                await trackedCardSave(result, assignment.cardNumber, assignment.label);
-                result.savedToDb = true;
+                await bumpProgress();
+              } catch (checkoutErr) {
+                await processPurchaseError(checkoutErr, assignment, 'checkout');
               }
-            }
-
-            await bumpProgress();
-          } catch (checkoutErr) {
-            await processPurchaseError(checkoutErr, assignment, 'checkout');
+            })();
+            
+            batchTasks.push(checkoutTask);
           }
-
-          const shouldContinue = await waitStepDelay('checkout stage', i, assignments.length);
-          if (!shouldContinue) break;
+          
+          if (batchTasks.length > 0) {
+            await Promise.all(batchTasks);
+          }
+        };
+        
+        // Process checkouts in concurrent batches
+        for (let i = 0; i < assignments.length; i += maxConcurrentCheckouts) {
+          if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+            sharedState.cancelled = true;
+            break;
+          }
+          
+          const batchEnd = Math.min(i + maxConcurrentCheckouts, assignments.length);
+          const batch = assignments.slice(i, batchEnd);
+          await processCheckoutBatch(batch);
+          
+          // Add small delay between batches for stealth (but not after last batch)
+          if (batchEnd < assignments.length && maxConcurrentCheckouts > 1) {
+            await sleep(appConfig.purchase.sequentialStepDelayMs || 60);
+          }
         }
       }
 
