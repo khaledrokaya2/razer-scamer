@@ -468,6 +468,13 @@ class OrderFlowHandler {
    * @param {string} telegramUserId - Telegram user ID
    */
   async handleCancelProcessing(bot, chatId, telegramUserId) {
+    const session = this.getSession(chatId);
+    if (!session || session.step !== 'processing') {
+      // Ignore stale callbacks from old messages.
+      this.clearCancellation(chatId);
+      return;
+    }
+
     // Mark as cancelled FIRST (stops new operations)
     this.markAsCancelled(chatId);
 
@@ -484,17 +491,8 @@ class OrderFlowHandler {
       logger.error('Error closing purchase pages during cancellation:', err.message);
     }
 
-    try {
-      const cancelMsg = await bot.sendMessage(chatId,
-        `🛑 *Cancelling order...*\n\n_Stopping active purchase pages and saving progress_`,
-        { parse_mode: 'Markdown' }
-      );
-
-      // Store message ID for later deletion
-      this.cancellingMessages.set(chatId, cancelMsg.message_id);
-    } catch (err) {
-      logger.error('Error sending cancelling message:', err);
-    }
+    // Intentionally no "cancelling..." chat message.
+    this.cancellingMessages.delete(chatId);
   }
 
   /**
@@ -1306,6 +1304,9 @@ class OrderFlowHandler {
   async handleBuyNow(bot, chatId, telegramUserId) {
     const session = this.getSession(chatId);
     if (!session) return;
+
+    // Guard against stale cancel flags from previous /cancel or old callbacks.
+    this.clearCancellation(chatId);
 
     const db = require('../services/DatabaseService');
     const credentials = await db.getUserCredentials(telegramUserId);

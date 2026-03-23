@@ -54,6 +54,8 @@ class PurchaseService {
     this.MAX_PARALLEL_PAGES = appConfig.purchase.maxParallelPages ?? 3;
     this.SEQUENTIAL_STEP_DELAY_MS = appConfig.purchase.sequentialStepDelayMs ?? 120;
     this.SEQUENTIAL_STEP_JITTER_MS = appConfig.purchase.sequentialStepJitterMs ?? 40;
+    this.PAGE_OPEN_STEP_DELAY_MS = appConfig.purchase.pageOpenStepDelayMs ?? 260;
+    this.PAGE_OPEN_STEP_JITTER_MS = appConfig.purchase.pageOpenStepJitterMs ?? 140;
     this.ACTION_GAP_MS = appConfig.purchase.actionGapMs ?? 260;
     this.ACTION_JITTER_MS = appConfig.purchase.actionJitterMs ?? 120;
     this.ACTION_LOCK_WAIT_TIMEOUT_MS = appConfig.purchase.actionLockWaitTimeoutMs ?? 30000;
@@ -1113,7 +1115,11 @@ class PurchaseService {
         target.dispatchEvent(new Event('change', { bubbles: true }));
 
         return { ok: true, total: radios.length };
-      }, cardIndex));
+      }, cardIndex), {
+        skipGap: true,
+        taskTimeoutMs: 10000,
+        taskLabel: 'select card'
+      });
 
       if (!selectionResult.ok) {
         if (selectionResult.reason === 'not_found') {
@@ -1124,15 +1130,75 @@ class PurchaseService {
 
       log.debug(`Found ${selectionResult.total} card radio options`);
 
-      // Wait until the selected card radio is actually checked.
-      await page.waitForFunction((index) => {
-        const cardInputs = document.querySelectorAll("input[type='radio'][name='paymentAmountItem']");
-        return !!(cardInputs[index] && cardInputs[index].checked);
-      }, { timeout: 1500 }, cardIndex).catch(() => {
-        // Non-fatal: selection was already attempted with multiple methods.
-      });
-
       log.success(`Card ${cardIndex} selected successfully`);
+
+      // Fast path: attempt payment selection immediately after card click.
+      // If payment channels are already hydrated we can skip extra waits.
+      const quickPaymentSelection = await this.runWithActionGate(telegramUserId, () => page.evaluate(() => {
+        const radios = Array.from(document.querySelectorAll("input[type='radio'][name='paymentChannelItem']"));
+        if (radios.length === 0) {
+          return { ok: false, reason: 'payment_not_ready' };
+        }
+
+        const csMatches = Array.from(document.querySelectorAll('[data-cs-override-id]'))
+          .filter(el => String(el.getAttribute('data-cs-override-id') || '').toLowerCase().includes('razergold'));
+
+        const findRazerGoldRadio = () => {
+          for (const host of csMatches) {
+            const radio = host.querySelector("input[type='radio'][name='paymentChannelItem']");
+            if (radio) return radio;
+          }
+
+          const labelMatch = Array.from(document.querySelectorAll('label')).find(label => {
+            const txt = (label.textContent || '').toLowerCase();
+            return txt.includes('razer gold');
+          });
+
+          if (labelMatch) {
+            const forId = labelMatch.getAttribute('for');
+            if (forId) {
+              const radio = document.getElementById(forId);
+              if (radio && radio.name === 'paymentChannelItem') return radio;
+            }
+
+            const nested = labelMatch.querySelector("input[type='radio'][name='paymentChannelItem']");
+            if (nested) return nested;
+          }
+
+          return null;
+        };
+
+        const targetRadio = findRazerGoldRadio();
+        if (!targetRadio) {
+          return { ok: false, reason: 'razer_gold_channel_not_found' };
+        }
+
+        const label = targetRadio.id ? document.querySelector(`label[for="${targetRadio.id}"]`) : null;
+        const clickTarget = label || targetRadio;
+
+        if (!targetRadio.checked) {
+          clickTarget.click();
+          targetRadio.checked = true;
+          targetRadio.dispatchEvent(new Event('input', { bubbles: true }));
+          targetRadio.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        return {
+          ok: !!targetRadio.checked,
+          reason: targetRadio.checked ? 'selected' : 'selection_not_stuck',
+          channels: radios.length,
+          csMatches: csMatches.length
+        };
+      }), {
+        skipGap: true,
+        taskTimeoutMs: 9000,
+        taskLabel: 'quick payment preselect'
+      }).catch(() => ({ ok: false, reason: 'quick_path_error' }));
+
+      const paymentAlreadySelected = !!(quickPaymentSelection && quickPaymentSelection.ok);
+      if (paymentAlreadySelected) {
+        log.success('✅ Razer Gold payment method selected successfully (fast path)');
+      }
 
       // Check cancellation
       if (checkCancellation && checkCancellation()) {
@@ -1148,23 +1214,25 @@ class PurchaseService {
       // Select Razer Gold as payment method
       log.purchase('Selecting Razer Gold payment...');
 
-      // Wait for payment channels to hydrate; this is more reliable than a single hardcoded container selector.
-      await page.waitForFunction(() => {
-        const section = document.querySelector('#webshop_step_payment_channels');
-        const channelRadios = document.querySelectorAll("input[type='radio'][name='paymentChannelItem']");
-        return !!section && channelRadios.length > 0;
-      }, {
-        timeout: 20000,
-        polling: 250
-      });
+      if (!paymentAlreadySelected) {
+        // Wait for payment channels to hydrate; this is more reliable than a single hardcoded container selector.
+        await page.waitForFunction(() => {
+          const section = document.querySelector('#webshop_step_payment_channels');
+          const channelRadios = document.querySelectorAll("input[type='radio'][name='paymentChannelItem']");
+          return !!section && channelRadios.length > 0;
+        }, {
+          timeout: 12000,
+          polling: 120
+        });
 
-      // Scroll the payment section into view
-      await page.evaluate(() => {
-        const paymentSection = document.querySelector("#webshop_step_payment_channels");
-        if (paymentSection) {
-          paymentSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-      });
+        // Scroll the payment section into view
+        await page.evaluate(() => {
+          const paymentSection = document.querySelector("#webshop_step_payment_channels");
+          if (paymentSection) {
+            paymentSection.scrollIntoView({ behavior: 'auto', block: 'center' });
+          }
+        });
+      }
 
       const paymentStats = await page.evaluate(() => ({
         channelCount: document.querySelectorAll("input[type='radio'][name='paymentChannelItem']").length,
@@ -1173,7 +1241,9 @@ class PurchaseService {
       }));
       log.debug(`Payment DOM ready (channels=${paymentStats.channelCount}, csIdMatches=${paymentStats.rzByCsId}, labelMatches=${paymentStats.rzByLabel})`);
 
-      const paymentSelection = await this.runWithActionGate(telegramUserId, () => page.evaluate(() => {
+      const paymentSelection = paymentAlreadySelected
+        ? { ok: true, reason: 'already_selected' }
+        : await this.runWithActionGate(telegramUserId, () => page.evaluate(() => {
         const isVisible = (el) => {
           if (!el) return false;
           const style = window.getComputedStyle(el);
@@ -1248,7 +1318,11 @@ class PurchaseService {
           channels: radios.length,
           csMatches: csMatches.length
         };
-      }));
+      }), {
+        skipGap: true,
+        taskTimeoutMs: 10000,
+        taskLabel: 'select payment method'
+      });
 
       if (!paymentSelection.ok) {
         throw new Error(`Failed to select Razer Gold payment method (${paymentSelection.reason}, channels=${paymentSelection.channels || 0}, matches=${paymentSelection.csMatches || 0})`);
@@ -2115,7 +2189,10 @@ class PurchaseService {
     const waitStepDelay = async (phaseLabel, idx, total) => {
       if (idx >= total - 1) return true;
 
-      const delayMs = this.SEQUENTIAL_STEP_DELAY_MS + Math.floor(Math.random() * (this.SEQUENTIAL_STEP_JITTER_MS + 1));
+      const isPageOpenPhase = String(phaseLabel).toLowerCase().includes('page open');
+      const baseDelay = isPageOpenPhase ? this.PAGE_OPEN_STEP_DELAY_MS : this.SEQUENTIAL_STEP_DELAY_MS;
+      const jitter = isPageOpenPhase ? this.PAGE_OPEN_STEP_JITTER_MS : this.SEQUENTIAL_STEP_JITTER_MS;
+      const delayMs = baseDelay + Math.floor(Math.random() * (jitter + 1));
       logger.debug(`Phase delay after ${phaseLabel}: ${delayMs}ms`);
       const cancelled = await this.sleepCancellable(delayMs, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
       if (cancelled) {
@@ -2152,16 +2229,31 @@ class PurchaseService {
       if (!isPrimaryReadyPage) {
         // Safety net: mirror ready-page auth cookies into worker tabs.
         await syncReadySessionCookies(page);
-      }
+        // Fast+safe mode: do not warm every worker with protected homepage navigation.
+        // Prepared flow will navigate to target game URL in stage 1 anyway.
+        const seededCookies = await page.cookies(this.READY_BROWSER_HOME_URL).catch(() => []);
+        if (!seededCookies || seededCookies.length === 0) {
+          logger.warn('Worker page cookie sync produced no cookies; falling back to session check navigation.');
+          await withRetry(async () => {
+            await this.runWithActionGate(telegramUserId, () => page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+            if (await isBanned(page)) throw new Error('rate limited');
+          });
 
-      await withRetry(async () => {
-        await this.runWithActionGate(telegramUserId, () => page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }));
-        if (await isBanned(page)) throw new Error('rate limited');
-      });
+          const sessionValid = await browserManager.checkSessionValid(page);
+          if (!sessionValid) {
+            throw new Error('Worker page is not authenticated with the ready browser session');
+          }
+        }
+      } else {
+        await withRetry(async () => {
+          await this.runWithActionGate(telegramUserId, () => page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+          if (await isBanned(page)) throw new Error('rate limited');
+        });
 
-      const sessionValid = await browserManager.checkSessionValid(page);
-      if (!sessionValid) {
-        throw new Error('Worker page is not authenticated with the ready browser session');
+        const sessionValid = await browserManager.checkSessionValid(page);
+        if (!sessionValid) {
+          throw new Error('Worker page is not authenticated with the ready browser session');
+        }
       }
 
       if (!isPrimaryReadyPage) {
@@ -2313,9 +2405,29 @@ class PurchaseService {
         const isPrimaryReadyPage = i === 0;
         const page = isPrimaryReadyPage ? readyPage : await readyContext.newPage();
 
-        await initializeWorkerPage(page, isPrimaryReadyPage);
-        workerPages.push({ page, label, isPrimaryReadyPage, slot: i + 1 });
-        logger.purchase(`${label} opened and ready.`);
+        try {
+          await initializeWorkerPage(page, isPrimaryReadyPage);
+          workerPages.push({ page, label, isPrimaryReadyPage, slot: i + 1 });
+          logger.purchase(`${label} opened and ready.`);
+        } catch (initErr) {
+          const isRateLimitError = String(initErr && initErr.message ? initErr.message : '').toLowerCase().includes('rate limited');
+          if (!isRateLimitError || workerPages.length === 0) {
+            throw initErr;
+          }
+
+          logger.warn(`${label} Worker init hit rate limit; continuing order with ${workerPages.length} ready page(s).`);
+          try {
+            if (!isPrimaryReadyPage && page && !page.isClosed()) {
+              await Promise.race([
+                page.close().catch(() => { }),
+                new Promise(resolve => setTimeout(resolve, 2000))
+              ]);
+            }
+          } catch (closeErr) {
+            logger.debug(`${label} Could not close rate-limited worker page: ${closeErr.message}`);
+          }
+          break;
+        }
 
         const shouldContinue = await waitStepDelay('page open', i, workerCount);
         if (!shouldContinue) break;
@@ -3089,6 +3201,46 @@ class PurchaseService {
       let processedCount = 0;
       const primarySession = usableSessions[0];
 
+      const runDetailWithCancellation = async (detailFactory) => {
+        if (!checkCancellation) {
+          return { cancelled: false, result: await detailFactory() };
+        }
+
+        if (checkCancellation()) {
+          return { cancelled: true };
+        }
+
+        let intervalId;
+        const cancelPromise = new Promise(resolve => {
+          intervalId = setInterval(() => {
+            if (checkCancellation()) {
+              resolve({ cancelled: true });
+            }
+          }, 80);
+        });
+
+        const taskPromise = (async () => {
+          try {
+            return { cancelled: false, result: await detailFactory() };
+          } catch (error) {
+            return { cancelled: false, error };
+          }
+        })();
+
+        const outcome = await Promise.race([taskPromise, cancelPromise]);
+
+        if (intervalId) {
+          clearInterval(intervalId);
+        }
+
+        if (outcome && outcome.cancelled) {
+          taskPromise.then(() => { }).catch(() => { });
+          return outcome;
+        }
+
+        return outcome;
+      };
+
       await emitProgress({
         phase: 'fetching',
         processed: 0,
@@ -3104,14 +3256,25 @@ class PurchaseService {
         const transaction = matchedTransactions[i];
 
         try {
-          // ANTI-BAN
-          let detail;
-          try {
-            detail = await this.fetchTransactionDetailViaApi(primarySession.page, transaction.txnNum, historyResult.apiHeaders || {});
-          } catch (apiErr) {
-            logger.debug(`API detail fetch fallback for ${transaction.txnNum}: ${apiErr.message}`);
-            detail = await this.fetchTransactionDetail(primarySession.page, transaction.txnNum);
+          const detailOutcome = await runDetailWithCancellation(async () => {
+            // ANTI-BAN
+            try {
+              return await this.fetchTransactionDetailViaApi(primarySession.page, transaction.txnNum, historyResult.apiHeaders || {});
+            } catch (apiErr) {
+              logger.debug(`API detail fetch fallback for ${transaction.txnNum}: ${apiErr.message}`);
+              return this.fetchTransactionDetail(primarySession.page, transaction.txnNum);
+            }
+          });
+
+          if (detailOutcome && detailOutcome.cancelled) {
+            break;
           }
+
+          if (detailOutcome && detailOutcome.error) {
+            throw detailOutcome.error;
+          }
+
+          const detail = detailOutcome.result;
 
           const description = this.normalizeTransactionDescription(transaction.description || detail.productName);
 

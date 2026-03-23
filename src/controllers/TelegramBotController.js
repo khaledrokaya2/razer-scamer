@@ -853,6 +853,8 @@ class TelegramBotController {
 
       // Clear order flow session
       orderFlowHandler.clearSession(chatId);
+      // Clear stale cancel flag so future orders are not auto-cancelled
+      orderFlowHandler.clearCancellation(chatId);
 
       // Clear order history pagination
       orderHistoryHandler.reset(chatId);
@@ -1049,7 +1051,7 @@ class TelegramBotController {
               scheduledService.cancelScheduledOrder(chatId);
 
               await this.bot.answerCallbackQuery(queryId, {
-                text: '🛑 Cancelling order...',
+                text: '✅ Cancelled',
                 show_alert: false
               });
             }
@@ -1538,17 +1540,15 @@ class TelegramBotController {
       const email = session.email;
       const passwordTrimmed = password.trim();
 
-      // Encrypt credentials
-      const emailEncrypted = encryptionService.encrypt(email);
-      const passwordEncrypted = encryptionService.encrypt(passwordTrimmed);
-
-      // Save to database
-      await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
-
-      // Credentials changed: reset browser and login immediately with the new credentials.
+      // Credentials changed: verify login first, then persist to database.
       const purchaseService = require('../services/PurchaseService');
       await purchaseService.resetUserBrowsers(telegramUserId);
       await scraperService.login(telegramUserId, email, passwordTrimmed);
+
+      // Login succeeded - now persist encrypted credentials.
+      const emailEncrypted = encryptionService.encrypt(email);
+      const passwordEncrypted = encryptionService.encrypt(passwordTrimmed);
+      await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
 
       // Keep ready-session map synchronized in background without blocking UX.
       purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch((syncErr) => {
@@ -1574,7 +1574,7 @@ class TelegramBotController {
       sessionManager.clearCredentials(chatId);
       sessionManager.updateState(chatId, 'idle');
 
-      await this.safeSendMessage(chatId, '❌ Failed to save credentials.');
+      await this.safeSendMessage(chatId, '❌ Error during login. Check your credentials then try again.');
     }
   }
 
