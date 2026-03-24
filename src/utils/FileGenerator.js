@@ -147,11 +147,11 @@ class FileGenerator {
   }
 
   /**
-   * Send PIN files to Telegram chat in TWO formats
-   * 
-   * This is the SINGLE SOURCE OF TRUTH for all file generation across the application.
+   * Send PIN-only file to Telegram chat.
+   *
+   * This is the SINGLE SOURCE OF TRUTH for order PIN file generation across the application.
    * All services (OrderFlowHandler, ScheduledOrderService, etc.) use this method.
-   * 
+   *
    * @param {Object} bot - Telegram bot instance
    * @param {number} chatId - Telegram chat ID
    * @param {number} orderId - Order ID
@@ -175,31 +175,19 @@ class FileGenerator {
       // Ensure directory exists
       this.ensureDirectoryExists();
 
-      // 1. Generate and send PIN + Serial Number file
-      const fileName1 = this.generateFileName(orderId, 'with_serial', isPartial);
-      const content1 = this.generatePinWithSerialContent(filteredPins);
-      const filePath1 = this.writeFile(fileName1, content1);
+      // Generate and send PIN-only file
+      const fileName = this.generateFileName(orderId, 'only', isPartial);
+      const content = this.generatePinOnlyContent(filteredPins);
+      const filePath = this.writeFile(fileName, content);
 
-      await bot.sendDocument(chatId, filePath1, {
-        caption: this.generateCaption(orderId, 'with_serial', isPartial),
-        parse_mode: 'Markdown'
-      }, { contentType: 'text/plain' });
-
-      this.deleteFile(filePath1);
-
-      // 2. Generate and send PIN-only file
-      const fileName2 = this.generateFileName(orderId, 'only', isPartial);
-      const content2 = this.generatePinOnlyContent(filteredPins);
-      const filePath2 = this.writeFile(fileName2, content2);
-
-      await bot.sendDocument(chatId, filePath2, {
+      await bot.sendDocument(chatId, filePath, {
         caption: this.generateCaption(orderId, 'only', isPartial),
         parse_mode: 'Markdown'
       }, { contentType: 'text/plain' });
 
-      this.deleteFile(filePath2);
+      this.deleteFile(filePath);
 
-      logger.info(`FileGenerator: Successfully sent PIN files for order ${orderId}`);
+      logger.info(`FileGenerator: Successfully sent PIN-only file for order ${orderId}`);
 
     } catch (err) {
       logger.error('FileGenerator: Error sending PIN files:', err);

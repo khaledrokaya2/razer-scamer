@@ -2355,6 +2355,7 @@ class PurchaseService {
 
     const postCheckoutStages = ['clicking_checkout', 'processing_2fa', 'reached_transaction_page', 'extracting_pin_data'];
     const workerPages = [];
+    const maxConcurrentCheckouts = appConfig.purchase.maxConcurrentCheckouts || 2;
 
     const processPurchaseError = async (purchaseErr, assignment, phase) => {
       const { cardNumber, label } = assignment;
@@ -2485,6 +2486,297 @@ class PurchaseService {
       await bumpProgress();
     };
 
+    const executeCheckoutForAssignment = async (assignment) => {
+      logger.purchase(`${assignment.label} Checkout for card ${assignment.cardNumber}/${quantity}...`);
+
+      try {
+        let result;
+
+        try {
+          result = await this.completePurchase({
+            telegramUserId,
+            page: assignment.page,
+            gameUrl,
+            cardIndex,
+            backupCode: null,
+            backupCodeId: null,
+            checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+            cardNumber: assignment.cardNumber,
+            gameName,
+            cardName,
+            label: assignment.label,
+            resumeFromCheckout: true
+          });
+        } catch (err) {
+          if (!(err instanceof BackupCodeExpiredError) && !(err instanceof TwoFactorVerificationRequiredError)) {
+            throw err;
+          }
+
+          // Fast path: some tabs auto-navigate to transaction page shortly after checkout.
+          // Skip backup-code lock/code reservation when this has already happened.
+          const urlBeforeLock = assignment.page.url();
+          if (urlBeforeLock.includes('/transaction/')) {
+            logger.debug(`${assignment.label} Reached transaction page before 2FA lock; skipping backup-code reservation.`);
+            result = await this.completePurchase({
+              telegramUserId,
+              page: assignment.page,
+              gameUrl,
+              cardIndex,
+              backupCode: null,
+              backupCodeId: null,
+              checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+              cardNumber: assignment.cardNumber,
+              gameName,
+              cardName,
+              label: assignment.label,
+              resumeFromTwoFactor: true
+            });
+          } else {
+            result = await this.runWithUserLock(telegramUserId, async () => {
+              const urlAfterLock = assignment.page.url();
+              if (urlAfterLock.includes('/transaction/')) {
+                logger.debug(`${assignment.label} Reached transaction page while waiting for 2FA lock; skipping backup code.`);
+                return this.completePurchase({
+                  telegramUserId,
+                  page: assignment.page,
+                  gameUrl,
+                  cardIndex,
+                  backupCode: null,
+                  backupCodeId: null,
+                  checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                  cardNumber: assignment.cardNumber,
+                  gameName,
+                  cardName,
+                  label: assignment.label,
+                  resumeFromTwoFactor: true
+                });
+              }
+
+              const nextBackupCode = await getNextBackupCode();
+              if (!nextBackupCode) {
+                throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA. Add more backup codes and retry remaining cards.');
+              }
+
+              logger.warn(`${assignment.label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
+              await humanDelay(this.TWO_FACTOR_LOCK_HUMAN_DELAY_MIN_MS, this.TWO_FACTOR_LOCK_HUMAN_DELAY_MAX_MS);
+
+              return this.completePurchase({
+                telegramUserId,
+                page: assignment.page,
+                gameUrl,
+                cardIndex,
+                backupCode: nextBackupCode.code,
+                backupCodeId: nextBackupCode.id,
+                checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+                cardNumber: assignment.cardNumber,
+                gameName,
+                cardName,
+                label: assignment.label,
+                resumeFromTwoFactor: true
+              });
+            });
+          }
+        }
+
+        sharedState.purchases.push(result);
+        sharedState.processedCount++;
+
+        if (result.success) {
+          sharedState.successCount++;
+          logger.success(`${assignment.label} Card ${assignment.cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
+          await trackedCardSave(result, assignment.cardNumber, assignment.label);
+          result.savedToDb = true;
+        } else {
+          sharedState.failedCount++;
+          logger.warn(`${assignment.label} Card ${assignment.cardNumber}/${quantity} reached transaction but extraction FAILED`);
+          if (result.transactionId) {
+            await trackedCardSave(result, assignment.cardNumber, assignment.label);
+            result.savedToDb = true;
+          }
+        }
+
+        await bumpProgress();
+        return {
+          ok: true,
+          reachedTransaction: !!(result && result.transactionId),
+          twoFactorWindowActive: this.isTwoFactorWindowActive(telegramUserId)
+        };
+      } catch (checkoutErr) {
+        await processPurchaseError(checkoutErr, assignment, 'checkout');
+        return {
+          ok: false,
+          reachedTransaction: !!(checkoutErr && checkoutErr.transactionId),
+          twoFactorWindowActive: this.isTwoFactorWindowActive(telegramUserId),
+          error: checkoutErr
+        };
+      }
+    };
+
+    const processCheckoutBatch = async (batchAssignments) => {
+      const validAssignments = batchAssignments.filter(a => !a.failedInPrepare);
+      if (validAssignments.length === 0) {
+        return;
+      }
+
+      // If 2FA window expired, use one leader checkout first to prime the 15-minute window,
+      // then continue other prepared pages in parallel without re-preparing flow.
+      const requireLeaderPrime = !this.isTwoFactorWindowActive(telegramUserId) && validAssignments.length > 1;
+      let pendingAssignments = validAssignments;
+
+      if (requireLeaderPrime) {
+        const windowMinutes = Math.round(this.TWO_FACTOR_WINDOW_MS / 60000);
+        const leaderCandidates = [...validAssignments];
+        let unlocked = false;
+        pendingAssignments = [];
+
+        while (leaderCandidates.length > 0 && !unlocked) {
+          const leader = leaderCandidates.shift();
+          logger.purchase(`${leader.label} Leader checkout: 2FA window expired, priming ${windowMinutes}m session before releasing other pages...`);
+
+          const leaderOutcome = await executeCheckoutForAssignment(leader);
+
+          if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+            sharedState.cancelled = true;
+            return;
+          }
+
+          const unlockedNow = !!(
+            leaderOutcome
+            && (leaderOutcome.twoFactorWindowActive || leaderOutcome.reachedTransaction)
+          );
+
+          if (unlockedNow) {
+            unlocked = true;
+            pendingAssignments = leaderCandidates;
+            logger.success(`${leader.label} Leader unlocked checkout flow; releasing ${pendingAssignments.length} prepared page(s) in parallel.`);
+            break;
+          }
+
+          logger.warn(`${leader.label} Leader did not unlock 2FA window/transaction; trying next prepared page as leader...`);
+        }
+
+        if (!unlocked) {
+          logger.warn('No prepared leader page unlocked checkout flow in this batch. Skipping parallel release for this batch.');
+          return;
+        }
+      }
+
+      const batchTasks = [];
+      for (const assignment of pendingAssignments) {
+        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+          sharedState.cancelled = true;
+          sharedState.cardQueue.unshift(assignment.cardNumber);
+          continue;
+        }
+
+        batchTasks.push(executeCheckoutForAssignment(assignment));
+      }
+
+      if (batchTasks.length > 0) {
+        await Promise.all(batchTasks);
+      }
+    };
+
+    const processPreparedAssignments = async (preparedAssignments) => {
+      if (!preparedAssignments || preparedAssignments.length === 0) {
+        return;
+      }
+
+      for (let i = 0; i < preparedAssignments.length; i += maxConcurrentCheckouts) {
+        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+          sharedState.cancelled = true;
+          break;
+        }
+
+        const batchEnd = Math.min(i + maxConcurrentCheckouts, preparedAssignments.length);
+        const batch = preparedAssignments.slice(i, batchEnd);
+        await processCheckoutBatch(batch);
+
+        // Add small delay between checkout batches for stealth.
+        if (batchEnd < preparedAssignments.length && maxConcurrentCheckouts > 1) {
+          await sleep(this.CHECKOUT_BATCH_DELAY_MS);
+        }
+      }
+    };
+
+    const takeAssignmentsForWorkers = (workers) => {
+      const assignments = [];
+
+      for (const worker of workers) {
+        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+          sharedState.cancelled = true;
+          break;
+        }
+
+        if (sharedState.cardQueue.length === 0) {
+          break;
+        }
+
+        const cardNumber = sharedState.cardQueue.shift();
+        assignments.push({
+          cardNumber,
+          page: worker.page,
+          label: worker.label,
+          worker,
+          failedInPrepare: false
+        });
+      }
+
+      return assignments;
+    };
+
+    const prepareAssignments = async (assignments, laneLabel = 'W1') => {
+      if (!assignments || assignments.length === 0) {
+        return [];
+      }
+
+      for (let i = 0; i < assignments.length; i++) {
+        const assignment = assignments[i];
+        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
+          sharedState.cancelled = true;
+          sharedState.cardQueue.unshift(assignment.cardNumber);
+          break;
+        }
+
+        const prepareMode = assignment.worker && assignment.worker.selectionPrimed
+          ? 'verify selection + checkout-ready'
+          : 'navigate + select';
+        logger.purchase(`${laneLabel} ${assignment.label} Preparing card ${assignment.cardNumber}/${quantity} (${prepareMode})...`);
+
+        try {
+          await this.completePurchase({
+            telegramUserId,
+            page: assignment.page,
+            gameUrl,
+            cardIndex,
+            backupCode: null,
+            backupCodeId: null,
+            checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
+            cardNumber: assignment.cardNumber,
+            gameName,
+            cardName,
+            label: assignment.label,
+            stopBeforeCheckout: true,
+            preferExistingSelection: !!(assignment.worker && assignment.worker.selectionPrimed)
+          });
+          if (assignment.worker) {
+            assignment.worker.selectionPrimed = true;
+          }
+        } catch (prepareErr) {
+          assignment.failedInPrepare = true;
+          if (assignment.worker) {
+            assignment.worker.selectionPrimed = false;
+          }
+          await processPurchaseError(prepareErr, assignment, 'prepare');
+        }
+
+        const shouldContinue = await waitStepDelay('prepare stage', i, assignments.length);
+        if (!shouldContinue) break;
+      }
+
+      return assignments.filter(a => !a.failedInPrepare);
+    };
+
     try {
       // Phase A: Open and initialize pages sequentially with delay between each page.
       for (let i = 0; i < workerCount; i++) {
@@ -2525,278 +2817,29 @@ class PurchaseService {
         if (!shouldContinue) break;
       }
 
-      // Phased card processing loop.
-      while (!sharedState.cancelled && !(checkCancellation && checkCancellation()) && sharedState.cardQueue.length > 0) {
-        const assignments = [];
+      // Two-lane pipeline:
+      // W1 prepares one lane while W2 checks out the previously prepared lane, then swap lanes.
+      const laneSize = Math.max(1, Math.min(workerPages.length, maxConcurrentCheckouts));
+      const laneAWorkers = workerPages.slice(0, laneSize);
+      const laneBWorkers = workerPages.slice(laneSize);
+      const hasTwoLanes = laneBWorkers.length > 0;
 
-        for (let i = 0; i < workerPages.length && sharedState.cardQueue.length > 0; i++) {
-          const cardNumber = sharedState.cardQueue.shift();
-          assignments.push({
-            cardNumber,
-            page: workerPages[i].page,
-            label: workerPages[i].label,
-            worker: workerPages[i],
-            failedInPrepare: false
-          });
-        }
+      logger.purchase(`Pipeline mode: W1 prepare lane size=${laneAWorkers.length}${hasTwoLanes ? `, laneB size=${laneBWorkers.length}` : ''}; W2 checkout concurrency=${maxConcurrentCheckouts}`);
 
-        // Phase B: Prepare each page (navigate, select card, select payment) sequentially.
-        for (let i = 0; i < assignments.length; i++) {
-          const assignment = assignments[i];
-          if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-            sharedState.cancelled = true;
-            sharedState.cardQueue.unshift(assignment.cardNumber);
-            break;
-          }
+      let nextPrepareWorkers = hasTwoLanes ? laneBWorkers : laneAWorkers;
+      let currentPrepared = await prepareAssignments(takeAssignmentsForWorkers(laneAWorkers), 'W1');
 
-          const prepareMode = assignment.worker && assignment.worker.selectionPrimed
-            ? 'verify selection + checkout-ready'
-            : 'navigate + select';
-          logger.purchase(`${assignment.label} Preparing card ${assignment.cardNumber}/${quantity} (${prepareMode})...`);
+      while (!sharedState.cancelled && !(checkCancellation && checkCancellation()) && (currentPrepared.length > 0 || sharedState.cardQueue.length > 0)) {
+        const nextAssignments = takeAssignmentsForWorkers(nextPrepareWorkers);
 
-          try {
-            await this.completePurchase({
-              telegramUserId,
-              page: assignment.page,
-              gameUrl,
-              cardIndex,
-              backupCode: null,
-              backupCodeId: null,
-              checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-              cardNumber: assignment.cardNumber,
-              gameName,
-              cardName,
-              label: assignment.label,
-              stopBeforeCheckout: true,
-              preferExistingSelection: !!(assignment.worker && assignment.worker.selectionPrimed)
-            });
-            if (assignment.worker) {
-              assignment.worker.selectionPrimed = true;
-            }
-          } catch (prepareErr) {
-            assignment.failedInPrepare = true;
-            if (assignment.worker) {
-              assignment.worker.selectionPrimed = false;
-            }
-            await processPurchaseError(prepareErr, assignment, 'prepare');
-          }
+        const checkoutPromise = processPreparedAssignments(currentPrepared);
+        const preparePromise = prepareAssignments(nextAssignments, 'W1');
 
-          const shouldContinue = await waitStepDelay('prepare stage', i, assignments.length);
-          if (!shouldContinue) break;
-        }
+        const [, preparedNext] = await Promise.all([checkoutPromise, preparePromise]);
+        currentPrepared = preparedNext;
 
-        // Phase C: Checkout prepared pages with configurable concurrency (default 2 simultaneous).
-        const maxConcurrentCheckouts = appConfig.purchase.maxConcurrentCheckouts || 2;
-
-        const executeCheckoutForAssignment = async (assignment) => {
-          logger.purchase(`${assignment.label} Checkout for card ${assignment.cardNumber}/${quantity}...`);
-
-          try {
-            let result;
-
-            try {
-              result = await this.completePurchase({
-                telegramUserId,
-                page: assignment.page,
-                gameUrl,
-                cardIndex,
-                backupCode: null,
-                backupCodeId: null,
-                checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                cardNumber: assignment.cardNumber,
-                gameName,
-                cardName,
-                label: assignment.label,
-                resumeFromCheckout: true
-              });
-            } catch (err) {
-              if (!(err instanceof BackupCodeExpiredError) && !(err instanceof TwoFactorVerificationRequiredError)) {
-                throw err;
-              }
-
-              // Fast path: some tabs auto-navigate to transaction page shortly after checkout.
-              // Skip backup-code lock/code reservation when this has already happened.
-              const urlBeforeLock = assignment.page.url();
-              if (urlBeforeLock.includes('/transaction/')) {
-                logger.debug(`${assignment.label} Reached transaction page before 2FA lock; skipping backup-code reservation.`);
-                result = await this.completePurchase({
-                  telegramUserId,
-                  page: assignment.page,
-                  gameUrl,
-                  cardIndex,
-                  backupCode: null,
-                  backupCodeId: null,
-                  checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                  cardNumber: assignment.cardNumber,
-                  gameName,
-                  cardName,
-                  label: assignment.label,
-                  resumeFromTwoFactor: true
-                });
-              } else {
-                result = await this.runWithUserLock(telegramUserId, async () => {
-                  const urlAfterLock = assignment.page.url();
-                  if (urlAfterLock.includes('/transaction/')) {
-                    logger.debug(`${assignment.label} Reached transaction page while waiting for 2FA lock; skipping backup code.`);
-                    return this.completePurchase({
-                      telegramUserId,
-                      page: assignment.page,
-                      gameUrl,
-                      cardIndex,
-                      backupCode: null,
-                      backupCodeId: null,
-                      checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                      cardNumber: assignment.cardNumber,
-                      gameName,
-                      cardName,
-                      label: assignment.label,
-                      resumeFromTwoFactor: true
-                    });
-                  }
-
-                  const nextBackupCode = await getNextBackupCode();
-                  if (!nextBackupCode) {
-                    throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA. Add more backup codes and retry remaining cards.');
-                  }
-
-                  logger.warn(`${assignment.label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
-                  await humanDelay(this.TWO_FACTOR_LOCK_HUMAN_DELAY_MIN_MS, this.TWO_FACTOR_LOCK_HUMAN_DELAY_MAX_MS);
-
-                  return this.completePurchase({
-                    telegramUserId,
-                    page: assignment.page,
-                    gameUrl,
-                    cardIndex,
-                    backupCode: nextBackupCode.code,
-                    backupCodeId: nextBackupCode.id,
-                    checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                    cardNumber: assignment.cardNumber,
-                    gameName,
-                    cardName,
-                    label: assignment.label,
-                    resumeFromTwoFactor: true
-                  });
-                });
-              }
-            }
-
-            sharedState.purchases.push(result);
-            sharedState.processedCount++;
-
-            if (result.success) {
-              sharedState.successCount++;
-              logger.success(`${assignment.label} Card ${assignment.cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
-              await trackedCardSave(result, assignment.cardNumber, assignment.label);
-              result.savedToDb = true;
-            } else {
-              sharedState.failedCount++;
-              logger.warn(`${assignment.label} Card ${assignment.cardNumber}/${quantity} reached transaction but extraction FAILED`);
-              if (result.transactionId) {
-                await trackedCardSave(result, assignment.cardNumber, assignment.label);
-                result.savedToDb = true;
-              }
-            }
-
-            await bumpProgress();
-            return {
-              ok: true,
-              reachedTransaction: !!(result && result.transactionId),
-              twoFactorWindowActive: this.isTwoFactorWindowActive(telegramUserId)
-            };
-          } catch (checkoutErr) {
-            await processPurchaseError(checkoutErr, assignment, 'checkout');
-            return {
-              ok: false,
-              reachedTransaction: !!(checkoutErr && checkoutErr.transactionId),
-              twoFactorWindowActive: this.isTwoFactorWindowActive(telegramUserId),
-              error: checkoutErr
-            };
-          }
-        };
-        
-        const processCheckoutBatch = async (batchAssignments) => {
-          const validAssignments = batchAssignments.filter(a => !a.failedInPrepare);
-          if (validAssignments.length === 0) {
-            return;
-          }
-
-          // If 2FA window expired, use one leader checkout first to prime the 15-minute window,
-          // then continue other prepared pages in parallel without re-preparing flow.
-          const requireLeaderPrime = !this.isTwoFactorWindowActive(telegramUserId) && validAssignments.length > 1;
-          let pendingAssignments = validAssignments;
-
-          if (requireLeaderPrime) {
-            const windowMinutes = Math.round(this.TWO_FACTOR_WINDOW_MS / 60000);
-            const leaderCandidates = [...validAssignments];
-            let unlocked = false;
-            pendingAssignments = [];
-
-            while (leaderCandidates.length > 0 && !unlocked) {
-              const leader = leaderCandidates.shift();
-              logger.purchase(`${leader.label} Leader checkout: 2FA window expired, priming ${windowMinutes}m session before releasing other pages...`);
-
-              const leaderOutcome = await executeCheckoutForAssignment(leader);
-
-              if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-                sharedState.cancelled = true;
-                return;
-              }
-
-              const unlockedNow = !!(
-                leaderOutcome
-                && (leaderOutcome.twoFactorWindowActive || leaderOutcome.reachedTransaction)
-              );
-
-              if (unlockedNow) {
-                unlocked = true;
-                pendingAssignments = leaderCandidates;
-                logger.success(`${leader.label} Leader unlocked checkout flow; releasing ${pendingAssignments.length} prepared page(s) in parallel.`);
-                break;
-              }
-
-              logger.warn(`${leader.label} Leader did not unlock 2FA window/transaction; trying next prepared page as leader...`);
-            }
-
-            if (!unlocked) {
-              logger.warn('No prepared leader page unlocked checkout flow in this batch. Skipping parallel release for this batch.');
-              return;
-            }
-          }
-
-          const batchTasks = [];
-          
-          for (const assignment of pendingAssignments) {
-            if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-              sharedState.cancelled = true;
-              sharedState.cardQueue.unshift(assignment.cardNumber);
-              continue;
-            }
-
-            const checkoutTask = executeCheckoutForAssignment(assignment);
-            
-            batchTasks.push(checkoutTask);
-          }
-          
-          if (batchTasks.length > 0) {
-            await Promise.all(batchTasks);
-          }
-        };
-        
-        // Process checkouts in concurrent batches
-        for (let i = 0; i < assignments.length; i += maxConcurrentCheckouts) {
-          if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-            sharedState.cancelled = true;
-            break;
-          }
-          
-          const batchEnd = Math.min(i + maxConcurrentCheckouts, assignments.length);
-          const batch = assignments.slice(i, batchEnd);
-          await processCheckoutBatch(batch);
-          
-          // Add small delay between batches for stealth (but not after last batch)
-          if (batchEnd < assignments.length && maxConcurrentCheckouts > 1) {
-            await sleep(this.CHECKOUT_BATCH_DELAY_MS);
-          }
+        if (hasTwoLanes) {
+          nextPrepareWorkers = nextPrepareWorkers === laneAWorkers ? laneBWorkers : laneAWorkers;
         }
       }
 
