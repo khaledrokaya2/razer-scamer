@@ -984,6 +984,43 @@ class PurchaseService {
         }
       };
 
+      const throwIfCancelled = (context = 'operation') => {
+        if (checkCancellation && checkCancellation()) {
+          log.warn(`Cancellation detected before ${context}; aborting immediately.`);
+          throw new Error('Order cancelled by user');
+        }
+      };
+
+      const waitForSelectorCancellable = async (selector, { visible = true, timeout = 3000 } = {}) => {
+        const deadline = Date.now() + timeout;
+
+        while (Date.now() < deadline) {
+          throwIfCancelled(`waiting for selector ${selector}`);
+
+          const el = await page.$(selector).catch(() => null);
+          if (el) {
+            if (!visible) {
+              return el;
+            }
+
+            const isVisible = await page.evaluate((node) => {
+              if (!node) return false;
+              const style = window.getComputedStyle(node);
+              const rect = node.getBoundingClientRect();
+              return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            }, el).catch(() => false);
+
+            if (isVisible) {
+              return el;
+            }
+          }
+
+          await this.sleep(120);
+        }
+
+        return null;
+      };
+
       await waitIfTwoFactorPaused();
 
       // STAGE 1-3: Prepare checkout flow (skip in resume modes)
@@ -1448,6 +1485,9 @@ class PurchaseService {
       currentStage = this.STAGES.CLICKING_CHECKOUT;
       log.debug(`Stage: ${currentStage}`);
 
+      // HARD GUARD: do not proceed to checkout click if cancellation is already requested.
+      throwIfCancelled('checkout click');
+
       // Click checkout
       log.purchase('Clicking checkout...');
 
@@ -1464,7 +1504,7 @@ class PurchaseService {
 
       for (const selector of checkoutSelectors) {
         try {
-          checkoutButton = await page.waitForSelector(selector, {
+          checkoutButton = await waitForSelectorCancellable(selector, {
             visible: true,
             timeout: 3000
           });
@@ -1482,6 +1522,9 @@ class PurchaseService {
         // Keep logging consistent if direct selector lookup fails.
         log.debug('Checkout button not found via strict selectors, using text-based fallback click');
       }
+
+      // HARD GUARD: ensure cancellation is honored right before dispatching checkout click.
+      throwIfCancelled('dispatching checkout click');
 
       const checkoutClickResult = await this.runWithActionGate(
         telegramUserId,
@@ -1817,6 +1860,8 @@ class PurchaseService {
           }
 
           // Step 6: Enter backup code (8 digits)
+          // HARD GUARD: cancellation right before entering backup code must stop immediately.
+          throwIfCancelled('entering backup code');
           log.debug('Entering backup code...');
 
           if (!backupCode || backupCode.length !== 8) {
@@ -1842,6 +1887,7 @@ class PurchaseService {
 
           if (entryMode === 'segmented') {
             // Fast path: fill all segmented fields in one DOM pass and dispatch events.
+            throwIfCancelled('filling segmented backup code fields');
             const filledCount = await otpFrame.evaluate((code) => {
               let count = 0;
               for (let i = 0; i < 8; i++) {
@@ -1861,6 +1907,7 @@ class PurchaseService {
             if (filledCount !== 8) {
               // Fallback: char-by-char typing with very small delay.
               for (let i = 0; i < 8; i++) {
+                throwIfCancelled('typing backup code digits');
                 const inputSelector = `#otp-input-${i}`;
                 await otpFrame.waitForSelector(inputSelector, { visible: true, timeout: 3000 });
                 await otpFrame.click(inputSelector, { clickCount: 3 });
@@ -1868,6 +1915,7 @@ class PurchaseService {
               }
             }
           } else {
+            throwIfCancelled('filling backup code single input');
             await otpFrame.evaluate((code) => {
               const input = document.querySelector("input[type='text'], input[type='tel'], input[type='number']");
               if (!input) throw new Error('Backup code input field not found');
@@ -1883,6 +1931,7 @@ class PurchaseService {
           // Mark the backup code as used now that it has been physically typed into the input
           if (backupCodeId) {
             try {
+              throwIfCancelled('marking backup code as used');
               const db = require('./DatabaseService');
               await db.markBackupCodesAsUsedByIds([backupCodeId]);
               log.debug(`Backup code ID ${backupCodeId} marked as used after entry`);
