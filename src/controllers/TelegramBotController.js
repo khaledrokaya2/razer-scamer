@@ -35,6 +35,8 @@ class TelegramBotController {
     // Track current user-level operation to block concurrent commands/callbacks.
     this.userOperations = new Map(); // userId -> { id, type, cancellable, startedAt }
     this.operationSeq = 0;
+    // Track in-progress credential update tests for /cancel rollback support.
+    this.credentialsUpdateControllers = new Map(); // userId -> { cancelled: boolean, previousCredentials }
     // Cleanup rate limit map periodically
     this.startRateLimitCleanup();
   }
@@ -806,6 +808,26 @@ class TelegramBotController {
 
     try {
       const activeOperation = this.getActiveOperation(telegramUserId);
+      const credentialsUpdateController = this.credentialsUpdateControllers.get(telegramUserId);
+
+      if (activeOperation && activeOperation.type === 'settings' && !credentialsUpdateController) {
+        await this.bot.sendMessage(chatId, '⏳ Credentials update is starting. Please wait a moment, then try /cancel again if needed.');
+        return;
+      }
+
+      if (credentialsUpdateController && activeOperation && activeOperation.type === 'settings') {
+        credentialsUpdateController.cancelled = true;
+
+        const purchaseService = require('../services/PurchaseService');
+        await purchaseService.resetUserBrowsers(telegramUserId);
+
+        await this.bot.sendMessage(
+          chatId,
+          '🛑 Cancelling credentials update... Browser stopped. Restoring old credentials session now.'
+        );
+        return;
+      }
+
       if (activeOperation && !activeOperation.cancellable) {
         await this.bot.sendMessage(chatId, '⏳ Browser launch/login is in progress and cannot be cancelled. Please wait.');
         return;
@@ -1534,16 +1556,49 @@ class TelegramBotController {
     const db = require('../services/DatabaseService');
     const encryptionService = require('../utils/encryption');
     const session = sessionManager.getSession(chatId);
+    const purchaseService = require('../services/PurchaseService');
+    const operation = this.beginUserOperation(telegramUserId, 'settings', true);
+
+    if (!operation) {
+      await this.sendBusyMessage(chatId, this.getActiveOperation(telegramUserId));
+      return;
+    }
 
     try {
+      if (!session || !session.email) {
+        throw new Error('Credentials update session expired');
+      }
+
       // Get email and password from session
       const email = session.email;
       const passwordTrimmed = password.trim();
+      const previousCredentials = await db.getUserCredentials(telegramUserId);
+      const credentialsUpdateController = {
+        cancelled: false,
+        previousCredentials
+      };
+      this.credentialsUpdateControllers.set(telegramUserId, credentialsUpdateController);
+
+      const throwIfCancelled = () => {
+        const controller = this.credentialsUpdateControllers.get(telegramUserId);
+        if (controller && controller.cancelled) {
+          throw new Error('Credentials update cancelled by user');
+        }
+      };
+
+      await this.safeSendMessage(
+        chatId,
+        '⏳ Browser is getting ready. Testing your new credentials now...\nUse /cancel to keep old credentials.'
+      );
+
+      throwIfCancelled();
 
       // Credentials changed: verify login first, then persist to database.
-      const purchaseService = require('../services/PurchaseService');
       await purchaseService.resetUserBrowsers(telegramUserId);
+      throwIfCancelled();
+
       await scraperService.login(telegramUserId, email, passwordTrimmed);
+      throwIfCancelled();
 
       // Login succeeded - now persist encrypted credentials.
       const emailEncrypted = encryptionService.encrypt(email);
@@ -1570,11 +1625,57 @@ class TelegramBotController {
     } catch (err) {
       logger.error('Error saving credentials:', err);
 
+      const controller = this.credentialsUpdateControllers.get(telegramUserId);
+      const cancelledByUser = err.message === 'Credentials update cancelled by user'
+        || (controller && controller.cancelled);
+
+      if (cancelledByUser) {
+        try {
+          await purchaseService.resetUserBrowsers(telegramUserId);
+
+          if (controller && controller.previousCredentials && controller.previousCredentials.email && controller.previousCredentials.password) {
+            await scraperService.login(
+              telegramUserId,
+              controller.previousCredentials.email,
+              controller.previousCredentials.password
+            );
+
+            purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch((syncErr) => {
+              logger.warn(`Background ready-session sync failed after credentials rollback for user ${telegramUserId}: ${syncErr.message}`);
+            });
+
+            await this.safeSendMessage(
+              chatId,
+              '❌ Credentials were not saved. Restored previous credentials and browser session is ready.'
+            );
+          } else {
+            await this.safeSendMessage(
+              chatId,
+              '❌ Credentials were not saved. No old credentials found to restore.'
+            );
+          }
+        } catch (rollbackErr) {
+          logger.error('Error restoring previous credentials session:', rollbackErr);
+          await this.safeSendMessage(
+            chatId,
+            '❌ Credentials were not saved, but restoring old browser session failed. Use /start or /settings.'
+          );
+        } finally {
+          sessionManager.clearCredentials(chatId);
+          sessionManager.updateState(chatId, 'idle');
+        }
+
+        return;
+      }
+
       // Clear credentials on error
       sessionManager.clearCredentials(chatId);
       sessionManager.updateState(chatId, 'idle');
 
       await this.safeSendMessage(chatId, '❌ Error during login. Check your credentials then try again.');
+    } finally {
+      this.credentialsUpdateControllers.delete(telegramUserId);
+      this.clearUserOperation(telegramUserId, operation.id);
     }
   }
 
