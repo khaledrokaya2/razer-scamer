@@ -28,6 +28,7 @@ const {
   createCatalogPageMatcher
 } = require('./purchase/url');
 const AntibanService = require('./AntibanService');
+const RazerLoginService = require('./RazerLoginService');
 const setupPage = AntibanService.setupPage;
 const isBanned = AntibanService.isBanned;
 const withRetry = AntibanService.withRetry;
@@ -43,15 +44,17 @@ class PurchaseService {
     // Map of telegramUserId -> Array of page instances
     this.activePurchasePages = new Map();
 
-    // Keep one persistent logged-in browser per user.
-    this.readyBrowsersByUser = new Map(); // userId -> {browser, page, slot}
+    // Keep a global shared ready-browser pool for all authorized users.
+    this.readyBrowsersByUser = new Map(); // globalKey -> Map(slot -> {browser, page, slot})
     this.readyInitLocks = new Map(); // userId -> Promise
     this.twoFactorLocks = new Map(); // userId -> Promise chain lock
     this.twoFactorWindowByUser = new Map(); // userId -> last successful 2FA timestamp
     this.actionLocks = new Map(); // userId -> Promise chain lock for page actions
     this.intentionalReadyCloseUsers = new Set();
-    this.MAX_READY_BROWSERS = 1;
-    this.MAX_PARALLEL_PAGES = appConfig.purchase.maxParallelPages ?? 3;
+    this.MAX_READY_BROWSERS = appConfig.purchase.maxReadyBrowsers ?? 1;
+    this.PAGES_PER_BROWSER = appConfig.purchase.pagesPerBrowser ?? [1];
+    this.MAX_READY_BROWSERS_FOR_TRANSACTIONS = 1;
+    this.MAX_PARALLEL_PAGES = appConfig.purchase.maxParallelPages ?? 1;
     this.SEQUENTIAL_STEP_DELAY_MS = appConfig.purchase.sequentialStepDelayMs ?? 120;
     this.SEQUENTIAL_STEP_JITTER_MS = appConfig.purchase.sequentialStepJitterMs ?? 40;
     this.PAGE_OPEN_STEP_DELAY_MS = appConfig.purchase.pageOpenStepDelayMs ?? 260;
@@ -75,6 +78,7 @@ class PurchaseService {
     this.TRANSACTION_API_RATE_DELAY_MS = appConfig.purchase.transactionApiRateDelayMs;
     this.POST_TRANSACTION_CONGRATS_TIMEOUT_MS = appConfig.purchase.postTransactionCongratsTimeoutMs ?? 2200;
     this.POST_TRANSACTION_PIN_WAIT_TIMEOUT_MS = appConfig.purchase.postTransactionPinWaitTimeoutMs ?? 1200;
+    this.TWO_FACTOR_IFRAME_RETRY_TIMEOUT_MS = appConfig.purchase.twoFactorIframeRetryTimeoutMs ?? 12000;
     this.CHECKOUT_BATCH_DELAY_MS = appConfig.purchase.checkoutBatchDelayMs ?? 20;
     this.TWO_FACTOR_LOCK_HUMAN_DELAY_MIN_MS = appConfig.purchase.twoFactorLockHumanDelayMinMs ?? 120;
     this.TWO_FACTOR_LOCK_HUMAN_DELAY_MAX_MS = appConfig.purchase.twoFactorLockHumanDelayMaxMs ?? 260;
@@ -82,9 +86,28 @@ class PurchaseService {
     this.TRANSACTIONS_PAGE_URL = 'https://gold.razer.com/global/en/transactions';
     this.TRANSACTION_DETAIL_URL_PREFIX = 'https://gold.razer.com/global/en/transaction/purchase/';
     this.READY_BROWSER_HOME_URL = 'https://gold.razer.com/global/en';
+    this.CHECKOUT_API_PATH = '/api/webshop/checkout/gold';
+    this.API_REPLAY_DELAY_MIN_MS = appConfig.purchase.apiReplayDelayMinMs ?? 1500;
+    this.API_REPLAY_DELAY_MAX_MS = appConfig.purchase.apiReplayDelayMaxMs ?? 4500;
 
     // Purchase stage value object imported from domain module.
     this.STAGES = PurchaseStages;
+
+    this.GLOBAL_SCOPE_KEY = '__GLOBAL_BOT_SCOPE__';
+  }
+
+  getGlobalScopeKey() {
+    return this.GLOBAL_SCOPE_KEY;
+  }
+
+  /**
+   * Get browser key for a specific slot number
+   * Generates keys dynamically: slot 1 → __GLOBAL_BROWSER_SLOT_1__, etc.
+   * @param {number} slot - Slot number (1, 2, 3, ...)
+   * @returns {string} Browser key
+   */
+  getGlobalBrowserKeyForSlot(slot) {
+    return `__GLOBAL_BROWSER_SLOT_${slot}__`;
   }
 
   /**
@@ -122,20 +145,31 @@ class PurchaseService {
    * @returns {Array<{browser: Object, page: Object, slot: number}>}
    */
   getReadySessions(telegramUserId) {
-    const session = this.readyBrowsersByUser.get(telegramUserId);
-    if (!session || !session.browser || !session.page) {
+    const scopeKey = this.getGlobalScopeKey();
+    const sessionMap = this.readyBrowsersByUser.get(scopeKey);
+    if (!sessionMap || !(sessionMap instanceof Map) || sessionMap.size === 0) {
       return [];
     }
 
-    try {
-      if (session.browser.isConnected() && !session.page.isClosed()) {
-        return [session];
+    const sessions = [];
+    const orderedSlots = Array.from(sessionMap.keys()).sort((a, b) => a - b);
+
+    for (const slot of orderedSlots) {
+      const session = sessionMap.get(slot);
+      if (!session || !session.browser || !session.page) {
+        continue;
       }
-    } catch (err) {
-      return [];
+
+      try {
+        if (session.browser.isConnected() && !session.page.isClosed()) {
+          sessions.push(session);
+        }
+      } catch (err) {
+        // ignore disconnected/stale entries
+      }
     }
 
-    return [];
+    return sessions;
   }
 
   /**
@@ -155,9 +189,18 @@ class PurchaseService {
    * @returns {boolean}
    */
   isTwoFactorWindowActive(telegramUserId) {
-    const lastTs = this.twoFactorWindowByUser.get(telegramUserId);
-    if (!lastTs) return false;
-    return (Date.now() - lastTs) < this.TWO_FACTOR_WINDOW_MS;
+    const lastTwoFactorTs = this.twoFactorWindowByUser.get(telegramUserId);
+    if (!lastTwoFactorTs) {
+      return false;
+    }
+
+    const ageMs = Date.now() - lastTwoFactorTs;
+    if (ageMs >= this.TWO_FACTOR_WINDOW_MS) {
+      this.twoFactorWindowByUser.delete(telegramUserId);
+      return false;
+    }
+
+    return true;
   }
 
   /**
@@ -176,21 +219,22 @@ class PurchaseService {
    * @returns {Promise<any>}
    */
   async runWithUserLock(telegramUserId, task) {
-    const previous = this.twoFactorLocks.get(telegramUserId) || Promise.resolve();
+    const scopeKey = this.getGlobalScopeKey();
+    const previous = this.twoFactorLocks.get(scopeKey) || Promise.resolve();
     let release;
     const current = new Promise(resolve => {
       release = resolve;
     });
 
-    this.twoFactorLocks.set(telegramUserId, current);
+    this.twoFactorLocks.set(scopeKey, current);
     await previous;
 
     try {
       return await task();
     } finally {
       release();
-      if (this.twoFactorLocks.get(telegramUserId) === current) {
-        this.twoFactorLocks.delete(telegramUserId);
+      if (this.twoFactorLocks.get(scopeKey) === current) {
+        this.twoFactorLocks.delete(scopeKey);
       }
     }
   }
@@ -206,28 +250,35 @@ class PurchaseService {
     telegramUserId,
     task,
     {
+      lockScopeKey = null,
+      serialize = true,
       skipGap = false,
       lockWaitTimeoutMs = this.ACTION_LOCK_WAIT_TIMEOUT_MS,
       taskTimeoutMs = this.ACTION_TASK_TIMEOUT_MS,
       taskLabel = 'browser action'
     } = {}
   ) {
-    const previous = this.actionLocks.get(telegramUserId) || Promise.resolve();
-    let release;
-    const current = new Promise(resolve => {
-      release = resolve;
-    });
+    const scopeKey = lockScopeKey || this.getGlobalScopeKey();
+    let release = null;
+    let current = null;
 
-    this.actionLocks.set(telegramUserId, current);
+    if (serialize) {
+      const previous = this.actionLocks.get(scopeKey) || Promise.resolve();
+      current = new Promise(resolve => {
+        release = resolve;
+      });
 
-    await Promise.race([
-      previous,
-      new Promise((_, reject) => {
-        setTimeout(() => {
-          reject(new Error(`Action gate wait timed out while waiting for previous action (${taskLabel})`));
-        }, lockWaitTimeoutMs);
-      })
-    ]);
+      this.actionLocks.set(scopeKey, current);
+
+      await Promise.race([
+        previous,
+        new Promise((_, reject) => {
+          setTimeout(() => {
+            reject(new Error(`Action gate wait timed out while waiting for previous action (${taskLabel})`));
+          }, lockWaitTimeoutMs);
+        })
+      ]);
+    }
 
     try {
       if (!skipGap) {
@@ -249,9 +300,11 @@ class PurchaseService {
         })
       ]);
     } finally {
-      release();
-      if (this.actionLocks.get(telegramUserId) === current) {
-        this.actionLocks.delete(telegramUserId);
+      if (serialize && release) {
+        release();
+      }
+      if (serialize && current && this.actionLocks.get(scopeKey) === current) {
+        this.actionLocks.delete(scopeKey);
       }
     }
   }
@@ -262,10 +315,11 @@ class PurchaseService {
    * @param {Object} page - Puppeteer page
    */
   trackPurchasePage(telegramUserId, page) {
-    if (!this.activePurchasePages.has(telegramUserId)) {
-      this.activePurchasePages.set(telegramUserId, []);
+    const scopeKey = this.getGlobalScopeKey();
+    if (!this.activePurchasePages.has(scopeKey)) {
+      this.activePurchasePages.set(scopeKey, []);
     }
-    this.activePurchasePages.get(telegramUserId).push(page);
+    this.activePurchasePages.get(scopeKey).push(page);
   }
 
   /**
@@ -274,14 +328,15 @@ class PurchaseService {
    * @param {Object} page - Puppeteer page
    */
   untrackPurchasePage(telegramUserId, page) {
-    if (!this.activePurchasePages.has(telegramUserId)) return;
-    const pages = this.activePurchasePages.get(telegramUserId);
+    const scopeKey = this.getGlobalScopeKey();
+    if (!this.activePurchasePages.has(scopeKey)) return;
+    const pages = this.activePurchasePages.get(scopeKey);
     const index = pages.indexOf(page);
     if (index > -1) {
       pages.splice(index, 1);
     }
     if (pages.length === 0) {
-      this.activePurchasePages.delete(telegramUserId);
+      this.activePurchasePages.delete(scopeKey);
     }
   }
 
@@ -293,14 +348,15 @@ class PurchaseService {
     * @param {Function} options.onProgress - Optional callback: ({ready, target, phase})
    * @returns {Promise<{ready: boolean, count: number, reason?: string}>}
    */
-  async ensureReadyBrowsers(telegramUserId, { forceRestart = false, onProgress = null } = {}) {
-    if (this.readyInitLocks.has(telegramUserId)) {
-      return this.readyInitLocks.get(telegramUserId);
+  async ensureReadyBrowsers(telegramUserId, { forceRestart = false, onProgress = null, credentialsOverride = null } = {}) {
+    const scopeKey = this.getGlobalScopeKey();
+    if (this.readyInitLocks.has(scopeKey)) {
+      return this.readyInitLocks.get(scopeKey);
     }
 
     const initPromise = (async () => {
       const db = require('./DatabaseService');
-      const credentials = await db.getUserCredentials(telegramUserId);
+      const credentials = credentialsOverride || await db.getUserCredentials(telegramUserId);
 
       if (!credentials || !credentials.email || !credentials.password) {
         await this.closeReadyBrowsersForUser(telegramUserId);
@@ -312,7 +368,7 @@ class PurchaseService {
       }
 
       const sessions = this.getReadySessions(telegramUserId);
-      const target = 1;
+      const target = this.MAX_READY_BROWSERS;
 
       if (onProgress) {
         try {
@@ -322,36 +378,7 @@ class PurchaseService {
         }
       }
 
-      if (sessions.length >= 1 && browserManager.isSessionReady(telegramUserId)) {
-        // Ensure ready session and BrowserManager point to the same browser instance.
-        try {
-          if (browserManager.hasActiveBrowser(telegramUserId)) {
-            const managed = await browserManager.getBrowser(telegramUserId);
-            const current = sessions[0];
-            if (managed && managed.browser && current.browser !== managed.browser) {
-              try {
-                if (current.browser && current.browser.isConnected()) {
-                  await Promise.race([
-                    current.browser.close().catch(() => { }),
-                    new Promise(resolve => setTimeout(resolve, 2000))
-                  ]);
-                }
-              } catch (syncErr) {
-                logger.debug(`Failed closing stale ready browser for user ${telegramUserId}: ${syncErr.message}`);
-              }
-
-              this.readyBrowsersByUser.set(telegramUserId, {
-                browser: managed.browser,
-                page: managed.page,
-                slot: 1
-              });
-              logger.system(`Rebound ready session to managed browser for user ${telegramUserId}`);
-            }
-          }
-        } catch (syncErr) {
-          logger.debug(`Ready/managed browser sync skipped for user ${telegramUserId}: ${syncErr.message}`);
-        }
-
+      if (sessions.length >= target) {
         if (onProgress) {
           try {
             await onProgress({ ready: sessions.length, target, phase: 'complete' });
@@ -362,65 +389,83 @@ class PurchaseService {
         return { ready: true, count: sessions.length, target };
       }
 
-      // First preference: reuse BrowserManager's already logged-in browser for this user.
-      try {
-        if (browserManager.isSessionReady(telegramUserId)) {
-          const browserSession = await browserManager.getBrowser(telegramUserId);
-          if (!browserSession || !browserSession.browser || !browserSession.page) {
-            throw new Error('active BrowserManager session missing browser/page');
+      logger.system(`Preparing ${target} global ready browser(s) shared by all users...`);
+      const sessionMap = new Map();
+
+      let readyCount = 0;
+      const launchTasks = [];
+      const launchFailures = [];
+
+      for (let slot = 1; slot <= target; slot++) {
+        const startDelay = slot === 1
+          ? 0
+          : this.getStaggerDelay(slot - 1, this.READY_LOGIN_STAGGER_MS, this.READY_LOGIN_JITTER_MS);
+
+        const launchTask = (async () => {
+          if (startDelay > 0) {
+            logger.debug(`[Ready ${slot}] Delaying login start by ${startDelay}ms to reduce detection`);
+            await this.sleep(startDelay);
           }
 
-          const adoptedSession = {
-            browser: browserSession.browser,
-            page: browserSession.page,
-            slot: 1
-          };
-          this.readyBrowsersByUser.set(telegramUserId, adoptedSession);
-          logger.success(`Adopted BrowserManager session as ready browser for user ${telegramUserId}`);
+          const browserKey = this.getGlobalBrowserKeyForSlot(slot);
+          const session = await this.launchReadyBrowserWithRetry(telegramUserId, credentials, slot, {
+            browserKey,
+            logPrefix: `[Ready ${slot}]`
+          });
+          sessionMap.set(slot, session);
 
+          readyCount += 1;
           if (onProgress) {
             try {
-              await onProgress({ ready: 1, target, phase: 'complete' });
+              await onProgress({ ready: readyCount, target, phase: 'starting' });
             } catch (progressErr) {
               logger.debug(`ensureReadyBrowsers progress callback error: ${progressErr.message}`);
             }
           }
+        })().catch((err) => {
+          launchFailures.push({ slot, error: err });
+          logger.error(`[Ready ${slot}] Slot initialization failed: ${err.message}`);
+        });
 
-          return { ready: true, count: 1, target };
-        }
-      } catch (adoptErr) {
-        logger.debug(`Could not adopt BrowserManager session for user ${telegramUserId}: ${adoptErr.message}`);
+        launchTasks.push(launchTask);
       }
 
-      logger.system(`Preparing 1 ready browser for user ${telegramUserId}...`);
+      await Promise.all(launchTasks);
 
-      const startDelay = this.getStaggerDelay(0, this.READY_LOGIN_STAGGER_MS, this.READY_LOGIN_JITTER_MS);
-      if (startDelay > 0) {
-        logger.debug(`[Ready 1] Delaying login start by ${startDelay}ms to reduce detection`);
-        await this.sleep(startDelay);
+      if (sessionMap.size > 0) {
+        this.readyBrowsersByUser.set(scopeKey, sessionMap);
+      } else {
+        this.readyBrowsersByUser.delete(scopeKey);
       }
 
-      const session = await this.launchReadyBrowserWithRetry(telegramUserId, credentials, 1);
-      this.readyBrowsersByUser.set(telegramUserId, session);
-      logger.success(`Ready browser initialized for user ${telegramUserId}: 1/1`);
+      if (sessionMap.size >= target) {
+        logger.success(`Global ready browser pool initialized: ${sessionMap.size}/${target}`);
+      } else {
+        logger.warn(`Global ready browser pool is partial: ${sessionMap.size}/${target}`);
+      }
 
       if (onProgress) {
         try {
-          await onProgress({ ready: 1, target, phase: 'complete' });
+          await onProgress({ ready: sessionMap.size, target, phase: 'complete' });
         } catch (progressErr) {
           logger.debug(`ensureReadyBrowsers progress callback error: ${progressErr.message}`);
         }
       }
 
-      return { ready: true, count: 1, target };
+      return {
+        ready: sessionMap.size >= target,
+        count: sessionMap.size,
+        target,
+        failures: launchFailures.map(item => ({ slot: item.slot, message: item.error.message }))
+      };
     })();
 
-    this.readyInitLocks.set(telegramUserId, initPromise);
+    this.readyInitLocks.set(scopeKey, initPromise);
 
     try {
       return await initPromise;
     } finally {
-      this.readyInitLocks.delete(telegramUserId);
+      this.readyInitLocks.delete(scopeKey);
     }
   }
 
@@ -436,8 +481,10 @@ class PurchaseService {
     const {
       keepPoolAtMaxOnDisconnect = true,
       headless = true,
-      logPrefix = `[Ready ${slot}]`
+      logPrefix = `[Ready ${slot}]`,
+      browserKey = this.getGlobalBrowserKeyForSlot(slot)
     } = options;
+    const scopeKey = this.getGlobalScopeKey();
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let browser = null;
@@ -445,8 +492,8 @@ class PurchaseService {
       try {
         logger.system(`${logPrefix} Binding ready session to managed browser (attempt ${attempt}/${maxAttempts})`);
 
-        const hadActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
-        const managedSession = await browserManager.getBrowser(telegramUserId);
+        const hadActiveBrowser = browserManager.hasActiveBrowser(browserKey);
+        const managedSession = await browserManager.getBrowser(browserKey);
         browser = managedSession.browser;
         page = managedSession.page;
 
@@ -460,6 +507,12 @@ class PurchaseService {
             await page.goto('https://razerid.razer.com/dashboard', { waitUntil: 'domcontentloaded', timeout: 30000 });
             if (await isBanned(page)) throw new Error('rate limited');
           });
+
+          const afterDashboardUrl = String(page.url() || '').toLowerCase();
+          // Strict check: session is considered authenticated only if dashboard is actually reached.
+          if (!afterDashboardUrl.includes('/dashboard') || afterDashboardUrl.includes('login') || afterDashboardUrl.includes('signin')) {
+            return false;
+          }
 
           const sessionValid = await browserManager.checkSessionValid(page);
           if (!sessionValid) {
@@ -475,43 +528,33 @@ class PurchaseService {
           }).catch(() => false);
         };
 
-        let loggedIn = await verifyAuthenticatedSession();
-        if (!loggedIn) {
-          // Session/cookies are no longer valid; reset in-memory 2FA window.
-          this.clearTwoFactorWindowState(telegramUserId);
-          logger.system(`${logPrefix} Session is not authenticated yet for user ${telegramUserId}; signing in...`);
+        const runFullLogin = async () => {
+          this.clearTwoFactorWindowState(scopeKey);
+          logger.system(`${logPrefix} Running full login flow...`);
+          await RazerLoginService.loginOnPage(page, credentials.email, credentials.password, {
+            openLabel: `${logPrefix} Opening Razer login page...`,
+            waitLabel: `${logPrefix} Waiting for login form...`,
+            typeLabel: `${logPrefix} Typing credentials...`,
+            submitLabel: `${logPrefix} Submitting login form...`
+          });
+        };
 
-          await page.goto('https://razerid.razer.com', { waitUntil: 'load', timeout: 60000 });
-          if (await isBanned(page)) throw new Error('rate limited');
+        let loggedIn = false;
 
-          const emailSelector = '#input-login-email, input[type="email"]';
-          const passwordSelector = '#input-login-password, input[type="password"]';
-
-          await page.waitForSelector(emailSelector, { visible: true, timeout: 15000 });
-          await page.waitForSelector(passwordSelector, { visible: true, timeout: 15000 });
-
-          await page.type(emailSelector, credentials.email, { delay: 20 });
-          await humanDelay();
-          await page.type(passwordSelector, credentials.password, { delay: 20 });
-          await humanDelay();
-
-          try {
-            await page.waitForSelector('button[aria-label="Accept All"]', { visible: true, timeout: 1500 });
-            await page.click('button[aria-label="Accept All"]');
-            await humanDelay();
-          } catch (err) {
-            // Cookie banner not always present.
-          }
-
-          await Promise.all([
-            page.click('button[type="submit"]'),
-            page.waitForNavigation({ waitUntil: 'load', timeout: 60000 }).catch(() => null)
-          ]);
-
+        if (!hadActiveBrowser) {
+          // Fresh slot browser must always perform a real login before being marked ready.
+          await runFullLogin();
+          loggedIn = await verifyAuthenticatedSession();
+        } else {
           loggedIn = await verifyAuthenticatedSession();
           if (!loggedIn) {
-            throw new Error('Login verification failed - still not authenticated');
+            await runFullLogin();
+            loggedIn = await verifyAuthenticatedSession();
           }
+        }
+
+        if (!loggedIn) {
+          throw new Error('Login verification failed - still not authenticated');
         }
 
         await withRetry(async () => {
@@ -520,23 +563,23 @@ class PurchaseService {
         });
 
         if (!hadActiveBrowser) {
-          logger.success(`${logPrefix} Created and initialized managed browser for user ${telegramUserId}`);
+          logger.success(`${logPrefix} Created and initialized managed browser (${browserKey})`);
         } else {
-          logger.success(`${logPrefix} Reusing existing managed browser for user ${telegramUserId}`);
+          logger.success(`${logPrefix} Reusing existing managed browser (${browserKey})`);
         }
 
         if (keepPoolAtMaxOnDisconnect && !browser.__purchaseReadyDisconnectHooked) {
           browser.__purchaseReadyDisconnectHooked = true;
           browser.on('disconnected', () => {
-            if (this.intentionalReadyCloseUsers.has(telegramUserId)) {
-              logger.debug(`${logPrefix} Ignoring disconnect recovery for intentional close (user ${telegramUserId})`);
+            if (this.intentionalReadyCloseUsers.has(scopeKey)) {
+              logger.debug(`${logPrefix} Ignoring disconnect recovery for intentional close`);
               return;
             }
-            this.clearTwoFactorWindowState(telegramUserId);
-            logger.warn(`${logPrefix} Browser disconnected for user ${telegramUserId}. Recreating...`);
+            this.clearTwoFactorWindowState(scopeKey);
+            logger.warn(`${logPrefix} Browser disconnected (${browserKey}). Recreating...`);
             setTimeout(() => {
-              if (this.intentionalReadyCloseUsers.has(telegramUserId)) {
-                logger.debug(`${logPrefix} Recovery skipped after intentional close (user ${telegramUserId})`);
+              if (this.intentionalReadyCloseUsers.has(scopeKey)) {
+                logger.debug(`${logPrefix} Recovery skipped after intentional close`);
                 return;
               }
               this.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch(err => {
@@ -546,14 +589,14 @@ class PurchaseService {
           });
         }
 
-        logger.success(`${logPrefix} Browser ready for user ${telegramUserId}`);
+        logger.success(`${logPrefix} Browser ready for global pool`);
         return { browser, page, slot };
       } catch (err) {
         logger.error(`${logPrefix} Launch/login failed: ${err.message}`);
         // Never close managed browser from this flow unless it became disconnected.
         if (browser && !browser.isConnected()) {
-          this.clearTwoFactorWindowState(telegramUserId);
-          try { await browserManager.closeBrowser(telegramUserId); } catch (closeErr) { }
+          this.clearTwoFactorWindowState(scopeKey);
+          try { await browserManager.closeBrowser(browserKey); } catch (closeErr) { }
         }
         if (attempt === maxAttempts) {
           throw new Error(`Failed to prepare ready browser slot ${slot}: ${err.message}`);
@@ -571,44 +614,44 @@ class PurchaseService {
    * @returns {Promise<number>} Number of browsers closed
    */
   async closeReadyBrowsersForUser(telegramUserId) {
-    const session = this.readyBrowsersByUser.get(telegramUserId);
-    this.intentionalReadyCloseUsers.add(telegramUserId);
-    this.clearTwoFactorWindowState(telegramUserId);
+    const scopeKey = this.getGlobalScopeKey();
+    const sessionMap = this.readyBrowsersByUser.get(scopeKey);
+    this.intentionalReadyCloseUsers.add(scopeKey);
+    this.clearTwoFactorWindowState(scopeKey);
 
-    if (!session) {
-      // Keep BrowserManager in sync on forced resets even when no ready map entry exists.
-      try {
-        await browserManager.closeBrowser(telegramUserId);
-      } catch (err) {
-        logger.debug(`Error closing BrowserManager browser for user ${telegramUserId}: ${err.message}`);
-      } finally {
-        setTimeout(() => this.intentionalReadyCloseUsers.delete(telegramUserId), 4500);
+    let closedCount = 0;
+    if (sessionMap && sessionMap instanceof Map) {
+      for (const [slot, session] of sessionMap.entries()) {
+        if (!session || !session.browser) {
+          continue;
+        }
+
+        try {
+          await Promise.race([
+            session.browser.close(),
+            new Promise(resolve => setTimeout(resolve, 3000))
+          ]);
+          closedCount++;
+        } catch (err) {
+          logger.debug(`Error closing ready browser slot ${slot}: ${err.message}`);
+        }
       }
-      return 0;
     }
 
-    try {
-      await Promise.race([
-        session.browser.close(),
-        new Promise(resolve => setTimeout(resolve, 3000))
-      ]);
-    } catch (err) {
-      logger.debug(`Error closing ready browser for user ${telegramUserId}: ${err.message}`);
+    this.readyBrowsersByUser.delete(scopeKey);
+
+    for (let slot = 1; slot <= this.MAX_READY_BROWSERS; slot++) {
+      const browserKey = this.getGlobalBrowserKeyForSlot(slot);
+      try {
+        await browserManager.closeBrowser(browserKey);
+      } catch (err) {
+        logger.debug(`Error closing BrowserManager browser key ${browserKey}: ${err.message}`);
+      }
     }
 
-    this.readyBrowsersByUser.delete(telegramUserId);
-
-    // Ensure BrowserManager map does not keep stale disconnected browser handles.
-    try {
-      await browserManager.closeBrowser(telegramUserId);
-    } catch (err) {
-      logger.debug(`Error closing BrowserManager browser for user ${telegramUserId}: ${err.message}`);
-    } finally {
-      setTimeout(() => this.intentionalReadyCloseUsers.delete(telegramUserId), 4500);
-    }
-
-    logger.system(`Closed ready browser for user ${telegramUserId}`);
-    return 1;
+    setTimeout(() => this.intentionalReadyCloseUsers.delete(scopeKey), 4500);
+    logger.system(`Closed global ready browser pool (${closedCount} browser(s))`);
+    return closedCount;
   }
 
   /**
@@ -917,7 +960,16 @@ class PurchaseService {
       }
 
       logger.debug('Out of stock, waiting 0.5 seconds before retry...');
-      await this.sleep(this.RELOAD_CHECK_INTERVAL);
+      const cancelledDuringDelay = await this.sleepCancellable(this.RELOAD_CHECK_INTERVAL, checkCancellation);
+      if (cancelledDuringDelay) {
+        logger.warn('Stock check cancelled during delay');
+        throw new Error('Order cancelled by user');
+      }
+
+      if (checkCancellation && checkCancellation()) {
+        logger.warn('Stock check cancelled before page reload');
+        throw new Error('Order cancelled by user');
+      }
 
       // Reload page
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -935,7 +987,7 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters {userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber}
    * @returns {Promise<Object>} Purchase data
    */
-  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '', onTwoFactorStart = null, onTwoFactorEnd = null, waitForTwoFactorPause = null, resumeFromTwoFactor = false, resumeFromCheckout = false, stopBeforeCheckout = false, preferExistingSelection = false }) {
+  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '', onTwoFactorStart = null, onTwoFactorEnd = null, waitForTwoFactorPause = null, resumeFromTwoFactor = false, resumeFromCheckout = false, stopBeforeCheckout = false, preferExistingSelection = false, actionScopeKey = null }) {
     // ANTI-BAN
     await setupPage(page);
     let currentStage = this.STAGES.IDLE;
@@ -1044,12 +1096,25 @@ class PurchaseService {
 
       if (!isSameGame) {
         log.debug('Not on game page, navigating...');
-        await this.runWithActionGate(telegramUserId, () => page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 }));
+        await this.runWithActionGate(telegramUserId, () => page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 }), { lockScopeKey: actionScopeKey });
         log.debug(`Navigated to: ${page.url()}`);
       } else {
         log.debug('Already on correct game page, refreshing to ensure clean state...');
-        await this.runWithActionGate(telegramUserId, () => page.reload({ waitUntil: 'load', timeout: 60000 }));
+        await this.runWithActionGate(telegramUserId, () => page.reload({ waitUntil: 'load', timeout: 60000 }), { lockScopeKey: actionScopeKey });
         log.debug(`Page refreshed: ${page.url()}`);
+      }
+
+      // Guard: Razer sometimes redirects to generic /gold/catalog; recover before tile checks.
+      let postNavUrl = String(page.url() || '');
+      if (!isSameCatalogPage(postNavUrl)) {
+        log.warn(`Unexpected URL after navigation (${postNavUrl}). Retrying direct game URL...`);
+        await this.runWithActionGate(
+          telegramUserId,
+          () => page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }),
+          { lockScopeKey: actionScopeKey }
+        );
+        postNavUrl = String(page.url() || '');
+        log.debug(`URL after recovery navigation: ${postNavUrl}`);
       }
 
       // Wait for cards with Access Denied retry logic (Akamai WAF rate-limiting)
@@ -1057,8 +1122,28 @@ class PurchaseService {
       const MAX_ACCESS_DENIED_RETRIES = 3;
       for (let adRetry = 0; adRetry <= MAX_ACCESS_DENIED_RETRIES; adRetry++) {
         try {
-          // Check for Access Denied page
-          const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 300));
+          const currentCatalogUrl = String(page.url() || '');
+          if (!isSameCatalogPage(currentCatalogUrl)) {
+            if (adRetry >= MAX_ACCESS_DENIED_RETRIES) {
+              throw new Error(`Redirected away from target game page (current URL: ${currentCatalogUrl})`);
+            }
+
+            const redirectDelay = (adRetry + 1) * 4000 + Math.floor(Math.random() * 2000);
+            log.warn(`Unexpected catalog URL (attempt ${adRetry + 1}/${MAX_ACCESS_DENIED_RETRIES}): ${currentCatalogUrl}. Retrying in ${Math.round(redirectDelay / 1000)}s...`);
+            await this.sleep(redirectDelay);
+            await this.runWithActionGate(
+              telegramUserId,
+              () => page.goto(gameUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }),
+              { lockScopeKey: actionScopeKey }
+            );
+            continue;
+          }
+
+          // Check for Access Denied/geo pages (scan larger text to avoid missing message blocks).
+          const bodyText = await page.evaluate(() => {
+            const txt = (document.body && document.body.innerText) ? document.body.innerText : '';
+            return txt.substring(0, 6000);
+          });
           if (bodyText.includes('Access Denied')) {
             if (adRetry >= MAX_ACCESS_DENIED_RETRIES) {
               throw new Error('Access Denied by Razer CDN after multiple retries - rate limited');
@@ -1066,8 +1151,12 @@ class PurchaseService {
             const backoffDelay = (adRetry + 1) * 10000 + Math.floor(Math.random() * 5000);
             log.warn(`Access Denied detected (attempt ${adRetry + 1}/${MAX_ACCESS_DENIED_RETRIES}). Waiting ${Math.round(backoffDelay / 1000)}s...`);
             await this.sleep(backoffDelay);
-            await this.runWithActionGate(telegramUserId, () => page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 }));
+            await this.runWithActionGate(telegramUserId, () => page.goto(gameUrl, { waitUntil: 'load', timeout: 60000 }), { lockScopeKey: actionScopeKey });
             continue; // Retry the check
+          }
+
+          if (bodyText.includes('Content is not available in this location')) {
+            throw new Error('Game content is not available in this location for current session/region');
           }
 
           // Headless-safe readiness: wait for either denomination radios or card tiles in DOM.
@@ -1101,7 +1190,7 @@ class PurchaseService {
             const bodyHTML = await page.evaluate(() => document.body.innerText.substring(0, 500)).catch(() => 'Could not read page');
             log.error(`Failed to find card tiles. Page content: ${bodyHTML}`);
             log.error(`Current URL: ${page.url()}`);
-            throw new Error('Card selection tiles not found - page may not have loaded correctly');
+            throw new Error(`Card selection tiles not found - ${err.message || 'page may not have loaded correctly'}`);
           }
         }
       }
@@ -1170,6 +1259,8 @@ class PurchaseService {
 
         return { ok: true, total: radios.length };
       }, cardIndex), {
+        lockScopeKey: actionScopeKey,
+        serialize: false,
         skipGap: true,
         taskTimeoutMs: 10000,
         taskLabel: 'select card'
@@ -1309,6 +1400,8 @@ class PurchaseService {
           csMatches: csMatches.length
         };
       }, !!preferExistingSelection), {
+        lockScopeKey: actionScopeKey,
+        serialize: false,
         skipGap: true,
         taskTimeoutMs: 9000,
         taskLabel: 'quick payment preselect'
@@ -1448,6 +1541,8 @@ class PurchaseService {
           csMatches: csMatches.length
         };
       }), {
+        lockScopeKey: actionScopeKey,
+        serialize: false,
         skipGap: true,
         taskTimeoutMs: 10000,
         taskLabel: 'select payment method'
@@ -1496,17 +1591,13 @@ class PurchaseService {
       const checkoutSelectors = [
         "button[data-cs-override-id='purchase-webshop-checkout-btn']",
         "button[data-cs-override-id='purchase-webshop-reload-checkout-btn']",
-        "button[aria-label='Checkout']",
-        "button[aria-label='RELOAD TO CHECKOUT']",
-        "button[data-v-3ca6ed43][class*='btn-primary']",
-        "button[data-v-75e3a125][data-v-3ca6ed43]" // Original selector as fallback
       ];
 
       for (const selector of checkoutSelectors) {
         try {
           checkoutButton = await waitForSelectorCancellable(selector, {
             visible: true,
-            timeout: 3000
+            timeout: 1200
           });
           if (checkoutButton) {
             log.success(`Found checkout button with selector: ${selector}`);
@@ -1577,6 +1668,7 @@ class PurchaseService {
           };
         }, checkoutSelectors),
         {
+          lockScopeKey: actionScopeKey,
           taskTimeoutMs: 12000,
           taskLabel: 'checkout js click'
         }
@@ -1588,9 +1680,10 @@ class PurchaseService {
 
       log.success('Checkout button clicked successfully');
 
-      // Wait for navigation after checkout (optimized timeout)
+      // Wait briefly for immediate navigation after checkout.
+      // Longer outcome handling is done by waitForCheckoutOutcome below.
       log.http('Waiting for page to load after checkout...');
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 2000 }).catch(() => {
         log.debug('Navigation timeout - will check URL...');
       });
 
@@ -1768,7 +1861,7 @@ class PurchaseService {
                 const modal = document.querySelector('#purchaseOtpModal');
                 const iframe = document.querySelector('#purchaseOtpModal iframe[id^="otp-iframe-"]');
                 return !!(modal && iframe);
-              }, { timeout: 7000, polling: 200 });
+              }, { timeout: this.TWO_FACTOR_IFRAME_RETRY_TIMEOUT_MS, polling: 200 });
             }
           }
 
@@ -2240,733 +2333,621 @@ class PurchaseService {
       throw err;
     } finally {
       // Update activity timestamp
-      browserManager.updateActivity(telegramUserId);
+      browserManager.updateActivity(actionScopeKey || telegramUserId);
     }
   }
 
   /**
-   * Process bulk purchases using one persistent browser with parallel pages.
-   * Flow is intentionally phased to look sequential while still using multiple pages.
-   * Phase A: open pages one-by-one
-   * Phase B: prepare each page (navigate -> card -> payment) one-by-one
-   * Phase C: checkout each prepared page one-by-one (2FA handled serially)
+   * Capture a completed checkout API request while a purchase action runs.
+   * @param {Object} page
+   * @returns {{waitForCompletion: Function, detach: Function}}
+   */
+  createCheckoutRequestCapture(page) {
+    const requestMap = new WeakMap();
+    let latestSnapshot = null;
+    let resolveWaiter = null;
+
+    const onRequest = (request) => {
+      if (request.method() !== 'POST') return;
+      if (request.resourceType() !== 'xhr') return;
+      if (!request.url().includes(this.CHECKOUT_API_PATH)) return;
+
+      requestMap.set(request, {
+        capturedAt: new Date().toISOString(),
+        request: {
+          url: request.url(),
+          method: request.method(),
+          resourceType: request.resourceType(),
+          headers: request.headers(),
+          postData: request.postData() || ''
+        },
+        response: null
+      });
+    };
+
+    const onResponse = async (response) => {
+      const request = response.request();
+      const snapshot = requestMap.get(request);
+      if (!snapshot) return;
+
+      let text = '';
+      let readError = null;
+      try {
+        text = await response.text();
+      } catch (err) {
+        readError = err.message;
+      }
+
+      snapshot.response = {
+        status: response.status(),
+        statusText: response.statusText(),
+        headers: response.headers(),
+        body: text,
+        readError
+      };
+
+      latestSnapshot = snapshot;
+      if (resolveWaiter) {
+        resolveWaiter(snapshot);
+        resolveWaiter = null;
+      }
+    };
+
+    page.on('request', onRequest);
+    page.on('response', onResponse);
+
+    return {
+      waitForCompletion: (timeoutMs = 45000) => new Promise((resolve, reject) => {
+        if (latestSnapshot) {
+          resolve(latestSnapshot);
+          return;
+        }
+
+        resolveWaiter = resolve;
+        setTimeout(() => {
+          if (!latestSnapshot) {
+            reject(new Error(`Timed out waiting for checkout request ${this.CHECKOUT_API_PATH}`));
+          }
+        }, timeoutMs);
+      }),
+      detach: () => {
+        page.off('request', onRequest);
+        page.off('response', onResponse);
+      }
+    };
+  }
+
+  /**
+   * Replay a previously captured checkout API request in the current browser session.
+   * @param {Object} page
+   * @param {Object} snapshot
+   * @returns {Promise<{ok: boolean, status: number, statusText: string, body: string}>}
+   */
+  async replayCapturedCheckoutRequest(page, snapshot) {
+    if (!snapshot || !snapshot.request) {
+      throw new Error('Missing captured checkout request payload');
+    }
+
+    const sourceHeaders = snapshot.request.headers || {};
+    const replayHeaders = {};
+    const allowedHeaders = [
+      'content-type',
+      'accept',
+      'accept-language',
+      'x-razer-language',
+      'x-razer-razerid',
+      'x-razer-accesstoken',
+      'x-razer-fpid'
+    ];
+
+    for (const key of allowedHeaders) {
+      if (sourceHeaders[key]) {
+        replayHeaders[key] = sourceHeaders[key];
+      }
+    }
+
+    if (!replayHeaders['content-type']) {
+      replayHeaders['content-type'] = 'application/json';
+    }
+
+    const result = await page.evaluate(async ({ url, body, headers }) => {
+      const response = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers,
+        body
+      });
+
+      const text = await response.text().catch(() => '');
+      return {
+        ok: response.ok,
+        status: response.status,
+        statusText: response.statusText,
+        body: text
+      };
+    }, {
+      url: snapshot.request.url,
+      body: snapshot.request.postData || '',
+      headers: replayHeaders
+    });
+
+    if (!result || !result.ok) {
+      throw new Error(`Checkout API replay failed with status ${result ? result.status : 'unknown'}`);
+    }
+
+    return result;
+  }
+
+  /**
+   * Resolve the newest successful transaction detail that is not in known set.
+   * @param {Object} page
+   * @param {Set<string>} knownTransactionIds
+   * @param {Function|null} checkCancellation
+   */
+  async waitForNewTransactionDetailAfterCheckout(page, knownTransactionIds, checkCancellation = null) {
+    const maxAttempts = 8;
+    const delayMs = 1300;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (checkCancellation && checkCancellation()) {
+        throw new Error('Order cancelled by user');
+      }
+
+      const historyResult = await this.fetchTransactionsHistoryPayload(page);
+      const allTransactions = Array.isArray(historyResult && historyResult.payload && historyResult.payload.Transactions)
+        ? historyResult.payload.Transactions
+        : [];
+
+      const candidate = allTransactions.find(tx => {
+        const txnNum = String(tx && tx.txnNum ? tx.txnNum : '');
+        return txnNum && this.isSuccessfulWebshopTransaction(tx) && !knownTransactionIds.has(txnNum);
+      });
+
+      if (candidate) {
+        const txnNum = String(candidate.txnNum);
+        let detail;
+        try {
+          detail = await this.fetchTransactionDetailViaApi(page, txnNum, historyResult.apiHeaders || {});
+        } catch (apiErr) {
+          detail = await this.fetchTransactionDetail(page, txnNum);
+        }
+
+        return {
+          transactionId: detail.transactionId || txnNum,
+          pinCode: detail.pinCode,
+          serialNumber: detail.serialNumber,
+          productName: detail.productName
+        };
+      }
+
+      if (attempt < maxAttempts) {
+        const cancelled = await this.sleepCancellable(delayMs, checkCancellation);
+        if (cancelled) {
+          throw new Error('Order cancelled by user');
+        }
+      }
+    }
+
+    throw new Error('Could not detect a new successful transaction after checkout API replay');
+  }
+
+  /**
+   * Process purchases sequentially on one global page.
+   * Flow: first card via scraper (2FA-safe), then API replay for remaining cards,
+   * with automatic fallback to scraper when API fails.
    */
   async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, onProgress, onCardCompleted, checkCancellation }) {
     const db = require('./DatabaseService');
 
-    // ===== STEP 0: VALIDATE CREDENTIALS =====
     const credentials = await db.getUserCredentials(telegramUserId);
     if (!credentials || !credentials.email || !credentials.password) {
       throw new Error('No Razer credentials found for your account. Please use /setcredentials to save your email and password first.');
     }
-    logger.purchase(`Using credentials for user ${telegramUserId}: ${credentials.email}`);
 
-    // Reuse only the already prepared persistent browser from /start.
-    // Do not auto-create a new browser during purchase.
-    const readySession = this.getReadySessions(telegramUserId)[0];
-    if (!readySession) {
-      throw new Error('No ready browser session found. Use /start first to open and login your persistent browser.');
+    const readySessions = this.getReadySessions(telegramUserId);
+    if (readySessions.length === 0) {
+      throw new Error('No global ready browser session available. Use /start first.');
     }
 
-    const browser = readySession.browser;
-    const readyPage = readySession.page;
-
-    if (!browser || !browser.isConnected() || !readyPage || readyPage.isClosed()) {
-      throw new Error('Ready browser session is not active. Please run /start to re-open your logged-in browser.');
+    const mainSession = readySessions[0];
+    if (!mainSession.page || mainSession.page.isClosed()) {
+      throw new Error('Global ready browser page is not active. Use /start to recover.');
     }
 
-    // CRITICAL: all worker pages must be created from the same logged-in browser context.
-    const readyContext = readyPage.browserContext();
+    const page = mainSession.page;
+    const purchases = [];
+    const knownTransactionIds = new Set();
+    const apiPurchasesNeedingDetails = []; // Track API purchases that need transaction detail enrichment
+    const purchaseStartTime = new Date(); // Record time before purchases start for batch fetching
+    let checkoutTemplate = null;
+    let forceScraperForCurrentCard = true;
 
-    // ===== STEP 1: VALIDATE BACKUP CODES =====
-    const allBackupCodes = await db.getAllActiveBackupCodes(telegramUserId);
-
-    if (allBackupCodes.length === 0) {
-      throw new Error('❌ No active backup codes available. Please add backup codes using /setbackupcodes before purchasing.');
-    }
-
-    const workerCount = Math.min(quantity, this.MAX_PARALLEL_PAGES);
-    logger.purchase(`Using phased purchase flow with ${workerCount} parallel page(s)`);
-
-    const sharedState = {
-      cardQueue: Array.from({ length: quantity }, (_, i) => i + 1), // [1, 2, 3, ..., quantity]
-      purchases: [],
-      successCount: 0,
-      failedCount: 0,
-      processedCount: 0,
-      cancelled: false,
-      pendingDbSaves: [] // Track all DB save promises to ensure they complete before exit
-    };
-
-    /**
-     * Guaranteed DB save wrapper - tracks the promise so it completes even during shutdown
-     * @param {Object} result - Purchase result
-     * @param {number} cardNum - Card number
-     * @param {string} lbl - Worker label for logging
-     */
-    const trackedCardSave = async (result, cardNum, lbl) => {
-      if (!onCardCompleted) return;
-      const savePromise = (async () => {
-        try {
-          await onCardCompleted(result, cardNum);
-          logger.debug(`${lbl} Card ${cardNum} tracked in order memory`);
-        } catch (saveErr) {
-          logger.error(`${lbl} CRITICAL: Failed to track card ${cardNum}: ${saveErr.message}`);
-        }
-      })();
-      sharedState.pendingDbSaves.push(savePromise);
-      return savePromise;
-    };
-
-    const bumpProgress = async () => {
+    const emitProgress = async (processed) => {
       if (!onProgress) return;
       try {
-        await onProgress(sharedState.processedCount, quantity);
+        await onProgress(processed, quantity);
       } catch (progressErr) {
         logger.debug(`Progress callback error: ${progressErr.message}`);
       }
     };
 
-    const waitStepDelay = async (phaseLabel, idx, total) => {
-      if (idx >= total - 1) return true;
-
-      const isPageOpenPhase = String(phaseLabel).toLowerCase().includes('page open');
-      const baseDelay = isPageOpenPhase ? this.PAGE_OPEN_STEP_DELAY_MS : this.SEQUENTIAL_STEP_DELAY_MS;
-      const jitter = isPageOpenPhase ? this.PAGE_OPEN_STEP_JITTER_MS : this.SEQUENTIAL_STEP_JITTER_MS;
-      const delayMs = baseDelay + Math.floor(Math.random() * (jitter + 1));
-      logger.debug(`Phase delay after ${phaseLabel}: ${delayMs}ms`);
-      const cancelled = await this.sleepCancellable(delayMs, () => sharedState.cancelled || (checkCancellation && checkCancellation()));
-      if (cancelled) {
-        sharedState.cancelled = true;
-        return false;
-      }
-
-      return true;
+    const trackCard = async (result, cardNumber) => {
+      if (!onCardCompleted) return;
+      await onCardCompleted(result, cardNumber);
     };
 
-    logger.purchase(`\n${'='.repeat(60)}`);
-    logger.purchase(`Starting PHASED bulk purchase: ${quantity} x ${cardName}`);
-    logger.purchase(`One browser session shared by ${workerCount} page(s)`);
-    logger.purchase(`Each stage runs page-by-page to keep flow sequential and stable`);
-    logger.purchase(`${'='.repeat(60)}\n`);
-
-    const getNextBackupCode = async () => {
-      const activeCodes = await db.getAllActiveBackupCodes(telegramUserId);
-      return activeCodes[0] || null;
-    };
-
-    const syncReadySessionCookies = async (page) => {
-      const cookies = await readyPage.cookies();
-      if (cookies && cookies.length > 0) {
-        await page.setCookie(...cookies);
-      }
-    };
-
-    const initializeWorkerPage = async (page, isPrimaryReadyPage) => {
-      await setupPage(page);
-      await page.setDefaultTimeout(45000);
-      await page.setDefaultNavigationTimeout(60000);
-
-      if (!isPrimaryReadyPage) {
-        // Safety net: mirror ready-page auth cookies into worker tabs.
-        await syncReadySessionCookies(page);
-        // Fast+safe mode: do not warm every worker with protected homepage navigation.
-        // Prepared flow will navigate to target game URL in stage 1 anyway.
-        const seededCookies = await page.cookies(this.READY_BROWSER_HOME_URL).catch(() => []);
-        if (!seededCookies || seededCookies.length === 0) {
-          logger.warn('Worker page cookie sync produced no cookies; falling back to session check navigation.');
-          await withRetry(async () => {
-            await this.runWithActionGate(telegramUserId, () => page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }));
-            if (await isBanned(page)) throw new Error('rate limited');
-          });
-
-          const sessionValid = await browserManager.checkSessionValid(page);
-          if (!sessionValid) {
-            throw new Error('Worker page is not authenticated with the ready browser session');
-          }
-        }
-      } else {
-        await withRetry(async () => {
-          await this.runWithActionGate(telegramUserId, () => page.goto(this.READY_BROWSER_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }));
-          if (await isBanned(page)) throw new Error('rate limited');
-        });
-
-        const sessionValid = await browserManager.checkSessionValid(page);
-        if (!sessionValid) {
-          throw new Error('Worker page is not authenticated with the ready browser session');
-        }
-      }
-
-      if (!isPrimaryReadyPage) {
-        this.trackPurchasePage(telegramUserId, page);
-      }
-    };
-
-    const postCheckoutStages = ['clicking_checkout', 'processing_2fa', 'reached_transaction_page', 'extracting_pin_data'];
-    const workerPages = [];
-    const maxConcurrentCheckouts = appConfig.purchase.maxConcurrentCheckouts || 2;
-
-    const processPurchaseError = async (purchaseErr, assignment, phase) => {
-      const { cardNumber, label } = assignment;
-      const checkoutAlreadyClicked = postCheckoutStages.includes(purchaseErr.stage);
-
-      if (purchaseErr instanceof InsufficientBalanceError) {
-        logger.error(`${label} 💰 Insufficient balance - stopping all pages`);
-        sharedState.cancelled = true;
-        sharedState.failedCount++;
-        sharedState.processedCount++;
-        sharedState.purchases.push({
-          success: false,
-          transactionId: purchaseErr.transactionId || null,
-          pinCode: 'FAILED',
-          serial: 'FAILED',
-          error: purchaseErr.message,
-          stage: purchaseErr.stage,
-          requiresManualCheck: false
-        });
-        await bumpProgress();
-        return;
-      }
-
-      if (purchaseErr instanceof BackupCodeExpiredError || purchaseErr instanceof InvalidBackupCodeError) {
-        if (!checkoutAlreadyClicked) {
-          sharedState.cardQueue.unshift(cardNumber);
-          logger.warn(`${label} ${phase} backup-code error before checkout. Card ${cardNumber} re-queued.`);
-          return;
-        }
-
-        const requiresManualResult = {
-          success: false,
-          transactionId: purchaseErr.transactionId || null,
-          pinCode: 'FAILED',
-          serialNumber: 'FAILED',
-          requiresManualCheck: true,
-          error: `${purchaseErr.message}. Checkout was already clicked; do not auto-retry this card.`,
-          gameName,
-          cardValue: cardName,
-          stage: purchaseErr.stage
-        };
-
-        sharedState.failedCount++;
-        sharedState.processedCount++;
-        sharedState.purchases.push(requiresManualResult);
-        await trackedCardSave(requiresManualResult, cardNumber, label);
-        requiresManualResult.savedToDb = true;
-        await bumpProgress();
-        return;
-      }
-
-      if (purchaseErr instanceof TwoFactorVerificationRequiredError) {
-        // Should normally be handled by the checkout lock path.
-        sharedState.cardQueue.unshift(cardNumber);
-        logger.warn(`${label} 2FA still pending during ${phase}. Card ${cardNumber} re-queued.`);
-        return;
-      }
-
-      if (purchaseErr.message && purchaseErr.message.includes('cancelled by user')) {
-        if (purchaseErr.transactionId) {
-          const rescuedResult = {
-            success: false,
-            transactionId: purchaseErr.transactionId,
-            pinCode: 'FAILED',
-            serialNumber: 'FAILED',
-            requiresManualCheck: true,
-            error: 'Purchase confirmed but cancelled before PIN extraction',
-            gameName,
-            cardValue: cardName
-          };
-          sharedState.purchases.push(rescuedResult);
-          sharedState.failedCount++;
-          sharedState.processedCount++;
-          await trackedCardSave(rescuedResult, cardNumber, label);
-          rescuedResult.savedToDb = true;
-          await bumpProgress();
-        } else {
-          sharedState.cardQueue.unshift(cardNumber);
-        }
-
-        sharedState.cancelled = true;
-        logger.info(`${label} Order cancelled by user`);
-        return;
-      }
-
-      let otherErrorSavedToDb = false;
-      if (purchaseErr.transactionId) {
-        const rescuedResult = {
-          success: false,
-          transactionId: purchaseErr.transactionId,
-          pinCode: 'FAILED',
-          serialNumber: 'FAILED',
-          requiresManualCheck: true,
-          error: `Purchase confirmed but error during processing: ${purchaseErr.message}`,
-          gameName,
-          cardValue: cardName
-        };
-        await trackedCardSave(rescuedResult, cardNumber, label);
-        otherErrorSavedToDb = true;
-      } else if (checkoutAlreadyClicked) {
-        const ghostResult = {
-          success: false,
-          transactionId: null,
-          pinCode: 'FAILED',
-          serialNumber: 'FAILED',
-          requiresManualCheck: true,
-          error: `Error after checkout clicked (${purchaseErr.stage}): ${purchaseErr.message}. Purchase may have gone through - check transaction history.`,
-          gameName,
-          cardValue: cardName
-        };
-        await trackedCardSave(ghostResult, cardNumber, label);
-        otherErrorSavedToDb = true;
-      }
-
-      logger.error(`${label} Card ${cardNumber} failed during ${phase}: ${purchaseErr.message}`);
-      sharedState.failedCount++;
-      sharedState.processedCount++;
-      sharedState.purchases.push({
-        success: false,
-        transactionId: purchaseErr.transactionId || null,
-        pinCode: 'FAILED',
-        serial: 'FAILED',
-        error: purchaseErr.message,
-        stage: purchaseErr.stage,
-        requiresManualCheck: true,
-        savedToDb: otherErrorSavedToDb
-      });
-      await bumpProgress();
-    };
-
-    const executeCheckoutForAssignment = async (assignment) => {
-      logger.purchase(`${assignment.label} Checkout for card ${assignment.cardNumber}/${quantity}...`);
+    const reserveAndRunScraperPurchase = async (cardNumber) => {
+      const label = `[Card ${cardNumber}]`;
+      const capture = this.createCheckoutRequestCapture(page);
 
       try {
+        const runScraperAttempt = async (backupCode = null, backupCodeId = null, resumeFromTwoFactor = false) => {
+          return this.completePurchase({
+            telegramUserId,
+            page,
+            gameUrl,
+            cardIndex,
+            backupCode,
+            backupCodeId,
+            checkCancellation,
+            cardNumber,
+            gameName,
+            cardName,
+            label,
+            resumeFromTwoFactor
+          });
+        };
+
         let result;
+        try {
+          result = await runScraperAttempt();
+        } catch (firstErr) {
+          if (!(firstErr instanceof TwoFactorVerificationRequiredError) && !(firstErr instanceof BackupCodeExpiredError)) {
+            throw firstErr;
+          }
+
+          let satisfied = false;
+          while (!satisfied) {
+            const reserved = await db.reserveNextBackupCode(telegramUserId);
+            if (!reserved) {
+              throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA.');
+            }
+
+            try {
+              result = await runScraperAttempt(reserved.code, reserved.id, true);
+              satisfied = true;
+            } catch (retryErr) {
+              if (retryErr instanceof InvalidBackupCodeError || retryErr instanceof BackupCodeExpiredError || retryErr instanceof TwoFactorVerificationRequiredError) {
+                continue;
+              }
+              throw retryErr;
+            }
+          }
+        }
 
         try {
-          result = await this.completePurchase({
-            telegramUserId,
-            page: assignment.page,
-            gameUrl,
-            cardIndex,
-            backupCode: null,
-            backupCodeId: null,
-            checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-            cardNumber: assignment.cardNumber,
-            gameName,
-            cardName,
-            label: assignment.label,
-            resumeFromCheckout: true
-          });
-        } catch (err) {
-          if (!(err instanceof BackupCodeExpiredError) && !(err instanceof TwoFactorVerificationRequiredError)) {
-            throw err;
-          }
-
-          // Fast path: some tabs auto-navigate to transaction page shortly after checkout.
-          // Skip backup-code lock/code reservation when this has already happened.
-          const urlBeforeLock = assignment.page.url();
-          if (urlBeforeLock.includes('/transaction/')) {
-            logger.debug(`${assignment.label} Reached transaction page before 2FA lock; skipping backup-code reservation.`);
-            result = await this.completePurchase({
-              telegramUserId,
-              page: assignment.page,
-              gameUrl,
-              cardIndex,
-              backupCode: null,
-              backupCodeId: null,
-              checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-              cardNumber: assignment.cardNumber,
-              gameName,
-              cardName,
-              label: assignment.label,
-              resumeFromTwoFactor: true
-            });
-          } else {
-            result = await this.runWithUserLock(telegramUserId, async () => {
-              const urlAfterLock = assignment.page.url();
-              if (urlAfterLock.includes('/transaction/')) {
-                logger.debug(`${assignment.label} Reached transaction page while waiting for 2FA lock; skipping backup code.`);
-                return this.completePurchase({
-                  telegramUserId,
-                  page: assignment.page,
-                  gameUrl,
-                  cardIndex,
-                  backupCode: null,
-                  backupCodeId: null,
-                  checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                  cardNumber: assignment.cardNumber,
-                  gameName,
-                  cardName,
-                  label: assignment.label,
-                  resumeFromTwoFactor: true
-                });
-              }
-
-              const nextBackupCode = await getNextBackupCode();
-              if (!nextBackupCode) {
-                throw new InvalidBackupCodeError('No active backup codes left to satisfy 2FA. Add more backup codes and retry remaining cards.');
-              }
-
-              logger.warn(`${assignment.label} 2FA required. Using shared backup code ID ${nextBackupCode.id}.`);
-              await humanDelay(this.TWO_FACTOR_LOCK_HUMAN_DELAY_MIN_MS, this.TWO_FACTOR_LOCK_HUMAN_DELAY_MAX_MS);
-
-              return this.completePurchase({
-                telegramUserId,
-                page: assignment.page,
-                gameUrl,
-                cardIndex,
-                backupCode: nextBackupCode.code,
-                backupCodeId: nextBackupCode.id,
-                checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-                cardNumber: assignment.cardNumber,
-                gameName,
-                cardName,
-                label: assignment.label,
-                resumeFromTwoFactor: true
-              });
-            });
-          }
+          checkoutTemplate = await capture.waitForCompletion(45000);
+        } catch (captureErr) {
+          logger.debug(`${label} Checkout capture unavailable for API replay: ${captureErr.message}`);
         }
 
-        sharedState.purchases.push(result);
-        sharedState.processedCount++;
-
-        if (result.success) {
-          sharedState.successCount++;
-          logger.success(`${assignment.label} Card ${assignment.cardNumber}/${quantity} completed! (TX: ${result.transactionId})`);
-          await trackedCardSave(result, assignment.cardNumber, assignment.label);
-          result.savedToDb = true;
-        } else {
-          sharedState.failedCount++;
-          logger.warn(`${assignment.label} Card ${assignment.cardNumber}/${quantity} reached transaction but extraction FAILED`);
-          if (result.transactionId) {
-            await trackedCardSave(result, assignment.cardNumber, assignment.label);
-            result.savedToDb = true;
-          }
-        }
-
-        await bumpProgress();
-        return {
-          ok: true,
-          reachedTransaction: !!(result && result.transactionId),
-          twoFactorWindowActive: this.isTwoFactorWindowActive(telegramUserId)
-        };
-      } catch (checkoutErr) {
-        await processPurchaseError(checkoutErr, assignment, 'checkout');
-        return {
-          ok: false,
-          reachedTransaction: !!(checkoutErr && checkoutErr.transactionId),
-          twoFactorWindowActive: this.isTwoFactorWindowActive(telegramUserId),
-          error: checkoutErr
-        };
+        return result;
+      } finally {
+        capture.detach();
       }
     };
 
-    const processCheckoutBatch = async (batchAssignments) => {
-      const validAssignments = batchAssignments.filter(a => !a.failedInPrepare);
-      if (validAssignments.length === 0) {
-        return;
+    const runApiPurchase = async (cardNumber) => {
+      if (!checkoutTemplate) {
+        throw new Error('Checkout API template is missing');
       }
 
-      // If 2FA window expired, use one leader checkout first to prime the 15-minute window,
-      // then continue other prepared pages in parallel without re-preparing flow.
-      const requireLeaderPrime = !this.isTwoFactorWindowActive(telegramUserId) && validAssignments.length > 1;
-      let pendingAssignments = validAssignments;
-
-      if (requireLeaderPrime) {
-        const windowMinutes = Math.round(this.TWO_FACTOR_WINDOW_MS / 60000);
-        const leaderCandidates = [...validAssignments];
-        let unlocked = false;
-        pendingAssignments = [];
-
-        while (leaderCandidates.length > 0 && !unlocked) {
-          const leader = leaderCandidates.shift();
-          logger.purchase(`${leader.label} Leader checkout: 2FA window expired, priming ${windowMinutes}m session before releasing other pages...`);
-
-          const leaderOutcome = await executeCheckoutForAssignment(leader);
-
-          if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-            sharedState.cancelled = true;
-            return;
-          }
-
-          const unlockedNow = !!(
-            leaderOutcome
-            && (leaderOutcome.twoFactorWindowActive || leaderOutcome.reachedTransaction)
-          );
-
-          if (unlockedNow) {
-            unlocked = true;
-            pendingAssignments = leaderCandidates;
-            logger.success(`${leader.label} Leader unlocked checkout flow; releasing ${pendingAssignments.length} prepared page(s) in parallel.`);
-            break;
-          }
-
-          logger.warn(`${leader.label} Leader did not unlock 2FA window/transaction; trying next prepared page as leader...`);
-        }
-
-        if (!unlocked) {
-          logger.warn('No prepared leader page unlocked checkout flow in this batch. Skipping parallel release for this batch.');
-          return;
-        }
+      if (checkCancellation && checkCancellation()) {
+        throw new Error('Order cancelled by user');
       }
 
-      const batchTasks = [];
-      for (const assignment of pendingAssignments) {
-        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-          sharedState.cancelled = true;
-          sharedState.cardQueue.unshift(assignment.cardNumber);
-          continue;
-        }
+      await this.replayCapturedCheckoutRequest(page, checkoutTemplate);
 
-        batchTasks.push(executeCheckoutForAssignment(assignment));
+      if (checkCancellation && checkCancellation()) {
+        throw new Error('Order cancelled by user');
       }
 
-      if (batchTasks.length > 0) {
-        await Promise.all(batchTasks);
-      }
-    };
-
-    const processPreparedAssignments = async (preparedAssignments) => {
-      if (!preparedAssignments || preparedAssignments.length === 0) {
-        return;
-      }
-
-      for (let i = 0; i < preparedAssignments.length; i += maxConcurrentCheckouts) {
-        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-          sharedState.cancelled = true;
-          break;
-        }
-
-        const batchEnd = Math.min(i + maxConcurrentCheckouts, preparedAssignments.length);
-        const batch = preparedAssignments.slice(i, batchEnd);
-        await processCheckoutBatch(batch);
-
-        // Add small delay between checkout batches for stealth.
-        if (batchEnd < preparedAssignments.length && maxConcurrentCheckouts > 1) {
-          await sleep(this.CHECKOUT_BATCH_DELAY_MS);
-        }
-      }
-    };
-
-    const takeAssignmentsForWorkers = (workers) => {
-      const assignments = [];
-
-      for (const worker of workers) {
-        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-          sharedState.cancelled = true;
-          break;
-        }
-
-        if (sharedState.cardQueue.length === 0) {
-          break;
-        }
-
-        const cardNumber = sharedState.cardQueue.shift();
-        assignments.push({
-          cardNumber,
-          page: worker.page,
-          label: worker.label,
-          worker,
-          failedInPrepare: false
-        });
-      }
-
-      return assignments;
-    };
-
-    const prepareAssignments = async (assignments, laneLabel = 'W1') => {
-      if (!assignments || assignments.length === 0) {
-        return [];
-      }
-
-      for (let i = 0; i < assignments.length; i++) {
-        const assignment = assignments[i];
-        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-          sharedState.cancelled = true;
-          sharedState.cardQueue.unshift(assignment.cardNumber);
-          break;
-        }
-
-        const prepareMode = assignment.worker && assignment.worker.selectionPrimed
-          ? 'verify selection + checkout-ready'
-          : 'navigate + select';
-        logger.purchase(`${laneLabel} ${assignment.label} Preparing card ${assignment.cardNumber}/${quantity} (${prepareMode})...`);
-
-        try {
-          await this.completePurchase({
-            telegramUserId,
-            page: assignment.page,
-            gameUrl,
-            cardIndex,
-            backupCode: null,
-            backupCodeId: null,
-            checkCancellation: () => sharedState.cancelled || (checkCancellation && checkCancellation()),
-            cardNumber: assignment.cardNumber,
-            gameName,
-            cardName,
-            label: assignment.label,
-            stopBeforeCheckout: true,
-            preferExistingSelection: !!(assignment.worker && assignment.worker.selectionPrimed)
-          });
-          if (assignment.worker) {
-            assignment.worker.selectionPrimed = true;
-          }
-        } catch (prepareErr) {
-          assignment.failedInPrepare = true;
-          if (assignment.worker) {
-            assignment.worker.selectionPrimed = false;
-          }
-          await processPurchaseError(prepareErr, assignment, 'prepare');
-        }
-
-        const shouldContinue = await waitStepDelay('prepare stage', i, assignments.length);
-        if (!shouldContinue) break;
-      }
-
-      return assignments.filter(a => !a.failedInPrepare);
+      // Skip per-purchase detail fetching - batch fetch all at the end
+      // This avoids the 55+ request overhead of loading transactions page per purchase
+      return {
+        success: true,
+        transactionId: null, // Will be enriched later
+        pinCode: 'PENDING',
+        serialNumber: 'PENDING',
+        stage: this.STAGES.COMPLETED,
+        gameName,
+        cardValue: cardName,
+        source: 'api-replay',
+        requiresDetailEnrichment: true // Flag for batch enrichment
+      };
     };
 
     try {
-      // Phase A: Open and initialize pages sequentially with delay between each page.
-      for (let i = 0; i < workerCount; i++) {
-        if (sharedState.cancelled || (checkCancellation && checkCancellation())) {
-          sharedState.cancelled = true;
-          break;
+      for (let cardNumber = 1; cardNumber <= quantity; cardNumber++) {
+        if (checkCancellation && checkCancellation()) {
+          const cancelErr = new Error('Order cancelled by user');
+          cancelErr.purchases = purchases;
+          throw cancelErr;
         }
 
-        const label = `[Page ${i + 1}]`;
-        const isPrimaryReadyPage = i === 0;
-        const page = isPrimaryReadyPage ? readyPage : await readyContext.newPage();
+        let result;
 
         try {
-          await initializeWorkerPage(page, isPrimaryReadyPage);
-          workerPages.push({ page, label, isPrimaryReadyPage, slot: i + 1, selectionPrimed: false });
-          logger.purchase(`${label} opened and ready.`);
-        } catch (initErr) {
-          const isRateLimitError = String(initErr && initErr.message ? initErr.message : '').toLowerCase().includes('rate limited');
-          if (!isRateLimitError || workerPages.length === 0) {
-            throw initErr;
-          }
-
-          logger.warn(`${label} Worker init hit rate limit; continuing order with ${workerPages.length} ready page(s).`);
-          try {
-            if (!isPrimaryReadyPage && page && !page.isClosed()) {
-              await Promise.race([
-                page.close().catch(() => { }),
-                new Promise(resolve => setTimeout(resolve, 2000))
-              ]);
+          if (forceScraperForCurrentCard || cardNumber === 1) {
+            logger.purchase(`[Card ${cardNumber}] Using scraper purchase flow (2FA-safe bootstrap/fallback).`);
+            result = await reserveAndRunScraperPurchase(cardNumber);
+            forceScraperForCurrentCard = false;
+          } else {
+            logger.purchase(`[Card ${cardNumber}] Using API replay purchase flow.`);
+            try {
+              result = await runApiPurchase(cardNumber);
+            } catch (apiErr) {
+              logger.warn(`[Card ${cardNumber}] API replay failed (${apiErr.message}). Falling back to scraper for this card.`);
+              result = await reserveAndRunScraperPurchase(cardNumber);
             }
-          } catch (closeErr) {
-            logger.debug(`${label} Could not close rate-limited worker page: ${closeErr.message}`);
           }
-          break;
+        } catch (cardErr) {
+          if (cardErr && cardErr.message && cardErr.message.includes('cancelled by user')) {
+            const cancelErr = new Error('Order cancelled by user');
+            cancelErr.purchases = purchases;
+            throw cancelErr;
+          }
+
+          if (cardErr instanceof InsufficientBalanceError) {
+            cardErr.purchases = purchases;
+            throw cardErr;
+          }
+
+          result = {
+            success: false,
+            transactionId: cardErr.transactionId || null,
+            pinCode: 'FAILED',
+            serialNumber: 'FAILED',
+            requiresManualCheck: true,
+            error: cardErr.message,
+            stage: cardErr.stage || this.STAGES.FAILED,
+            gameName,
+            cardValue: cardName
+          };
+
+          // After a hard failure, next card should re-bootstrap with scraper.
+          forceScraperForCurrentCard = true;
         }
 
-        const shouldContinue = await waitStepDelay('page open', i, workerCount);
-        if (!shouldContinue) break;
-      }
+        if (result && result.transactionId) {
+          knownTransactionIds.add(String(result.transactionId));
+        }
 
-      // Two-lane pipeline:
-      // W1 prepares one lane while W2 checks out the previously prepared lane, then swap lanes.
-      const laneSize = Math.max(1, Math.min(workerPages.length, maxConcurrentCheckouts));
-      const laneAWorkers = workerPages.slice(0, laneSize);
-      const laneBWorkers = workerPages.slice(laneSize);
-      const hasTwoLanes = laneBWorkers.length > 0;
+        // Track API purchases that need detail enrichment
+        if (result && result.requiresDetailEnrichment) {
+          apiPurchasesNeedingDetails.push({ index: purchases.length, result });
+        }
 
-      logger.purchase(`Pipeline mode: W1 prepare lane size=${laneAWorkers.length}${hasTwoLanes ? `, laneB size=${laneBWorkers.length}` : ''}; W2 checkout concurrency=${maxConcurrentCheckouts}`);
+        purchases.push(result);
+        await trackCard(result, cardNumber);
+        await emitProgress(cardNumber);
 
-      let nextPrepareWorkers = hasTwoLanes ? laneBWorkers : laneAWorkers;
-      let currentPrepared = await prepareAssignments(takeAssignmentsForWorkers(laneAWorkers), 'W1');
-
-      while (!sharedState.cancelled && !(checkCancellation && checkCancellation()) && (currentPrepared.length > 0 || sharedState.cardQueue.length > 0)) {
-        const nextAssignments = takeAssignmentsForWorkers(nextPrepareWorkers);
-
-        const checkoutPromise = processPreparedAssignments(currentPrepared);
-        const preparePromise = prepareAssignments(nextAssignments, 'W1');
-
-        const [, preparedNext] = await Promise.all([checkoutPromise, preparePromise]);
-        currentPrepared = preparedNext;
-
-        if (hasTwoLanes) {
-          nextPrepareWorkers = nextPrepareWorkers === laneAWorkers ? laneBWorkers : laneAWorkers;
+        if (cardNumber < quantity) {
+          const delayMs = this.API_REPLAY_DELAY_MIN_MS + Math.floor(Math.random() * (Math.max(0, this.API_REPLAY_DELAY_MAX_MS - this.API_REPLAY_DELAY_MIN_MS) + 1));
+          const cancelled = await this.sleepCancellable(delayMs, checkCancellation);
+          if (cancelled) {
+            const cancelErr = new Error('Order cancelled by user');
+            cancelErr.purchases = purchases;
+            throw cancelErr;
+          }
         }
       }
 
-      // ===== FINAL SUMMARY =====
-      logger.purchase(`\n${'='.repeat(60)}`);
-
-      const remaining = sharedState.cardQueue.length;
-      if (remaining > 0) {
-        logger.warn(`ORDER PARTIAL: ${remaining} card(s) remained in queue`);
+      // Batch fetch transaction details for all API purchases
+      if (apiPurchasesNeedingDetails.length > 0) {
+        try {
+          await this.enrichApiPurchasesWithTransactionDetails(
+            page,
+            purchases,
+            apiPurchasesNeedingDetails,
+            purchaseStartTime,
+            checkCancellation,
+            onProgress
+          );
+        } catch (enrichErr) {
+          logger.warn(`⚠️ Could not fully enrich transaction details: ${enrichErr.message}`);
+          // Continue anyway - purchases have success status even if details missing
+        }
       }
 
-      logger.success(`Results: ✅ Success: ${sharedState.successCount} | ❌ Failed: ${sharedState.failedCount} | Total: ${sharedState.processedCount}/${quantity}`);
-      logger.purchase(`${'='.repeat(60)}\n`);
-
-      if (sharedState.cancelled && checkCancellation && checkCancellation()) {
-        const cancelledErr = new Error('Order cancelled by user');
-        cancelledErr.purchases = sharedState.purchases;
-        throw cancelledErr;
-      }
-
-      return sharedState.purchases;
-
+      return purchases;
     } catch (err) {
-      if (err.message && err.message.includes('cancelled by user')) {
-        logger.info('Parallel bulk purchase cancelled:', err.message);
-      } else {
-        logger.error('Parallel bulk purchase error:', err.message);
-      }
-
-      err.purchases = sharedState.purchases;
+      err.purchases = purchases;
       throw err;
-    } finally {
-      // Close worker pages except the persistent primary ready page.
-      await Promise.allSettled(workerPages.map(async ({ page, label, isPrimaryReadyPage }) => {
-        if (isPrimaryReadyPage || !page) return;
-        try {
-          this.untrackPurchasePage(telegramUserId, page);
-          if (!page.isClosed()) {
-            await Promise.race([
-              page.close().catch(() => { }),
-              new Promise(resolve => setTimeout(resolve, 2500))
-            ]);
-          }
-          logger.debug(`${label} Worker page closed`);
-        } catch (closeErr) {
-          logger.error(`${label} Error closing worker page: ${closeErr.message}`);
-        }
-      }));
+    }
+  }
 
-      // CRITICAL SAFETY NET: Wait for ALL pending card tracking saves to complete before exit.
-      if (sharedState.pendingDbSaves.length > 0) {
-        logger.system(`⏳ Waiting for ${sharedState.pendingDbSaves.length} pending card save(s) to complete...`);
-        try {
-          await Promise.allSettled(sharedState.pendingDbSaves);
-          logger.system(`✅ All ${sharedState.pendingDbSaves.length} pending card save(s) completed`);
-        } catch (dbErr) {
-          logger.error(`⚠️ Error waiting for pending card saves: ${dbErr.message}`);
-        }
+  /**
+   * Batch fetch and enrich API purchases with transaction details.
+   * Filters transactions newer than purchase start time and fetches their details one by one.
+   * Uses same pattern/delays as /transactions D/M command for consistency.
+   * @param {Object} page - Puppeteer page instance
+   * @param {Array} purchases - All purchase results array
+   * @param {Array} apiPurchasesNeedingDetails - Array of {index, result} for API purchases needing details
+   * @param {Date} purchaseStartTime - Time when purchases started
+   * @param {Function} checkCancellation - Cancellation check function
+   * @param {Function} onProgress - Progress callback for UI updates
+   * @returns {Promise<void>}
+   */
+  async enrichApiPurchasesWithTransactionDetails(page, purchases, apiPurchasesNeedingDetails, purchaseStartTime, checkCancellation, onProgress = null) {
+    const emitProgress = async (data) => {
+      if (!onProgress) return;
+      try {
+        await onProgress(data);
+      } catch (progressErr) {
+        logger.debug(`enrichment progress callback error: ${progressErr.message}`);
+      }
+    };
+
+    try {
+      // Wait a moment for transactions to appear in history API (payment systems have slight latency)
+      await this.sleepCancellable(2000, checkCancellation);
+
+      await emitProgress({ phase: 'loading_history', processed: 0, total: 0, matched: 0, failures: 0, cancelled: false });
+
+      // Fetch all transactions history once
+      const historyResult = await this.fetchTransactionsHistoryPayload(page);
+      const allTransactions = Array.isArray(historyResult && historyResult.payload && historyResult.payload.Transactions)
+        ? historyResult.payload.Transactions
+        : [];
+
+      if (allTransactions.length === 0) {
+        logger.warn('No transactions found in history');
+        await emitProgress({ phase: 'complete', processed: 0, total: 0, matched: 0, failures: 0, cancelled: false });
+        return;
       }
 
-      // Best-effort cleanup for any remaining tracked worker pages.
-      const leftoverPages = this.activePurchasePages.get(telegramUserId) || [];
-      if (leftoverPages.length > 0) {
-        logger.system(`Cleaning up ${leftoverPages.length} remaining purchase page(s)...`);
-        await Promise.all(leftoverPages.map(async (activePage) => {
+      // Filter transactions that are NEWER than or EQUAL to purchase start time (inclusive) and are successful webshop purchases
+      await emitProgress({
+        phase: 'filtering',
+        processed: 0,
+        total: allTransactions.length,
+        matched: 0,
+        failures: 0,
+        cancelled: false
+      });
+
+      const newerTransactions = allTransactions.filter(tx => {
+        // History API uses 'txnDate', not 'transactionDate'
+        if (!tx.txnDate) return false;
+        try {
+          const txDate = new Date(tx.txnDate);
+          // Filter: transaction must be >= purchase start time (inclusive) and successful
+          return txDate >= purchaseStartTime && this.isSuccessfulWebshopTransaction(tx);
+        } catch (err) {
+          return false;
+        }
+      });
+
+      // Fallback: if no transactions found by date filter, just take the most recent webshop transactions
+      let transactionsToUse = newerTransactions;
+      if (newerTransactions.length === 0 && allTransactions.length > 0) {
+        logger.info(`Date filtering found 0 transactions. Using recent webshop transactions as fallback...`);
+        const webshopTransactions = allTransactions.filter(tx => this.isSuccessfulWebshopTransaction(tx));
+        // Take the most recent N transactions where N is number of API purchases needing details
+        transactionsToUse = webshopTransactions.slice(0, Math.min(webshopTransactions.length, apiPurchasesNeedingDetails.length));
+        logger.info(`Fallback: using ${transactionsToUse.length} recent webshop transactions`);
+      }
+
+      if (transactionsToUse.length === 0) {
+        logger.warn('No successful webshop transactions found at all');
+        await emitProgress({ phase: 'complete', processed: 0, total: 0, matched: 0, failures: 0, cancelled: false });
+        return;
+      }
+
+      logger.info(`Enrichment: Found ${transactionsToUse.length} transactions for ${apiPurchasesNeedingDetails.length} API purchases`);
+
+      // Gather all transaction IDs from transactions to use
+      const txidsToFetch = transactionsToUse.map(tx => String(tx.txnNum || ''));
+      logger.purchase(`\n📦 Found ${transactionsToUse.length} transactions. Fetching details for ${apiPurchasesNeedingDetails.length} API purchases...`);
+
+      await emitProgress({
+        phase: 'fetching',
+        processed: 0,
+        total: txidsToFetch.length,
+        matched: transactionsToUse.length,
+        failures: 0,
+        cancelled: false
+      });
+
+      const failures = [];
+      let processedCount = 0;
+      const usedTransactionIndices = new Set(); // Track which transactions we've used
+
+      // For each purchase that needs enrichment, find and fetch its transaction details
+      for (const purchaseEntry of apiPurchasesNeedingDetails) {
+        const { index: purchaseIndex } = purchaseEntry;
+
+        if (checkCancellation && checkCancellation()) {
+          logger.info('Transaction enrichment cancelled by user');
+          break;
+        }
+
+        // Find an unused transaction that hasn't been matched yet
+        let assignedTransaction = null;
+        for (let txIdx = 0; txIdx < transactionsToUse.length; txIdx++) {
+          if (!usedTransactionIndices.has(txIdx)) {
+            assignedTransaction = transactionsToUse[txIdx];
+            usedTransactionIndices.add(txIdx);
+            break;
+          }
+        }
+
+        if (!assignedTransaction) {
+          logger.warn(`No available transaction to enrich purchase at index ${purchaseIndex}`);
+          failures.push({
+            purchaseIndex,
+            error: 'No matching transaction found'
+          });
+          processedCount += 1;
+          continue;
+        }
+
+        const txnNum = String(assignedTransaction.txnNum || '');
+
+        try {
+          // Fetch transaction detail via API (same logic as /transactions command)
+          let detail;
           try {
-            if (activePage && !activePage.isClosed()) {
-              await Promise.race([
-                activePage.close().catch(() => { }),
-                new Promise(resolve => setTimeout(resolve, 2000))
-              ]);
-            }
-          } catch (err) {
-            logger.debug(`Failed to close leftover page: ${err.message}`);
+            detail = await this.fetchTransactionDetailViaApi(page, txnNum, historyResult.apiHeaders || {});
+          } catch (apiErr) {
+            logger.debug(`API detail fetch failed for txn ${txnNum}, falling back to page scrape`);
+            detail = await this.fetchTransactionDetail(page, txnNum);
           }
-        }));
-        this.activePurchasePages.delete(telegramUserId);
+
+          // Enrich the purchase at the correct index
+          if (purchaseIndex !== null && purchaseIndex < purchases.length) {
+            const result = purchases[purchaseIndex];
+            result.transactionId = detail.transactionId || txnNum;
+            result.pinCode = detail.pinCode;
+            result.serialNumber = detail.serialNumber;
+            result.productName = detail.productName || result.cardValue;
+            result.requiresDetailEnrichment = false; // Mark as enriched
+            
+            logger.success(`✓ Enriched purchase [${purchaseIndex}]: txnId=${result.transactionId} pin=${result.pinCode.substring(0, 4)}...`);
+          }
+        } catch (detailErr) {
+          logger.warn(`Failed to fetch details for transaction ${txnNum}: ${detailErr.message}`);
+          failures.push({
+            txnNum,
+            error: detailErr.message
+          });
+        } finally {
+          processedCount += 1;
+          await emitProgress({
+            phase: 'fetching',
+            processed: processedCount,
+            total: apiPurchasesNeedingDetails.length,
+            matched: transactionsToUse.length,
+            failures: failures.length,
+            cancelled: !!(checkCancellation && checkCancellation())
+          });
+
+          // Anti-ban delay between requests (same as /transactions command)
+          if (processedCount < apiPurchasesNeedingDetails.length) {
+            const cancelled = await this.sleepCancellable(this.TRANSACTION_API_RATE_DELAY_MS, checkCancellation);
+            if (cancelled) {
+              break;
+            }
+          }
+        }
       }
+
+      logger.success('✓ Transaction detail enrichment complete');
+      await emitProgress({ phase: 'complete', processed: processedCount, total: apiPurchasesNeedingDetails.length, matched: transactionsToUse.length, failures: failures.length, cancelled: false });
+    } catch (err) {
+      logger.warn(`Error during batch transaction enrichment: ${err.message}`);
+      throw err;
     }
   }
 
@@ -2976,13 +2957,14 @@ class PurchaseService {
    * @returns {Promise<number>} Number of pages closed
    */
   async forceCloseUserBrowsers(telegramUserId) {
-    const pages = this.activePurchasePages.get(telegramUserId);
+    const scopeKey = this.getGlobalScopeKey();
+    const pages = this.activePurchasePages.get(scopeKey);
     if (!pages || pages.length === 0) {
-      logger.debug(`No active purchase pages to close for user ${telegramUserId}`);
+      logger.debug('No active purchase pages to close in global scope');
       return 0;
     }
 
-    logger.system(`Force closing ${pages.length} active purchase pages for user ${telegramUserId}...`);
+    logger.system(`Force closing ${pages.length} active purchase pages in global scope...`);
 
     const closePromises = pages.map(async (page) => {
       try {
@@ -2998,9 +2980,9 @@ class PurchaseService {
     });
 
     await Promise.all(closePromises);
-    this.activePurchasePages.delete(telegramUserId);
+    this.activePurchasePages.delete(scopeKey);
 
-    logger.success(`Closed ${pages.length} purchase pages for user ${telegramUserId}`);
+    logger.success(`Closed ${pages.length} purchase pages in global scope`);
     return pages.length;
   }
 
@@ -3339,7 +3321,7 @@ class PurchaseService {
       throw new Error('No ready browser session available. Please run /start first.');
     }
 
-    const usableSessions = readySessions.slice(0, Math.min(this.MAX_READY_BROWSERS, readySessions.length));
+    const usableSessions = readySessions.slice(0, Math.min(this.MAX_READY_BROWSERS_FOR_TRANSACTIONS, readySessions.length));
     const groupedPins = new Map();
     const failures = [];
     let matchedTransactions = [];

@@ -900,13 +900,37 @@ class OrderFlowHandler {
       });
       this.progressMessages.set(chatId, progressMsg.message_id);
 
-      // Progress update callback
+      // Progress update callback - handles both purchase progress (number format) and enrichment progress (object format)
       const sendProgressUpdate = async (completed, total) => {
         try {
-          const progressBar = this.createProgressBar(completed, total);
-          const percentage = Math.round((completed / total) * 100);
-
-          const progressText = `⏳ *Progress*\n${progressBar}\n\n✅ ${completed}/${total} (📊 ${percentage}%)`;
+          let progressText = '';
+          let progressBar = '';
+          
+          // Handle enrichment progress (object format with phases)
+          if (typeof completed === 'object' && completed !== null && completed.phase) {
+            const phase = completed.phase || 'working';
+            const processed = completed.processed || 0;
+            const totalTx = completed.total || 0;
+            const matched = completed.matched || 0;
+            const failures = completed.failures || 0;
+            
+            progressBar = this.createProgressBar(processed, totalTx);
+            let statusLine = '⏳ Preparing...';
+            if (phase === 'loading_history') statusLine = '📥 Loading transactions history';
+            if (phase === 'filtering') statusLine = '🔍 Filtering successful transactions';
+            if (phase === 'fetching') statusLine = '📦 Fetching transaction details';
+            if (phase === 'complete') statusLine = '✓ Finalizing results';
+            
+            const percentage = totalTx > 0 ? Math.round((processed / totalTx) * 100) : 0;
+            progressText = `⏳ *Enriching API Purchases*\n${statusLine}\n${progressBar}\n\n✅ ${processed}/${Math.max(1, totalTx)} | 🎯 Matched: ${matched} | ⚠️ Failed: ${failures} (📊 ${percentage}%)`;
+          } else {
+            // Handle purchase progress (original number format)
+            completed = typeof completed === 'number' ? completed : 0;
+            total = typeof total === 'number' ? total : 1;
+            progressBar = this.createProgressBar(completed, total);
+            const percentage = Math.round((completed / total) * 100);
+            progressText = `⏳ *Progress*\n${progressBar}\n\n✅ ${completed}/${total} (📊 ${percentage}%)`;
+          }
 
           const existingMessageId = this.progressMessages.get(chatId);
 

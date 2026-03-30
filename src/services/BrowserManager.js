@@ -26,6 +26,10 @@ class BrowserManager {
     this.browserCreationLocks = new Map();
     this.recoveryInProgress = new Set();
     this.intentionalCloseUsers = new Set();
+    
+    // Generate browser slot keys dynamically based on configured count
+    this.MAX_BROWSERS = appConfig.purchase.maxReadyBrowsers ?? 2;
+    this.GLOBAL_BROWSER_SLOTS = this._generateBrowserSlots(this.MAX_BROWSERS);
 
     // OPTIMIZATION: Keep browser open for 1 day (users don't want to re-login frequently)
     this.INACTIVITY_TIMEOUT = appConfig.browser.inactivityTimeoutMs;
@@ -35,6 +39,41 @@ class BrowserManager {
     // this.startCleanupInterval();
   }
 
+  /**
+   * Generate browser slot keys dynamically based on configured count
+   * @param {number} count - Number of browsers to support
+   * @returns {Array<string>} Array of slot keys like ['__GLOBAL_BROWSER_SLOT_1__', '__GLOBAL_BROWSER_SLOT_2__', ...]
+   */
+  _generateBrowserSlots(count) {
+    const slots = [];
+    for (let i = 1; i <= count; i++) {
+      slots.push(`__GLOBAL_BROWSER_SLOT_${i}__`);
+    }
+    logger.debug(`Generated ${slots.length} browser slot(s): ${slots.join(', ')}`);
+    return slots;
+  }
+
+  normalizeBrowserKey(userId) {
+    const key = String(userId);
+    
+    // If userId is already a global slot key, return it
+    if (this.GLOBAL_BROWSER_SLOTS.includes(key)) {
+      return key;
+    }
+    
+    // If userId is a numeric index (1, 2, 3...), map to corresponding slot
+    const slotIndex = parseInt(userId, 10);
+    if (!isNaN(slotIndex) && slotIndex > 0 && slotIndex <= this.GLOBAL_BROWSER_SLOTS.length) {
+      const resultSlot = this.GLOBAL_BROWSER_SLOTS[slotIndex - 1];
+      logger.debug(`normalizeBrowserKey(${userId}) → index ${slotIndex} → slot ${resultSlot} (total slots: ${this.GLOBAL_BROWSER_SLOTS.length})`);
+      return resultSlot;
+    }
+    
+    logger.debug(`normalizeBrowserKey(${userId}) → fallback to slot 1 (not in range 1-${this.GLOBAL_BROWSER_SLOTS.length})`);
+    // Otherwise, map regular user IDs to first slot (fallback)
+    return this.GLOBAL_BROWSER_SLOTS[0];
+  }
+
 
   /**
    * Get or create browser for user
@@ -42,31 +81,32 @@ class BrowserManager {
    * @returns {Promise<{browser, page}>} Browser and page instance
    */
   async getBrowser(userId) {
-    const creating = this.browserCreationLocks.get(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const creating = this.browserCreationLocks.get(browserKey);
     if (creating) {
-      logger.debug(`Browser creation already in progress for user ${userId}, waiting for existing launch`);
+      logger.debug(`Browser creation already in progress for key ${browserKey}, waiting for existing launch`);
       return creating;
     }
 
-    const existing = this.userBrowsers.get(userId);
+    const existing = this.userBrowsers.get(browserKey);
 
     // If browser exists and is still connected, reuse it
     if (existing && existing.browser.isConnected()) {
-      logger.system(`Reusing existing browser for user ${userId}`);
+      logger.system(`Reusing existing browser for key ${browserKey}`);
       existing.lastActivity = Date.now();
       return { browser: existing.browser, page: existing.page };
     }
 
     const createPromise = (async () => {
-      const latest = this.userBrowsers.get(userId);
+      const latest = this.userBrowsers.get(browserKey);
       if (latest && latest.browser && latest.browser.isConnected()) {
         latest.lastActivity = Date.now();
-        logger.system(`Reusing existing browser for user ${userId}`);
+        logger.system(`Reusing existing browser for key ${browserKey}`);
         return { browser: latest.browser, page: latest.page };
       }
 
       // Create new browser only when user has no live browser session.
-      logger.system(`Creating new browser for user ${userId}`);
+      logger.system(`Creating new browser for key ${browserKey}`);
       const browser = await this.launchBrowser();
       const existingPages = await browser.pages();
       const page = existingPages[0] || await browser.newPage();
@@ -76,7 +116,7 @@ class BrowserManager {
       await page.setDefaultTimeout(45000);
       await page.setDefaultNavigationTimeout(60000);
 
-      this.userBrowsers.set(userId, {
+      this.userBrowsers.set(browserKey, {
         browser,
         page,
         lastActivity: Date.now(),
@@ -86,20 +126,20 @@ class BrowserManager {
 
       // Auto-recover if browser dies unexpectedly.
       browser.on('disconnected', () => {
-        this.handleUnexpectedDisconnect(userId).catch(err => {
-          logger.error(`Browser recovery failed for user ${userId}:`, err.message);
+        this.handleUnexpectedDisconnect(browserKey).catch(err => {
+          logger.error(`Browser recovery failed for key ${browserKey}:`, err.message);
         });
       });
 
       return { browser, page };
     })();
 
-    this.browserCreationLocks.set(userId, createPromise);
+    this.browserCreationLocks.set(browserKey, createPromise);
 
     try {
       return await createPromise;
     } finally {
-      this.browserCreationLocks.delete(userId);
+      this.browserCreationLocks.delete(browserKey);
     }
   }
 
@@ -108,41 +148,46 @@ class BrowserManager {
    * @param {number|string} userId
    */
   async handleUnexpectedDisconnect(userId) {
-    if (this.intentionalCloseUsers.has(userId)) {
-      logger.debug(`Skipping auto-recovery for intentionally closed browser (user ${userId})`);
+    const browserKey = this.normalizeBrowserKey(userId);
+
+    if (this.intentionalCloseUsers.has(browserKey)) {
+      logger.debug(`Skipping auto-recovery for intentionally closed browser (key ${browserKey})`);
       return;
     }
 
-    if (this.recoveryInProgress.has(userId)) {
+    if (this.recoveryInProgress.has(browserKey)) {
       return;
     }
 
-    this.recoveryInProgress.add(userId);
+    this.recoveryInProgress.add(browserKey);
     try {
-      const existing = this.userBrowsers.get(userId);
+      const existing = this.userBrowsers.get(browserKey);
       if (existing && existing.browser && existing.browser.isConnected()) {
         return;
       }
 
-      this.userBrowsers.delete(userId);
-      logger.warn(`Browser disconnected for user ${userId}. Re-launching session...`);
+      this.userBrowsers.delete(browserKey);
+      logger.warn(`Browser disconnected for key ${browserKey}. Re-launching session...`);
 
       await new Promise(resolve => setTimeout(resolve, 1500));
-      const { page } = await this.getBrowser(userId);
+      const { page } = await this.getBrowser(browserKey);
 
       try {
-        await this.autoRelogin(userId, page);
+        const isExplicitGlobalSlotKey = String(browserKey).startsWith('__GLOBAL_BROWSER_SLOT_');
+        if (!isExplicitGlobalSlotKey) {
+          await this.autoRelogin(userId, page);
+        }
         await page.goto('https://gold.razer.com/global/en', { waitUntil: 'domcontentloaded', timeout: 30000 });
         // ANTI-BAN
         await humanDelay();
         // ANTI-BAN
         if (await isBanned(page)) throw new Error('rate limited');
-        logger.success(`Recovered browser session for user ${userId}`);
+        logger.success(`Recovered browser session for key ${browserKey}`);
       } catch (loginErr) {
-        logger.warn(`Recovered browser for user ${userId}, but auto-relogin failed: ${loginErr.message}`);
+        logger.warn(`Recovered browser for key ${browserKey}, but auto-relogin failed: ${loginErr.message}`);
       }
     } finally {
-      this.recoveryInProgress.delete(userId);
+      this.recoveryInProgress.delete(browserKey);
     }
   }
 
@@ -165,7 +210,7 @@ class BrowserManager {
       '--no-first-run',
       '--mute-audio',
       '--lang=en-US,en',
-      '--window-size=1366,900',
+      '--window-size=500,800',
       '--disable-blink-features=AutomationControlled',
       // Memory optimization (reasonable limits)
       '--js-flags=--max-old-space-size=256'
@@ -173,7 +218,7 @@ class BrowserManager {
 
 
     const browser = await puppeteer.launch({
-      headless: headlessMode,
+      headless: false,
       protocolTimeout: 180000,
       args: launchArgs
     });
@@ -189,7 +234,8 @@ class BrowserManager {
    * @returns {Promise<Page>} Page instance
    */
   async navigateToUrl(userId, url) {
-    const { page } = await this.getBrowser(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const { page } = await this.getBrowser(browserKey);
     // ANTI-BAN
     await setupPage(page);
 
@@ -228,7 +274,7 @@ class BrowserManager {
       }
 
       // Update activity after successful navigation
-      this.updateActivity(userId);
+      this.updateActivity(browserKey);
 
       return page;
     } catch (err) {
@@ -247,7 +293,7 @@ class BrowserManager {
         if (await isBanned(page)) throw new Error('rate limited');
       });
 
-      this.updateActivity(userId);
+      this.updateActivity(browserKey);
       return page;
     }
   }
@@ -343,7 +389,8 @@ class BrowserManager {
    * @returns {Page|null} Page instance or null
    */
   getPage(userId) {
-    const existing = this.userBrowsers.get(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const existing = this.userBrowsers.get(browserKey);
     if (existing && existing.browser.isConnected()) {
       existing.lastActivity = Date.now();
       return existing.page;
@@ -356,27 +403,28 @@ class BrowserManager {
    * @param {number} userId - User ID
    */
   async closeBrowser(userId) {
-    const creating = this.browserCreationLocks.get(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const creating = this.browserCreationLocks.get(browserKey);
     if (creating) {
       try {
         await creating;
       } catch (err) {
-        logger.debug(`Creation lock failed before close for user ${userId}: ${err.message}`);
+        logger.debug(`Creation lock failed before close for key ${browserKey}: ${err.message}`);
       }
     }
 
-    const existing = this.userBrowsers.get(userId);
+    const existing = this.userBrowsers.get(browserKey);
     if (existing) {
-      logger.system(`Closing browser for user ${userId}`);
-      this.intentionalCloseUsers.add(userId);
+      logger.system(`Closing browser for key ${browserKey}`);
+      this.intentionalCloseUsers.add(browserKey);
       try {
         await existing.browser.close();
       } catch (err) {
-        logger.error(`Error closing browser for user ${userId}:`, err.message);
+        logger.error(`Error closing browser for key ${browserKey}:`, err.message);
       } finally {
-        setTimeout(() => this.intentionalCloseUsers.delete(userId), 4000);
+        setTimeout(() => this.intentionalCloseUsers.delete(browserKey), 4000);
       }
-      this.userBrowsers.delete(userId);
+      this.userBrowsers.delete(browserKey);
     }
   }
 
@@ -385,7 +433,8 @@ class BrowserManager {
    * @param {number} userId - User ID
    */
   markInUse(userId) {
-    const existing = this.userBrowsers.get(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const existing = this.userBrowsers.get(browserKey);
     if (existing) {
       existing.inUse = true;
       existing.lastActivity = Date.now();
@@ -397,7 +446,8 @@ class BrowserManager {
    * @param {number} userId - User ID
    */
   markNotInUse(userId) {
-    const existing = this.userBrowsers.get(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const existing = this.userBrowsers.get(browserKey);
     if (existing) {
       existing.inUse = false;
       existing.lastActivity = Date.now();
@@ -409,7 +459,8 @@ class BrowserManager {
    * @param {number} userId - User ID
    */
   updateActivity(userId) {
-    const existing = this.userBrowsers.get(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const existing = this.userBrowsers.get(browserKey);
     if (existing) {
       existing.lastActivity = Date.now();
     }
@@ -421,7 +472,8 @@ class BrowserManager {
    * @param {boolean} isReady
    */
   markSessionReady(userId, isReady) {
-    const existing = this.userBrowsers.get(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const existing = this.userBrowsers.get(browserKey);
     if (existing) {
       existing.isReady = !!isReady;
       existing.lastActivity = Date.now();
@@ -434,13 +486,14 @@ class BrowserManager {
    * @returns {boolean}
    */
   isSessionReady(userId) {
-    const existing = this.userBrowsers.get(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const existing = this.userBrowsers.get(browserKey);
     return !!(
       existing
       && existing.browser
       && existing.browser.isConnected()
       && existing.isReady === true
-      && !this.recoveryInProgress.has(userId)
+      && !this.recoveryInProgress.has(browserKey)
     );
   }
 
@@ -504,7 +557,8 @@ class BrowserManager {
    * @returns {number} Age in minutes, -1 if no session
    */
   getSessionAge(userId) {
-    const existing = this.userBrowsers.get(userId);
+    const browserKey = this.normalizeBrowserKey(userId);
+    const existing = this.userBrowsers.get(browserKey);
     if (!existing) return -1;
 
     return Math.round((Date.now() - existing.lastActivity) / 1000 / 60);

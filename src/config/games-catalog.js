@@ -45,8 +45,8 @@ const gamesCatalog = [
   },
   {
     id: 'pubg-mobile',
-    name: '🔫 PUBG Mobile(Global)',
-    link: 'https://gold.razer.com/global/en/gold/catalog/pubg-mobile-uc-code',
+    name: '🔫 PUBG Mobile Tencent(Global)',
+    link: 'https://gold.razer.com/global/en/gold/catalog/pubg-mobile-uc-code-tencent',
     description: 'PUBG Mobile UC',
     cards: [
       'PUBG 60 UC',

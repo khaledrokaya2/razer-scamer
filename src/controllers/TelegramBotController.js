@@ -37,20 +37,28 @@ class TelegramBotController {
     this.operationSeq = 0;
     // Track in-progress credential update tests for /cancel rollback support.
     this.credentialsUpdateControllers = new Map(); // userId -> { cancelled: boolean, previousCredentials }
+    this.GLOBAL_SCOPE_KEY = '__GLOBAL_BOT_SCOPE__';
     // Cleanup rate limit map periodically
     this.startRateLimitCleanup();
   }
 
+  getScopeKey(userId) {
+    return this.GLOBAL_SCOPE_KEY;
+  }
+
   getActiveOperation(userId) {
-    return this.userOperations.get(userId) || null;
+    const scopeKey = this.getScopeKey(userId);
+    return this.userOperations.get(scopeKey) || null;
   }
 
   isUserBusy(userId) {
-    return this.userOperations.has(userId);
+    const scopeKey = this.getScopeKey(userId);
+    return this.userOperations.has(scopeKey);
   }
 
   beginUserOperation(userId, type, cancellable) {
-    if (this.userOperations.has(userId)) {
+    const scopeKey = this.getScopeKey(userId);
+    if (this.userOperations.has(scopeKey)) {
       return null;
     }
 
@@ -61,19 +69,20 @@ class TelegramBotController {
       startedAt: Date.now()
     };
 
-    this.userOperations.set(userId, operation);
+    this.userOperations.set(scopeKey, operation);
     return operation;
   }
 
   clearUserOperation(userId, operationId = null) {
-    const current = this.userOperations.get(userId);
+    const scopeKey = this.getScopeKey(userId);
+    const current = this.userOperations.get(scopeKey);
     if (!current) return;
 
     if (operationId !== null && current.id !== operationId) {
       return;
     }
 
-    this.userOperations.delete(userId);
+    this.userOperations.delete(scopeKey);
   }
 
   formatOperationName(type) {
@@ -119,6 +128,30 @@ class TelegramBotController {
     return operation;
   }
 
+  async getGlobalReadyStatus(telegramUserId) {
+    const purchaseService = require('../services/PurchaseService');
+    const readySessions = purchaseService.getReadySessions(telegramUserId);
+    const target = purchaseService.MAX_READY_BROWSERS || 2;
+    return {
+      ready: readySessions.length >= target,
+      count: readySessions.length,
+      target
+    };
+  }
+
+  async ensureGlobalPoolReadyOrNotify(chatId, telegramUserId) {
+    const status = await this.getGlobalReadyStatus(telegramUserId);
+    if (status.ready) {
+      return true;
+    }
+
+    await this.safeSendMessage(
+      chatId,
+      `⏳ Bot is not ready yet (${status.count}/${status.target} browsers logged in). Use /start and wait until all browsers are ready.`
+    );
+    return false;
+  }
+
   async ensureAuthorized(chatId, telegramUserId) {
     const authResult = await authService.checkAuthorization(telegramUserId);
     if (authResult.authorized) {
@@ -135,6 +168,7 @@ class TelegramBotController {
    * or explicit user operation lock for these flows.
    */
   getExclusiveOperation(chatId, telegramUserId) {
+    const scopeKey = this.getScopeKey(telegramUserId);
     const orderSession = orderFlowHandler.getSession(chatId);
     if (orderSession && (orderSession.step === 'processing' || orderSession.step === 'checking_balance')) {
       return {
@@ -145,7 +179,7 @@ class TelegramBotController {
       };
     }
 
-    if (this.balanceCheckInProgress.has(telegramUserId)) {
+    if (this.balanceCheckInProgress.has(scopeKey)) {
       return {
         id: -2,
         type: 'check_balance',
@@ -154,7 +188,7 @@ class TelegramBotController {
       };
     }
 
-    const txController = this.transactionsFetchControllers.get(telegramUserId);
+    const txController = this.transactionsFetchControllers.get(scopeKey);
     if (txController && txController.cancelled !== true) {
       return {
         id: -3,
@@ -435,20 +469,21 @@ class TelegramBotController {
       }
 
       const purchaseService = require('../services/PurchaseService');
-      const hasActiveBrowser = browserManager.hasActiveBrowser(telegramUserId);
+      const warmMsg = await this.bot.sendMessage(chatId, `⏳ Preparing shared browsers and logging in with ${credentials.email}...`);
+      const readyResult = await purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: false });
+      await this.bot.deleteMessage(chatId, warmMsg.message_id).catch(() => { });
 
-      if (!hasActiveBrowser) {
-        const loginMsg = await this.bot.sendMessage(chatId, `⏳ Opening browser and logging in with ${credentials.email}...`);
-        await scraperService.login(telegramUserId, credentials.email, credentials.password);
-        await this.bot.deleteMessage(chatId, loginMsg.message_id).catch(() => { });
+      if (!readyResult.ready) {
+        await this.safeSendMessage(
+          chatId,
+          `⏳ Bot is not ready yet (${readyResult.count}/${readyResult.target} browsers logged in). Wait until all are ready, then use /start again.`
+        );
+        return;
       }
 
-      await this.bot.sendMessage(chatId, '✅ Browser is ready.');
-
-      // Keep purchase ready session in sync, but do not block user flow if it fails.
-      purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch((warmErr) => {
-        logger.warn(`Background ready-session sync failed for user ${telegramUserId}: ${warmErr.message}`);
-      });
+      const browserCount = readyResult.target || 2;
+      const browserLabel = browserCount === 1 ? 'browser' : 'browsers';
+      await this.bot.sendMessage(chatId, `✅ All ${browserLabel} are ready and logged in.`);
 
       // Initialize order flow and show game selection directly
       // Cards are loaded from local catalog cache first, then user browser when needed.
@@ -541,6 +576,10 @@ class TelegramBotController {
         return;
       }
 
+      if (!(await this.ensureGlobalPoolReadyOrNotify(chatId, telegramUserId))) {
+        return;
+      }
+
       await this.handleCheckBalanceButton(chatId, telegramUserId);
     } catch (err) {
       logger.error('Error in /check_balance command:', err);
@@ -557,6 +596,7 @@ class TelegramBotController {
   async handleTransactionsCommand(msg) {
     const chatId = msg.chat.id.toString();
     const telegramUserId = msg.from.id.toString();
+    const scopeKey = this.getScopeKey(telegramUserId);
     const operation = await this.tryBeginCommandOperation(chatId, telegramUserId, 'transactions', true);
     if (!operation) {
       return;
@@ -572,7 +612,11 @@ class TelegramBotController {
         return;
       }
 
-      if (this.transactionsFetchControllers.has(telegramUserId)) {
+      if (!(await this.ensureGlobalPoolReadyOrNotify(chatId, telegramUserId))) {
+        return;
+      }
+
+      if (this.transactionsFetchControllers.has(scopeKey)) {
         return this.bot.sendMessage(chatId, '⏳ Transactions fetch already running. Use /cancel to stop it.');
       }
 
@@ -581,7 +625,7 @@ class TelegramBotController {
       }
 
       const fetchController = { cancelled: false };
-      this.transactionsFetchControllers.set(telegramUserId, fetchController);
+      this.transactionsFetchControllers.set(scopeKey, fetchController);
 
       const loadingMsg = await this.bot.sendMessage(chatId, `⏳ Fetching transactions for ${dateInput}...`);
       let lastProgressText = '';
@@ -672,7 +716,7 @@ class TelegramBotController {
         }
         throw innerErr;
       } finally {
-        this.transactionsFetchControllers.delete(telegramUserId);
+        this.transactionsFetchControllers.delete(scopeKey);
       }
     } catch (err) {
       logger.error('Error in /transactions command:', err);
@@ -734,6 +778,10 @@ class TelegramBotController {
     try {
       const isAuthorized = await this.ensureAuthorized(chatId, telegramUserId);
       if (!isAuthorized) {
+        return;
+      }
+
+      if (!(await this.ensureGlobalPoolReadyOrNotify(chatId, telegramUserId))) {
         return;
       }
 
@@ -840,10 +888,13 @@ class TelegramBotController {
       }
 
       // Check if there's an active purchase session BEFORE clearing
-      const hasActiveSession = orderFlowHandler.getSession(chatId);
+      const activeSession = orderFlowHandler.getSession(chatId);
+      const hasActiveSession = !!activeSession;
+      const hasProcessingSession = !!(activeSession && (activeSession.step === 'processing' || activeSession.step === 'checking_balance'));
+      const scopeKey = this.getScopeKey(telegramUserId);
 
       // Cancel any ongoing purchases FIRST (before clearing session)
-      if (hasActiveSession) {
+      if (hasActiveSession || (activeOperation && activeOperation.type === 'purchase')) {
         // Mark as cancelled to stop purchase flow
         orderFlowHandler.markAsCancelled(chatId);
 
@@ -858,25 +909,28 @@ class TelegramBotController {
       }
 
       // Cancel any ongoing balance checks
-      if (this.balanceCheckInProgress.has(telegramUserId)) {
-        this.balanceCheckInProgress.delete(telegramUserId);
+      if (this.balanceCheckInProgress.has(scopeKey)) {
+        this.balanceCheckInProgress.delete(scopeKey);
 
         logger.info(`Cancelled balance check for user ${telegramUserId}`);
       }
 
       // Cancel any ongoing transactions fetch
-      if (this.transactionsFetchControllers.has(telegramUserId)) {
-        const controller = this.transactionsFetchControllers.get(telegramUserId);
+      if (this.transactionsFetchControllers.has(scopeKey)) {
+        const controller = this.transactionsFetchControllers.get(scopeKey);
         if (controller) {
           controller.cancelled = true;
         }
         logger.info(`Cancelled transactions fetch for user ${telegramUserId}`);
       }
 
-      // Clear order flow session
+      // Clear order flow session.
+      // Keep cancellation flag set while an active purchase operation/session is winding down,
+      // otherwise long-running loops can miss the cancel signal.
       orderFlowHandler.clearSession(chatId);
-      // Clear stale cancel flag so future orders are not auto-cancelled
-      orderFlowHandler.clearCancellation(chatId);
+      if (!(hasProcessingSession || (activeOperation && activeOperation.type === 'purchase'))) {
+        orderFlowHandler.clearCancellation(chatId);
+      }
 
       // Clear order history pagination
       orderHistoryHandler.reset(chatId);
@@ -1004,6 +1058,19 @@ class TelegramBotController {
     }
 
     try {
+      const requiresReadyPool = callbackData.startsWith('order_game_')
+        || callbackData.startsWith('order_card_')
+        || callbackData === 'order_confirm_continue'
+        || callbackData === 'order_buy_now'
+        || callbackData === 'order_schedule';
+
+      if (requiresReadyPool) {
+        const isReady = await this.ensureGlobalPoolReadyOrNotify(chatId, telegramUserId);
+        if (!isReady) {
+          return;
+        }
+      }
+
       switch (callbackData) {
         case 'back_to_menu':
           await this.showMainMenu(chatId);
@@ -1214,6 +1281,7 @@ class TelegramBotController {
   async handleCheckBalanceButton(chatId, telegramUserId) {
     const db = require('../services/DatabaseService');
     const purchaseService = require('../services/PurchaseService');
+    const scopeKey = this.getScopeKey(telegramUserId);
 
     // Check if user has credentials first
     const credentials = await db.getUserCredentials(telegramUserId);
@@ -1222,7 +1290,7 @@ class TelegramBotController {
     }
 
     // Mark balance check as in progress
-    this.balanceCheckInProgress.add(telegramUserId);
+    this.balanceCheckInProgress.add(scopeKey);
 
     // Show loading message
     const loadingMsg = await this.bot.sendMessage(chatId, '⏳ Checking balance...');
@@ -1238,7 +1306,7 @@ class TelegramBotController {
       logger.info(`Using ready browser for balance check: User ${telegramUserId}, slot ${readySessions[0].slot}`);
 
       // Check if cancelled before getting balance
-      if (!this.balanceCheckInProgress.has(telegramUserId)) {
+      if (!this.balanceCheckInProgress.has(scopeKey)) {
         throw new Error('Balance check cancelled by user');
       }
 
@@ -1246,7 +1314,7 @@ class TelegramBotController {
       const balance = await scraperService.getBalance(telegramUserId, page);
 
       // Check if cancelled before sending result
-      if (!this.balanceCheckInProgress.has(telegramUserId)) {
+      if (!this.balanceCheckInProgress.has(scopeKey)) {
         throw new Error('Balance check cancelled by user');
       }
 
@@ -1275,7 +1343,7 @@ class TelegramBotController {
 
       // Only send error message if NOT cancelled by user
       // If user was removed from balanceCheckInProgress, it means /cancel was used
-      if (err.message !== 'Balance check cancelled by user' && this.balanceCheckInProgress.has(telegramUserId)) {
+      if (err.message !== 'Balance check cancelled by user' && this.balanceCheckInProgress.has(scopeKey)) {
         if (err.message.includes('No ready browser session available')) {
           await this.bot.sendMessage(chatId, '⚠️ No ready browser available. Use /start first, then try /check_balance again.');
         } else {
@@ -1284,7 +1352,7 @@ class TelegramBotController {
       }
     } finally {
       // Always remove from in-progress set
-      this.balanceCheckInProgress.delete(telegramUserId);
+      this.balanceCheckInProgress.delete(scopeKey);
     }
   }
 
@@ -1593,22 +1661,43 @@ class TelegramBotController {
 
       throwIfCancelled();
 
-      // Credentials changed: verify login first, then persist to database.
+      // Credentials changed: restart both global browsers and test new credentials on both.
       await purchaseService.resetUserBrowsers(telegramUserId);
       throwIfCancelled();
 
-      await scraperService.login(telegramUserId, email, passwordTrimmed);
+      const readyResult = await purchaseService.ensureReadyBrowsers(telegramUserId, {
+        forceRestart: true,
+        credentialsOverride: {
+          email,
+          password: passwordTrimmed
+        }
+      });
       throwIfCancelled();
 
-      // Login succeeded - now persist encrypted credentials.
+      if (!readyResult || readyResult.count <= 0) {
+        throw new Error('Both browser logins failed with new credentials');
+      }
+
+      // At least one browser login succeeded - persist encrypted credentials.
       const emailEncrypted = encryptionService.encrypt(email);
       const passwordEncrypted = encryptionService.encrypt(passwordTrimmed);
       await db.saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted);
 
-      // Keep ready-session map synchronized in background without blocking UX.
-      purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch((syncErr) => {
-        logger.warn(`Background ready-session sync failed after credential update for user ${telegramUserId}: ${syncErr.message}`);
-      });
+      // Wait for second browser in background before declaring bot ready.
+      if (!readyResult.ready) {
+        this.safeSendMessage(
+          chatId,
+          `✅ Credentials saved (${readyResult.count}/${readyResult.target} browsers logged in). Waiting for second browser login before bot is ready...`
+        ).catch(() => { });
+
+        purchaseService.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).then((syncResult) => {
+          if (syncResult && syncResult.ready) {
+            this.safeSendMessage(chatId, '✅ Second browser logged in. Bot is now fully ready to use.').catch(() => { });
+          }
+        }).catch((syncErr) => {
+          logger.warn(`Background ready-session sync failed after credential update for user ${telegramUserId}: ${syncErr.message}`);
+        });
+      }
 
       // Clear credentials from memory
       sessionManager.clearCredentials(chatId);
@@ -1616,9 +1705,14 @@ class TelegramBotController {
       // Reset session state
       sessionManager.updateState(chatId, 'idle');
 
+      const browserLabel = readyResult.target === 1 ? 'browser' : 'browsers';
+      const readyMessage = readyResult.ready
+        ? `✅ *Credentials Updated*\nAll ${readyResult.target} ${browserLabel} are ready.`
+        : `✅ *Credentials Updated*\nWaiting for remaining browser(s) to login before bot becomes ready (${readyResult.count}/${readyResult.target}).`;
+      
       await this.safeSendMessage(
         chatId,
-        '✅ *Credentials Updated*\nBrowser is ready.',
+        readyMessage,
         { parse_mode: 'Markdown' }
       );
 

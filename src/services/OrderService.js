@@ -207,6 +207,25 @@ class OrderService {
         }
       }
 
+      // Step 3b: SYNC enriched pins from final purchases array into stored pins
+      // (Enrichment happens after purchase loop, so we need to update any PENDING pins with real data)
+      const orderData = this.orderPins.get(order.id);
+      if (orderData && orderData.pins && purchases.length > 0) {
+        for (let i = 0; i < purchases.length && i < orderData.pins.length; i++) {
+          const purchase = purchases[i];
+          const storedPin = orderData.pins[i];
+          
+          // If this purchase was enriched (has real pin now instead of PENDING), update the stored entry
+          if (purchase.pinCode && purchase.pinCode !== 'PENDING' && purchase.pinCode !== 'FAILED') {
+            storedPin.pinCode = purchase.pinCode;
+            storedPin.serialNumber = purchase.serialNumber || '';
+            storedPin.transactionId = purchase.transactionId || '';
+            storedPin.requiresManualCheck = false;
+            logger.debug(`Synced enriched pin for card ${i + 1}: ${purchase.pinCode.substring(0, 4)}...`);
+          }
+        }
+      }
+
       // Step 4: Mark order as completed in memory.
       order.status = 'completed';
 

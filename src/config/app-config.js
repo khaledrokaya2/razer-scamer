@@ -35,18 +35,22 @@ const APP_CONFIG = {
     ]
   },
   purchase: {
-    maxParallelPages: 10,
-    maxConcurrentCheckouts: 3,
-    sequentialStepDelayMs: 40,
-    sequentialStepJitterMs: 25,
-    pageOpenStepDelayMs: 260,
-    pageOpenStepJitterMs: 140,
-    actionGapMs: 60,
-    actionJitterMs: 40,
-    navJitterMinMs: 40,
-    navJitterMaxMs: 90,
+    // Single global browser + single page model.
+    maxReadyBrowsers: 1,
+    pagesPerBrowser: [1],
+    maxParallelPages: 1,
+    maxConcurrentCheckouts: 1,
+    sequentialStepDelayMs: 15,
+    sequentialStepJitterMs: 10,
+    pageOpenStepDelayMs: 80,
+    pageOpenStepJitterMs: 45,
+    actionGapMs: 20,
+    actionJitterMs: 15,
+    navJitterMinMs: 10,
+    navJitterMaxMs: 25,
     checkoutBatchDelayMs: 20,
     twoFactorWindowMs: 15 * 60 * 1000,
+    twoFactorIframeRetryTimeoutMs: 8000,
     postTransactionCongratsTimeoutMs: 2200,
     postTransactionPinWaitTimeoutMs: 1200,
     twoFactorLockHumanDelayMinMs: 80,
@@ -61,7 +65,9 @@ const APP_CONFIG = {
     purchaseCardJitterMs: 1000,
     transactionDetailStaggerMs: 5200,
     transactionDetailJitterMs: 2600,
-    transactionApiRateDelayMs: 100
+    transactionApiRateDelayMs: 100,
+    apiReplayDelayMinMs: 500,
+    apiReplayDelayMaxMs: 800
   },
   orderFlow: {
     sessionTimeoutMs: 30 * 60 * 1000,

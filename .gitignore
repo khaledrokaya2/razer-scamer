@@ -56,3 +56,6 @@ coverage/
 # Build output
 dist/
 build/
+
+# Test scripts and captured artifacts
+test/

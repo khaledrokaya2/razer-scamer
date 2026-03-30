@@ -117,10 +117,6 @@ class User {
     this.telegram_user_id = data.telegram_user_id;
     this.username = data.username;
     this.created_at = data.created_at;
-    this.AllowedAttempts = data.AllowedAttempts;
-    this.SubscriptionType = data.SubscriptionType;
-    this.SubscriptionExpiresAt = data.SubscriptionExpiresAt;
-    this.role = data.role;
     this.email_encrypted = data.email_encrypted;
     this.password_encrypted = data.password_encrypted;
   }

@@ -37,7 +37,40 @@ class DatabaseService {
     // OPTIMIZATION: Pre-parse connection string once
     this.parseConnectionString();
 
+    // Shared-operator mode: all bot users read/write same credentials and backup codes.
+    this.SHARED_OPERATOR_USER_ID = process.env.GLOBAL_OPERATOR_USER_ID || '900000000000000001';
+
     logger.database('Database pool configured: 2-10 connections');
+  }
+
+  getSharedOperatorUserId() {
+    return this.SHARED_OPERATOR_USER_ID;
+  }
+
+  normalizeSharedOperatorId() {
+    return this.getSharedOperatorUserId();
+  }
+
+  isMissingUsedAtColumnError(err) {
+    return this.isMissingColumnError(err, 'used_at');
+  }
+
+  isMissingStatusColumnError(err) {
+    return this.isMissingColumnError(err, 'status');
+  }
+
+  isMissingIsUsedColumnError(err) {
+    return this.isMissingColumnError(err, 'is_used');
+  }
+
+  isMissingColumnError(err, columnName) {
+    const message = String((err && err.message) || '').toLowerCase();
+    return message.includes(`invalid column name '${String(columnName).toLowerCase()}'`)
+      || message.includes(`invalid column name "${String(columnName).toLowerCase()}"`);
+  }
+
+  logUsedAtFallback(opName) {
+    logger.warn(`[DB fallback] ${opName}: backup_codes.used_at is missing, using legacy status-only update. Run setup-database-new.sql to migrate schema.`);
   }
 
   /**
@@ -420,9 +453,10 @@ class DatabaseService {
     try {
       await this.connect();
       const { User } = require('../models/DatabaseModels');
+      const scopedUserId = this.normalizeSharedOperatorId();
 
       const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .input('telegram_user_id', sql.BigInt, scopedUserId)
         .query('SELECT * FROM user_accounts WHERE telegram_user_id = @telegram_user_id');
 
       return result.recordset.length > 0 ? new User(result.recordset[0]) : null;
@@ -462,23 +496,24 @@ class DatabaseService {
   async ensureUserExists(telegramUserId) {
     try {
       await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
 
       // Check if user exists
-      const existing = await this.getUserByTelegramId(telegramUserId);
+      const existing = await this.getUserByTelegramId(scopedUserId);
       if (existing) return;
 
       // Create user account with username based on telegram_user_id
-      const username = `user_${telegramUserId}`;
+      const username = `user_${scopedUserId}`;
 
       await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .input('telegram_user_id', sql.BigInt, scopedUserId)
         .input('username', sql.NVarChar(50), username)
         .query(`
           INSERT INTO user_accounts (telegram_user_id, username, created_at)
           VALUES (@telegram_user_id, @username, GETDATE())
         `);
 
-      logger.info(`Created user account for telegram_user_id: ${telegramUserId}`);
+      logger.info(`Created shared operator user account: ${scopedUserId}`);
     } catch (err) {
       logger.error('Error ensuring user exists:', err);
       throw err;
@@ -496,14 +531,15 @@ class DatabaseService {
     try {
       await this.connect();
       const { User } = require('../models/DatabaseModels');
+      const scopedUserId = this.normalizeSharedOperatorId();
 
       // Check if user exists
-      const existingUser = await this.getUserByTelegramId(telegramUserId);
+      const existingUser = await this.getUserByTelegramId(scopedUserId);
 
       if (existingUser) {
         // Update existing user
         const result = await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, telegramUserId)
+          .input('telegram_user_id', sql.BigInt, scopedUserId)
           .input('email_encrypted', sql.NVarChar(500), emailEncrypted)
           .input('password_encrypted', sql.NVarChar(500), passwordEncrypted)
           .query(`
@@ -517,11 +553,11 @@ class DatabaseService {
         return new User(result.recordset[0]);
       } else {
         // Create user account first
-        await this.ensureUserExists(telegramUserId);
+        await this.ensureUserExists(scopedUserId);
 
         // Now update with credentials
         const result = await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, telegramUserId)
+          .input('telegram_user_id', sql.BigInt, scopedUserId)
           .input('email_encrypted', sql.NVarChar(500), emailEncrypted)
           .input('password_encrypted', sql.NVarChar(500), passwordEncrypted)
           .query(`
@@ -548,9 +584,10 @@ class DatabaseService {
   async deleteUserCredentials(telegramUserId) {
     try {
       await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
 
       await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .input('telegram_user_id', sql.BigInt, scopedUserId)
         .query(`
           UPDATE user_accounts 
           SET email_encrypted = NULL, password_encrypted = NULL 
@@ -577,33 +614,119 @@ class DatabaseService {
   async saveBackupCodes(telegramUserId, codes) {
     try {
       await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
 
       // Ensure user account exists
-      await this.ensureUserExists(telegramUserId);
+      await this.ensureUserExists(scopedUserId);
 
-      // First, mark all existing codes as expired
-      await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .query(`
-          UPDATE backup_codes 
-          SET status = 'expired' 
-          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
-        `);
+      // First, deactivate all existing active codes (schema-compatible fallback chain)
+      try {
+        await this.pool.request()
+          .input('telegram_user_id', sql.BigInt, scopedUserId)
+          .query(`
+            UPDATE dbo.backup_codes
+            SET status = 'expired'
+            WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+          `);
+      } catch (err) {
+        if (!this.isMissingStatusColumnError(err)) {
+          throw err;
+        }
+
+        this.logUsedAtFallback('saveBackupCodes deactivate/status');
+        try {
+          await this.pool.request()
+            .input('telegram_user_id', sql.BigInt, scopedUserId)
+            .query(`
+              UPDATE dbo.backup_codes
+              SET is_used = 1
+              WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
+            `);
+        } catch (isUsedErr) {
+          if (!this.isMissingIsUsedColumnError(isUsedErr)) {
+            throw isUsedErr;
+          }
+
+          try {
+            await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                UPDATE dbo.backup_codes
+                SET used_at = SYSUTCDATETIME()
+                WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
+              `);
+          } catch (usedAtErr) {
+            if (!this.isMissingUsedAtColumnError(usedAtErr)) {
+              throw usedAtErr;
+            }
+
+            // Last resort legacy schema: clear all and reinsert fresh set.
+            await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                DELETE FROM dbo.backup_codes
+                WHERE telegram_user_id = @telegram_user_id
+              `);
+          }
+        }
+      }
 
       // Insert new codes as active
       for (const code of codes) {
         const codeEncrypted = encryptionService.encrypt(code);
 
-        await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, telegramUserId)
-          .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
-          .query(`
-            INSERT INTO backup_codes (telegram_user_id, code_encrypted, status)
-            VALUES (@telegram_user_id, @code_encrypted, 'active')
-          `);
+        try {
+          await this.pool.request()
+            .input('telegram_user_id', sql.BigInt, scopedUserId)
+            .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
+            .query(`
+              INSERT INTO dbo.backup_codes (telegram_user_id, code_encrypted, status)
+              VALUES (@telegram_user_id, @code_encrypted, 'active')
+            `);
+        } catch (err) {
+          if (!this.isMissingStatusColumnError(err)) {
+            throw err;
+          }
+
+          try {
+            await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
+              .query(`
+                INSERT INTO dbo.backup_codes (telegram_user_id, code_encrypted, is_used)
+                VALUES (@telegram_user_id, @code_encrypted, 0)
+              `);
+          } catch (isUsedErr) {
+            if (!this.isMissingIsUsedColumnError(isUsedErr)) {
+              throw isUsedErr;
+            }
+
+            try {
+              await this.pool.request()
+                .input('telegram_user_id', sql.BigInt, scopedUserId)
+                .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
+                .query(`
+                  INSERT INTO dbo.backup_codes (telegram_user_id, code_encrypted, used_at)
+                  VALUES (@telegram_user_id, @code_encrypted, NULL)
+                `);
+            } catch (usedAtErr) {
+              if (!this.isMissingUsedAtColumnError(usedAtErr)) {
+                throw usedAtErr;
+              }
+
+              await this.pool.request()
+                .input('telegram_user_id', sql.BigInt, scopedUserId)
+                .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
+                .query(`
+                  INSERT INTO dbo.backup_codes (telegram_user_id, code_encrypted)
+                  VALUES (@telegram_user_id, @code_encrypted)
+                `);
+            }
+          }
+        }
       }
 
-      logger.database(`Saved ${codes.length} backup codes for user ${telegramUserId}`);
+      logger.database(`Saved ${codes.length} backup codes for shared operator ${scopedUserId}`);
       return codes.length;
     } catch (err) {
       logger.error('Error saving backup codes:', err);
@@ -619,15 +742,62 @@ class DatabaseService {
   async getNextBackupCode(telegramUserId) {
     try {
       await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
 
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .query(`
-          SELECT TOP 1 id, code_encrypted 
-          FROM backup_codes 
-          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
-          ORDER BY id ASC
-        `);
+      let result;
+      try {
+        result = await this.pool.request()
+          .input('telegram_user_id', sql.BigInt, scopedUserId)
+          .query(`
+            SELECT TOP 1 id, code_encrypted
+            FROM dbo.backup_codes
+            WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+            ORDER BY id ASC
+          `);
+      } catch (err) {
+        if (!this.isMissingStatusColumnError(err)) {
+          throw err;
+        }
+
+        try {
+          result = await this.pool.request()
+            .input('telegram_user_id', sql.BigInt, scopedUserId)
+            .query(`
+              SELECT TOP 1 id, code_encrypted
+              FROM dbo.backup_codes
+              WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
+              ORDER BY id ASC
+            `);
+        } catch (isUsedErr) {
+          if (!this.isMissingIsUsedColumnError(isUsedErr)) {
+            throw isUsedErr;
+          }
+
+          try {
+            result = await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                SELECT TOP 1 id, code_encrypted
+                FROM dbo.backup_codes
+                WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
+                ORDER BY id ASC
+              `);
+          } catch (usedAtErr) {
+            if (!this.isMissingUsedAtColumnError(usedAtErr)) {
+              throw usedAtErr;
+            }
+
+            result = await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                SELECT TOP 1 id, code_encrypted
+                FROM dbo.backup_codes
+                WHERE telegram_user_id = @telegram_user_id
+                ORDER BY id ASC
+              `);
+          }
+        }
+      }
 
       if (result.recordset.length === 0) {
         return null;
@@ -642,6 +812,147 @@ class DatabaseService {
   }
 
   /**
+   * Atomically reserve and consume the next active backup code.
+   * Prevents duplicate assignment when multiple pages request a code concurrently.
+   * @param {string} telegramUserId - Telegram user ID
+   * @returns {Promise<{id: number, code: string} | null>} Reserved code payload or null
+   */
+  async reserveNextBackupCode(telegramUserId) {
+    try {
+      await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
+
+      let result;
+      try {
+        result = await this.pool.request()
+          .input('telegram_user_id', sql.BigInt, scopedUserId)
+          .query(`
+            ;WITH next_code AS (
+              SELECT TOP (1) id, code_encrypted, status, used_at
+              FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
+              WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+              ORDER BY id ASC
+            )
+            UPDATE next_code
+            SET status = 'used', used_at = SYSUTCDATETIME()
+            OUTPUT inserted.id, inserted.code_encrypted;
+          `);
+      } catch (err) {
+        if (!this.isMissingUsedAtColumnError(err) && !this.isMissingStatusColumnError(err)) {
+          throw err;
+        }
+
+        this.logUsedAtFallback('reserveNextBackupCode');
+
+        // Fallback 1: status exists, used_at missing
+        if (this.isMissingUsedAtColumnError(err) && !this.isMissingStatusColumnError(err)) {
+          result = await this.pool.request()
+            .input('telegram_user_id', sql.BigInt, scopedUserId)
+            .query(`
+              ;WITH next_code AS (
+                SELECT TOP (1) id, code_encrypted, status
+                FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
+                WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+                ORDER BY id ASC
+              )
+              UPDATE next_code
+              SET status = 'used'
+              OUTPUT inserted.id, inserted.code_encrypted;
+            `);
+        } else {
+          // Fallback 2: status missing -> legacy is_used/used_at/no-flag schemas
+          try {
+            result = await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                ;WITH next_code AS (
+                  SELECT TOP (1) id, code_encrypted, is_used, used_at
+                  FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
+                  WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
+                  ORDER BY id ASC
+                )
+                UPDATE next_code
+                SET is_used = 1, used_at = SYSUTCDATETIME()
+                OUTPUT inserted.id, inserted.code_encrypted;
+              `);
+          } catch (legacyErr) {
+            if (!this.isMissingUsedAtColumnError(legacyErr) && !this.isMissingIsUsedColumnError(legacyErr)) {
+              throw legacyErr;
+            }
+
+            try {
+              result = await this.pool.request()
+                .input('telegram_user_id', sql.BigInt, scopedUserId)
+                .query(`
+                  ;WITH next_code AS (
+                    SELECT TOP (1) id, code_encrypted, is_used
+                    FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
+                    WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
+                    ORDER BY id ASC
+                  )
+                  UPDATE next_code
+                  SET is_used = 1
+                  OUTPUT inserted.id, inserted.code_encrypted;
+                `);
+            } catch (legacyNoIsUsedErr) {
+              if (!this.isMissingIsUsedColumnError(legacyNoIsUsedErr)) {
+                throw legacyNoIsUsedErr;
+              }
+
+              try {
+                result = await this.pool.request()
+                  .input('telegram_user_id', sql.BigInt, scopedUserId)
+                  .query(`
+                    ;WITH next_code AS (
+                      SELECT TOP (1) id, code_encrypted, used_at
+                      FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
+                      WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
+                      ORDER BY id ASC
+                    )
+                    UPDATE next_code
+                    SET used_at = SYSUTCDATETIME()
+                    OUTPUT inserted.id, inserted.code_encrypted;
+                  `);
+              } catch (noFlagsErr) {
+                if (!this.isMissingUsedAtColumnError(noFlagsErr)) {
+                  throw noFlagsErr;
+                }
+
+                // Last-resort old schema: consume by deleting one row and output deleted payload.
+                result = await this.pool.request()
+                  .input('telegram_user_id', sql.BigInt, scopedUserId)
+                  .query(`
+                    ;WITH next_code AS (
+                      SELECT TOP (1) id, code_encrypted
+                      FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
+                      WHERE telegram_user_id = @telegram_user_id
+                      ORDER BY id ASC
+                    )
+                    DELETE FROM next_code
+                    OUTPUT deleted.id, deleted.code_encrypted;
+                  `);
+              }
+            }
+          }
+        }
+      }
+
+      if (!result.recordset || result.recordset.length === 0) {
+        return null;
+      }
+
+      const row = result.recordset[0];
+      return {
+        id: row.id,
+        code: encryptionService.decrypt(row.code_encrypted)
+      };
+    } catch (err) {
+      logger.error('Error reserving backup code:', err);
+      throw err;
+    }
+  }
+
+  /**
    * Mark a backup code as used
    * @param {string} telegramUserId - Telegram user ID
    * @returns {Promise<boolean>} True if marked
@@ -649,15 +960,74 @@ class DatabaseService {
   async markBackupCodeAsUsed(telegramUserId) {
     try {
       await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
 
       // Mark the oldest active code as used
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .query(`
-          UPDATE TOP (1) backup_codes
-          SET status = 'used', used_at = SYSUTCDATETIME()
-          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
-        `);
+      let result;
+      try {
+        result = await this.pool.request()
+          .input('telegram_user_id', sql.BigInt, scopedUserId)
+          .query(`
+            UPDATE TOP (1) dbo.backup_codes
+            SET status = 'used', used_at = SYSUTCDATETIME()
+            WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+          `);
+      } catch (err) {
+        if (!this.isMissingUsedAtColumnError(err) && !this.isMissingStatusColumnError(err)) {
+          throw err;
+        }
+
+        this.logUsedAtFallback('markBackupCodeAsUsed');
+        try {
+          result = await this.pool.request()
+            .input('telegram_user_id', sql.BigInt, scopedUserId)
+            .query(`
+              UPDATE TOP (1) dbo.backup_codes
+              SET status = 'used'
+              WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+            `);
+        } catch (statusErr) {
+          if (!this.isMissingStatusColumnError(statusErr)) {
+            throw statusErr;
+          }
+
+          try {
+            result = await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                UPDATE TOP (1) dbo.backup_codes
+                SET is_used = 1
+                WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
+              `);
+          } catch (isUsedErr) {
+            if (!this.isMissingIsUsedColumnError(isUsedErr)) {
+              throw isUsedErr;
+            }
+
+            try {
+              result = await this.pool.request()
+                .input('telegram_user_id', sql.BigInt, scopedUserId)
+                .query(`
+                  UPDATE TOP (1) dbo.backup_codes
+                  SET used_at = SYSUTCDATETIME()
+                  WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
+                `);
+            } catch (usedAtErr) {
+              if (!this.isMissingUsedAtColumnError(usedAtErr)) {
+                throw usedAtErr;
+              }
+
+              result = await this.pool.request()
+                .input('telegram_user_id', sql.BigInt, scopedUserId)
+                .query(`
+                  DELETE TOP (1)
+                  FROM dbo.backup_codes
+                  WHERE telegram_user_id = @telegram_user_id
+                `);
+            }
+          }
+        }
+      }
 
       return result.rowsAffected[0] > 0;
     } catch (err) {
@@ -675,15 +1045,62 @@ class DatabaseService {
   async getAllActiveBackupCodes(telegramUserId) {
     try {
       await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
 
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .query(`
-          SELECT id, code_encrypted 
-          FROM backup_codes 
-          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
-          ORDER BY id ASC
-        `);
+      let result;
+      try {
+        result = await this.pool.request()
+          .input('telegram_user_id', sql.BigInt, scopedUserId)
+          .query(`
+            SELECT id, code_encrypted
+            FROM dbo.backup_codes
+            WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+            ORDER BY id ASC
+          `);
+      } catch (err) {
+        if (!this.isMissingStatusColumnError(err)) {
+          throw err;
+        }
+
+        try {
+          result = await this.pool.request()
+            .input('telegram_user_id', sql.BigInt, scopedUserId)
+            .query(`
+              SELECT id, code_encrypted
+              FROM dbo.backup_codes
+              WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
+              ORDER BY id ASC
+            `);
+        } catch (isUsedErr) {
+          if (!this.isMissingIsUsedColumnError(isUsedErr)) {
+            throw isUsedErr;
+          }
+
+          try {
+            result = await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                SELECT id, code_encrypted
+                FROM dbo.backup_codes
+                WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
+                ORDER BY id ASC
+              `);
+          } catch (usedAtErr) {
+            if (!this.isMissingUsedAtColumnError(usedAtErr)) {
+              throw usedAtErr;
+            }
+
+            result = await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                SELECT id, code_encrypted
+                FROM dbo.backup_codes
+                WHERE telegram_user_id = @telegram_user_id
+                ORDER BY id ASC
+              `);
+          }
+        }
+      }
 
       return result.recordset.map(row => ({
         id: row.id,
@@ -709,12 +1126,65 @@ class DatabaseService {
       // Safe: IDs are integers from our own database
       const idList = codeIds.map(id => parseInt(id)).join(',');
 
-      const result = await this.pool.request()
-        .query(`
-          UPDATE backup_codes
-          SET status = 'used', used_at = SYSUTCDATETIME()
-          WHERE id IN (${idList})
-        `);
+      let result;
+      try {
+        result = await this.pool.request()
+          .query(`
+            UPDATE dbo.backup_codes
+            SET status = 'used', used_at = SYSUTCDATETIME()
+            WHERE id IN (${idList})
+          `);
+      } catch (err) {
+        if (!this.isMissingUsedAtColumnError(err) && !this.isMissingStatusColumnError(err)) {
+          throw err;
+        }
+
+        this.logUsedAtFallback('markBackupCodesAsUsedByIds');
+        try {
+          result = await this.pool.request()
+            .query(`
+              UPDATE dbo.backup_codes
+              SET status = 'used'
+              WHERE id IN (${idList})
+            `);
+        } catch (statusErr) {
+          if (!this.isMissingStatusColumnError(statusErr)) {
+            throw statusErr;
+          }
+
+          try {
+            result = await this.pool.request()
+              .query(`
+                UPDATE dbo.backup_codes
+                SET is_used = 1
+                WHERE id IN (${idList})
+              `);
+          } catch (isUsedErr) {
+            if (!this.isMissingIsUsedColumnError(isUsedErr)) {
+              throw isUsedErr;
+            }
+
+            try {
+              result = await this.pool.request()
+                .query(`
+                  UPDATE dbo.backup_codes
+                  SET used_at = SYSUTCDATETIME()
+                  WHERE id IN (${idList}) AND used_at IS NULL
+                `);
+            } catch (usedAtErr) {
+              if (!this.isMissingUsedAtColumnError(usedAtErr)) {
+                throw usedAtErr;
+              }
+
+              result = await this.pool.request()
+                .query(`
+                  DELETE FROM dbo.backup_codes
+                  WHERE id IN (${idList})
+                `);
+            }
+          }
+        }
+      }
 
       logger.database(`Marked ${result.rowsAffected[0]} backup codes as used (IDs: ${idList})`);
       return result.rowsAffected[0];
@@ -732,14 +1202,58 @@ class DatabaseService {
   async getActiveBackupCodeCount(telegramUserId) {
     try {
       await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
 
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .query(`
-          SELECT COUNT(*) as count 
-          FROM backup_codes 
-          WHERE telegram_user_id = @telegram_user_id AND status = 'active'
-        `);
+      let result;
+      try {
+        result = await this.pool.request()
+          .input('telegram_user_id', sql.BigInt, scopedUserId)
+          .query(`
+            SELECT COUNT(*) as count
+            FROM dbo.backup_codes
+            WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+          `);
+      } catch (err) {
+        if (!this.isMissingStatusColumnError(err)) {
+          throw err;
+        }
+
+        try {
+          result = await this.pool.request()
+            .input('telegram_user_id', sql.BigInt, scopedUserId)
+            .query(`
+              SELECT COUNT(*) as count
+              FROM dbo.backup_codes
+              WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
+            `);
+        } catch (isUsedErr) {
+          if (!this.isMissingIsUsedColumnError(isUsedErr)) {
+            throw isUsedErr;
+          }
+
+          try {
+            result = await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                SELECT COUNT(*) as count
+                FROM dbo.backup_codes
+                WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
+              `);
+          } catch (usedAtErr) {
+            if (!this.isMissingUsedAtColumnError(usedAtErr)) {
+              throw usedAtErr;
+            }
+
+            result = await this.pool.request()
+              .input('telegram_user_id', sql.BigInt, scopedUserId)
+              .query(`
+                SELECT COUNT(*) as count
+                FROM dbo.backup_codes
+                WHERE telegram_user_id = @telegram_user_id
+              `);
+          }
+        }
+      }
 
       return result.recordset[0].count;
     } catch (err) {
@@ -756,11 +1270,12 @@ class DatabaseService {
   async deleteAllBackupCodes(telegramUserId) {
     try {
       await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
 
       await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
+        .input('telegram_user_id', sql.BigInt, scopedUserId)
         .query(`
-          DELETE FROM backup_codes 
+          DELETE FROM dbo.backup_codes 
           WHERE telegram_user_id = @telegram_user_id
         `);
 
