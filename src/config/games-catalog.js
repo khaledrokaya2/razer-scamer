@@ -49,16 +49,16 @@ const gamesCatalog = [
     link: 'https://gold.razer.com/global/en/gold/catalog/pubg-mobile-uc-code-tencent',
     description: 'PUBG Mobile UC',
     cards: [
-      'PUBG 60 UC',
-      'PUBG 325 UC',
-      'PUBG 660 UC',
-      'PUBG 1800 UC',
-      'PUBG 3850 UC',
-      'PUBG 8100 UC',
-      'PUBG 16200 UC',
-      'PUBG 24300 UC',
-      'PUBG 32400 UC',
-      'PUBG 40500 UC'
+      '60 UC',
+      '300 + 25 UC',
+      '600 + 60 UC',
+      '1500 + 300 UC',
+      '3000 + 850 UC',
+      '6000 + 2100 UC',
+      '12000 + 4200 UC',
+      '18000 + 6300 UC',
+      '24000 + 8400 UC',
+      '30000 + 10500 UC'
     ]
   },
   {

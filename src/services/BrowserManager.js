@@ -199,6 +199,27 @@ class BrowserManager {
     const configuredHeadlessMode = appConfig.browser.headlessMode;
     const headlessMode = configuredHeadlessMode ?? 'true';
 
+    const normalizeHeadless = (value) => {
+      const normalized = String(value || '').trim().toLowerCase();
+      if (normalized === 'false' || normalized === '0' || normalized === 'off' || normalized === 'no') {
+        return false;
+      }
+      if (normalized === 'new') {
+        return 'new';
+      }
+      return true;
+    };
+
+    let resolvedHeadless = normalizeHeadless(headlessMode);
+
+    // In Linux servers (pm2, VPS, containers), headful mode requires X/Wayland.
+    // If no display is available, force headless to prevent launch failure.
+    const hasDisplay = !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+    if (process.platform === 'linux' && !hasDisplay && resolvedHeadless === false) {
+      logger.warn('No DISPLAY/WAYLAND_DISPLAY detected on Linux; forcing headless mode');
+      resolvedHeadless = true;
+    }
+
     const launchArgs = [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -218,7 +239,7 @@ class BrowserManager {
 
 
     const browser = await puppeteer.launch({
-      headless: false,
+      headless: resolvedHeadless,
       protocolTimeout: 180000,
       args: launchArgs
     });
