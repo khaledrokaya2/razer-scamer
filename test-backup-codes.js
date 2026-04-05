@@ -19,7 +19,7 @@ function printUsage() {
 }
 
 function getConnectionString() {
-  return process.env.TEST_DB_CONNECTION_STRING || '';
+  return process.env.DB_CONNECTION_STRING2 || '';
 }
 
 function parseConnectionString(connectionString) {
@@ -129,7 +129,7 @@ async function main() {
       .query(`
         SELECT id, code_encrypted, status, created_at, used_at
         FROM backup_codes
-        WHERE telegram_user_id = @telegram_user_id AND status = 'active'
+        WHERE telegram_user_id = @telegram_user_id
         ORDER BY id ASC
       `);
 

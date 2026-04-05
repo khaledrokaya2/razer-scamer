@@ -231,7 +231,7 @@ class BrowserManager {
       '--no-first-run',
       '--mute-audio',
       '--lang=en-US,en',
-      '--window-size=500,800',
+      '--window-size=1100,500',
       '--disable-blink-features=AutomationControlled',
       // Memory optimization (reasonable limits)
       '--js-flags=--max-old-space-size=256'

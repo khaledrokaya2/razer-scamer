@@ -11,12 +11,10 @@
 
 const {
   getAllGames,
-  getGameById,
-  getCachedCardsByGameId,
-  getCachedCardsByUrl,
-  setRuntimeCachedCardsByUrl
+  getGameById
 } = require('../config/games-catalog');
 const purchaseService = require('../services/PurchaseService');
+const gameCardsService = require('../services/GameCardsService');
 const orderService = require('../services/OrderService');
 const logger = require('../utils/logger');
 
@@ -153,6 +151,7 @@ class OrderFlowHandler {
       gameUrl: null,
       cardIndex: null,
       cardName: null,
+      regionId: null,
       quantity: null,
       backupCodes: null, // Changed to array
       backupCodeIndex: 0, // Track current code index
@@ -318,33 +317,24 @@ class OrderFlowHandler {
       telegramUserId: telegramUserId
     });
 
-    // Show loading message
     const loadingMsg = await bot.sendMessage(chatId,
-      `🔄 *LOADING CARDS*\n${gameName}\n\n_Please wait..._`,
+      `🔄 *LOADING CARDS*\n🎮 ${gameName}\n\n_Please wait..._`,
       { parse_mode: 'Markdown' }
     );
 
     try {
-      logger.http(`Scraping cards from custom URL: ${urlTrimmed}`);
-
-      // Fast path: use locally cached cards first.
-      let cards = getCachedCardsByUrl(urlTrimmed);
-
-      if (cards.length === 0) {
-        cards = await purchaseService.getAvailableCards(telegramUserId, urlTrimmed);
-        setRuntimeCachedCardsByUrl(urlTrimmed, cards);
-      }
+      logger.http(`Loading cards from catalog API: ${urlTrimmed} (region 2)`);
+      const result = await gameCardsService.getCards(telegramUserId, urlTrimmed, 2);
+      const cards = result.cards;
 
       logger.success(`Found ${cards.length} cards`);
 
-      // Delete loading message
       try {
         await bot.deleteMessage(chatId, loadingMsg.message_id);
       } catch (delErr) {
         logger.debug('Could not delete loading message');
       }
 
-      // Create keyboard with card options
       const keyboard = cards.map((card, index) => [
         {
           text: card.disabled ? `❌ ${card.name} (Out of Stock)` : `✅ ${card.name}`,
@@ -352,7 +342,6 @@ class OrderFlowHandler {
         }
       ]);
 
-      // Add only back button
       keyboard.push([
         { text: '⬅️ Back to Games', callback_data: 'order_back_to_games' }
       ]);
@@ -361,22 +350,17 @@ class OrderFlowHandler {
         `💎 *SELECT CARD*\n🎮 ${gameName}\n\n_Out of stock cards will be monitored and auto-purchased when available._`,
         { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
       );
-      // Store message ID for later deletion
       this.cardMenuMessages.set(chatId, cardMenuMsg.message_id);
-
     } catch (err) {
-      logger.error(`Error loading cards from custom URL:`, err.message);
+      logger.error(`Error loading cards for custom URL:`, err.message);
 
-      // Delete loading message
       try {
         await bot.deleteMessage(chatId, loadingMsg.message_id);
       } catch (delErr) {
         logger.debug('Could not delete loading message');
       }
 
-      // Show error message
-      await bot.sendMessage(chatId, `❌ *Error loading cards*\nInvalid URL or network error`, { parse_mode: 'Markdown' });
-
+      await bot.sendMessage(chatId, `❌ *Fetch failed*\nInvalid URL or network error`, { parse_mode: 'Markdown' });
       this.clearSession(chatId);
     }
   }
@@ -560,6 +544,7 @@ class OrderFlowHandler {
       gameId: game.id,
       gameName: game.name,
       gameUrl: game.link,
+      regionId: game.regionId || 2,
       telegramUserId: telegramUserId
     });
 
@@ -570,14 +555,12 @@ class OrderFlowHandler {
     );
 
     try {
-      logger.http(`Scraping cards from: ${game.link}`);
+      logger.http(`Loading cards from catalog API: ${game.link}`);
+      const result = await gameCardsService.getCards(telegramUserId, game.link, game.regionId || 2);
+      const cards = result.cards;
 
-      // Fast path: use locally cached cards first.
-      let cards = getCachedCardsByGameId(game.id);
-
-      if (cards.length === 0) {
-        cards = await purchaseService.getAvailableCards(telegramUserId, game.link);
-        setRuntimeCachedCardsByUrl(game.link, cards);
+      if (result.apiError) {
+        await bot.sendMessage(chatId, `⚠️ Card fetch failed from catalog API (region ${game.regionId || 2}). Falling back to scraping...`);
       }
 
       logger.success(`Found ${cards.length} cards`);

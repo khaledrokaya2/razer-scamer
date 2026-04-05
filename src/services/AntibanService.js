@@ -1,10 +1,31 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const appConfig = require('../config/app-config');
+const logger = require('../utils/logger');
 
 puppeteer.use(StealthPlugin());
 
 class AntibanService {
+  static shouldBlockRequestByUrl(requestUrl) {
+    if (!requestUrl || typeof requestUrl !== 'string') {
+      return false;
+    }
+
+    try {
+      const parsed = new URL(requestUrl);
+      const hostname = String(parsed.hostname || '').toLowerCase();
+      const pathname = String(parsed.pathname || '');
+
+      // Prevent storefront from applying "last purchase" default SKU/payment channel.
+      return hostname === 'gold.razer.com'
+        && pathname.startsWith('/api/rzusers/gold-catalog/webshop');
+    } catch (_) {
+      // Fallback for unexpected/invalid URLs.
+      const normalized = requestUrl.toLowerCase();
+      return normalized.includes('://gold.razer.com/api/rzusers/gold-catalog/webshop');
+    }
+  }
+
   static getPuppeteer() {
     return puppeteer;
   }
@@ -49,7 +70,14 @@ class AntibanService {
       await page.setRequestInterception(true);
       const requestHandler = (request) => {
         const resourceType = request.resourceType();
-        if (blockedResourceTypes.has(resourceType)) {
+        const requestUrl = request.url();
+        const shouldBlockByUrl = AntibanService.shouldBlockRequestByUrl(requestUrl);
+
+        if (blockedResourceTypes.has(resourceType) || shouldBlockByUrl) {
+          if (shouldBlockByUrl && !page.__loggedBlockedWebshopRequest) {
+            page.__loggedBlockedWebshopRequest = true;
+            logger.warn('Blocked webshop default-selection request to prevent auto-selecting last purchased card/payment.');
+          }
           request.abort();
         } else {
           request.continue();
