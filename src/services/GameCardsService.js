@@ -90,7 +90,9 @@ class GameCardsService {
           const bodyText = Buffer.concat(chunks).toString('utf8');
 
           if (statusCode < 200 || statusCode >= 300) {
-            reject(new Error(`Catalog API returned HTTP ${statusCode}`));
+            const bodyPreview = String(bodyText || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+            const details = bodyPreview ? ` body=${JSON.stringify(bodyPreview)}` : '';
+            reject(new Error(`Catalog API returned HTTP ${statusCode} for ${url}.${details}`));
             return;
           }
 

@@ -915,6 +915,45 @@ class PurchaseService {
       });
 
       if (cardsData.cards.length === 0) {
+        const diagnostics = await page.evaluate(() => {
+          const allRadios = Array.from(document.querySelectorAll('input[type="radio"]'));
+          const byName = allRadios.reduce((acc, radio) => {
+            const name = String(radio.getAttribute('name') || '(no-name)');
+            acc[name] = (acc[name] || 0) + 1;
+            return acc;
+          }, {});
+
+          const radioSamples = allRadios.slice(0, 8).map((radio) => {
+            const parent = radio.closest('label, div, li');
+            const text = parent ? String(parent.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+            return {
+              name: radio.getAttribute('name') || '',
+              id: radio.id || '',
+              value: radio.value || '',
+              disabled: !!radio.disabled,
+              text
+            };
+          });
+
+          const bodyText = String(document.body?.innerText || '').toLowerCase();
+
+          return {
+            pageUrl: location.href,
+            title: document.title,
+            selectionTileCount: document.querySelectorAll('.selection-tile').length,
+            webshopStepSkuCount: document.querySelectorAll('#webshop_step_sku *').length,
+            paymentAmountCount: document.querySelectorAll('input[name="paymentAmountItem"]').length,
+            paymentChannelCount: document.querySelectorAll('input[name="paymentChannelItem"]').length,
+            totalRadioCount: allRadios.length,
+            radioByName: byName,
+            hasLoginInputs: document.querySelectorAll('input[type="password"]').length > 0,
+            hasCaptchaHints: bodyText.includes('captcha') || bodyText.includes('verify you are human'),
+            hasOutOfStockText: bodyText.includes('out of stock'),
+            radioSamples
+          };
+        });
+
+        logger.warn('Card extraction diagnostics (no cards found)', diagnostics);
         throw new Error('No cards found. The page might not have loaded properly or the game might not be available.');
       }
 
