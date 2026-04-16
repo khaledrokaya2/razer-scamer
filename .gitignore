@@ -49,6 +49,7 @@ temp_pins/
 temp/
 *.txt
 *.md
+*.sh
 
 # Test coverage
 coverage/
