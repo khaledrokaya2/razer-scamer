@@ -59,8 +59,8 @@ class OrderFlowHandler {
       let cleaned = 0;
 
       for (const [chatId, session] of this.orderSessions.entries()) {
-        // CRITICAL: Skip processing orders (can take 1+ hours for large quantities or stock waiting)
-        if (session.step === 'processing' || session.step === 'checking_balance') {
+        // CRITICAL: Skip processing and cancelling orders (can take 1+ hours for large quantities or stock waiting)
+        if (session.step === 'processing' || session.step === 'checking_balance' || session.step === 'cancelling') {
           continue;
         }
 
@@ -124,11 +124,35 @@ class OrderFlowHandler {
   }
 
   /**
+   * Mark order as cancelling and keep the session locked until the running flow exits.
+   * @param {number} chatId - Chat ID
+   */
+  markAsCancelling(chatId) {
+    const session = this.getSession(chatId);
+
+    if (session) {
+      session.step = 'cancelling';
+      session.cancelRequested = true;
+      session.lastActivity = Date.now();
+    }
+
+    this.cancellationRequests.add(chatId);
+  }
+
+  /**
    * Clear cancellation flag
    * @param {number} chatId - Chat ID
    */
   clearCancellation(chatId) {
     this.cancellationRequests.delete(chatId);
+
+    const session = this.orderSessions.get(chatId);
+    if (session) {
+      delete session.cancelRequested;
+      if (session.step === 'cancelling') {
+        session.step = 'idle';
+      }
+    }
   }
 
   /**
@@ -371,75 +395,87 @@ class OrderFlowHandler {
    * @param {number} chatId - Chat ID
    */
   async handleCancel(bot, chatId, telegramUserId) {
-    // Mark as cancelled FIRST
-    this.markAsCancelled(chatId);
+    const session = this.getSession(chatId);
+    const hasActivePurchase = !!(session && (session.step === 'processing' || session.step === 'checking_balance' || session.step === 'cancelling'));
 
-    // Force close active purchase pages only (keep persistent browser session).
-    if (telegramUserId) {
-      const purchaseService = require('../services/PurchaseService');
+    if (hasActivePurchase) {
+      // Mark as cancelling FIRST and keep the session locked until the running flow exits.
+      this.markAsCancelling(chatId);
 
-      try {
-        // Close parallel purchase pages
-        const browsersClosed = await purchaseService.forceCloseUserBrowsers(telegramUserId);
-        if (browsersClosed > 0) {
-          logger.system(`Force closed ${browsersClosed} active purchase page(s) during cancel`);
+      // Force close active purchase pages only (keep persistent browser session).
+      if (telegramUserId) {
+        const purchaseService = require('../services/PurchaseService');
+
+        try {
+          // Close parallel purchase pages
+          const browsersClosed = await purchaseService.forceCloseUserBrowsers(telegramUserId);
+          if (browsersClosed > 0) {
+            logger.system(`Force closed ${browsersClosed} active purchase page(s) during cancel`);
+          }
+        } catch (err) {
+          logger.error('Error closing purchase pages during cancel:', err.message);
         }
+      }
+
+      // Delete menu/progress messages but do not clear the session yet.
+      const gameMenuMsgId = this.gameMenuMessages.get(chatId);
+      if (gameMenuMsgId) {
+        try {
+          await bot.deleteMessage(chatId, gameMenuMsgId);
+        } catch (delErr) {
+          logger.debug('Could not delete game menu message');
+        }
+      }
+
+      const cardMenuMsgId = this.cardMenuMessages.get(chatId);
+      if (cardMenuMsgId) {
+        try {
+          await bot.deleteMessage(chatId, cardMenuMsgId);
+        } catch (delErr) {
+          logger.debug('Could not delete card menu message');
+        }
+      }
+
+      const summaryMsgId = this.orderSummaryMessages.get(chatId);
+      if (summaryMsgId) {
+        try {
+          await bot.deleteMessage(chatId, summaryMsgId);
+        } catch (delErr) {
+          logger.debug('Could not delete order summary message');
+        }
+      }
+
+      const progressMsgId = this.progressMessages.get(chatId);
+      if (progressMsgId) {
+        try {
+          await bot.deleteMessage(chatId, progressMsgId);
+        } catch (delErr) {
+          logger.debug('Could not delete progress message');
+        }
+      }
+
+      const quantityPromptMsgId = this.quantityPromptMessages.get(chatId);
+      if (quantityPromptMsgId) {
+        try {
+          await bot.deleteMessage(chatId, quantityPromptMsgId);
+        } catch (delErr) {
+          logger.debug('Could not delete quantity prompt message');
+        }
+      }
+
+      try {
+        await bot.sendMessage(chatId,
+          `🛑 *Cancellation requested*\n\nThe active order is stopping now.`,
+          { parse_mode: 'Markdown' }
+        );
       } catch (err) {
-        logger.error('Error closing purchase pages during cancel:', err.message);
+        logger.error('Error sending cancel request message:', err);
       }
+
+      return;
     }
 
-    // Delete game menu message if exists
-    const gameMenuMsgId = this.gameMenuMessages.get(chatId);
-    if (gameMenuMsgId) {
-      try {
-        await bot.deleteMessage(chatId, gameMenuMsgId);
-      } catch (delErr) {
-        logger.debug('Could not delete game menu message');
-      }
-    }
-
-    // Delete card menu message if exists
-    const cardMenuMsgId = this.cardMenuMessages.get(chatId);
-    if (cardMenuMsgId) {
-      try {
-        await bot.deleteMessage(chatId, cardMenuMsgId);
-      } catch (delErr) {
-        logger.debug('Could not delete card menu message');
-      }
-    }
-
-    // Delete order summary message if exists
-    const summaryMsgId = this.orderSummaryMessages.get(chatId);
-    if (summaryMsgId) {
-      try {
-        await bot.deleteMessage(chatId, summaryMsgId);
-      } catch (delErr) {
-        logger.debug('Could not delete order summary message');
-      }
-    }
-
-    // Delete progress message if exists
-    const progressMsgId = this.progressMessages.get(chatId);
-    if (progressMsgId) {
-      try {
-        await bot.deleteMessage(chatId, progressMsgId);
-      } catch (delErr) {
-        logger.debug('Could not delete progress message');
-      }
-    }
-
-    // Delete quantity prompt message if exists
-    const quantityPromptMsgId = this.quantityPromptMessages.get(chatId);
-    if (quantityPromptMsgId) {
-      try {
-        await bot.deleteMessage(chatId, quantityPromptMsgId);
-      } catch (delErr) {
-        logger.debug('Could not delete quantity prompt message');
-      }
-    }
-
-    // Now clear session and maps
+    // No active purchase is running, so cancel the setup flow immediately.
     this.clearSession(chatId);
     this.clearCancellation(chatId);
     this.progressMessages.delete(chatId);
@@ -463,14 +499,14 @@ class OrderFlowHandler {
    */
   async handleCancelProcessing(bot, chatId, telegramUserId) {
     const session = this.getSession(chatId);
-    if (!session || session.step !== 'processing') {
+    if (!session || (session.step !== 'processing' && session.step !== 'cancelling')) {
       // Ignore stale callbacks from old messages.
       this.clearCancellation(chatId);
       return;
     }
 
-    // Mark as cancelled FIRST (stops new operations)
-    this.markAsCancelled(chatId);
+    // Mark as cancelling FIRST (stops new operations and keeps the order lock alive)
+    this.markAsCancelling(chatId);
 
     // Force close active purchase pages immediately (keep persistent browser alive)
     const purchaseService = require('../services/PurchaseService');

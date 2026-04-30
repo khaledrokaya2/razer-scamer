@@ -170,7 +170,7 @@ class TelegramBotController {
   getExclusiveOperation(chatId, telegramUserId) {
     const scopeKey = this.getScopeKey(telegramUserId);
     const orderSession = orderFlowHandler.getSession(chatId);
-    if (orderSession && (orderSession.step === 'processing' || orderSession.step === 'checking_balance')) {
+    if (orderSession && (orderSession.step === 'processing' || orderSession.step === 'checking_balance' || orderSession.step === 'cancelling')) {
       return {
         id: -1,
         type: 'purchase',
@@ -890,13 +890,13 @@ class TelegramBotController {
       // Check if there's an active purchase session BEFORE clearing
       const activeSession = orderFlowHandler.getSession(chatId);
       const hasActiveSession = !!activeSession;
-      const hasProcessingSession = !!(activeSession && (activeSession.step === 'processing' || activeSession.step === 'checking_balance'));
+      const hasProcessingSession = !!(activeSession && (activeSession.step === 'processing' || activeSession.step === 'checking_balance' || activeSession.step === 'cancelling'));
       const scopeKey = this.getScopeKey(telegramUserId);
 
       // Cancel any ongoing purchases FIRST (before clearing session)
       if (hasActiveSession || (activeOperation && activeOperation.type === 'purchase')) {
         // Mark as cancelled to stop purchase flow
-        orderFlowHandler.markAsCancelled(chatId);
+        orderFlowHandler.markAsCancelling(chatId);
 
         // Force close all active purchase pages/tabs only.
         const purchaseService = require('../services/PurchaseService');
@@ -924,27 +924,30 @@ class TelegramBotController {
         logger.info(`Cancelled transactions fetch for user ${telegramUserId}`);
       }
 
-      // Clear order flow session.
-      // Keep cancellation flag set while an active purchase operation/session is winding down,
-      // otherwise long-running loops can miss the cancel signal.
-      orderFlowHandler.clearSession(chatId);
+      // Clear order flow session only after the running order has fully stopped.
       if (!(hasProcessingSession || (activeOperation && activeOperation.type === 'purchase'))) {
+        orderFlowHandler.clearSession(chatId);
         orderFlowHandler.clearCancellation(chatId);
       }
 
-      // Clear order history pagination
-      orderHistoryHandler.reset(chatId);
+      // Clear auxiliary UI/session state only when no purchase is winding down.
+      if (!(hasProcessingSession || (activeOperation && activeOperation.type === 'purchase'))) {
+        orderHistoryHandler.reset(chatId);
 
-      // Clear session manager state
-      sessionManager.updateState(chatId, 'idle');
-      sessionManager.clearCredentials(chatId);
+        sessionManager.updateState(chatId, 'idle');
+        sessionManager.clearCredentials(chatId);
+      }
 
-      // Mark user immediately ready for new commands after cancellation.
-      this.clearUserOperation(telegramUserId, activeOperation ? activeOperation.id : null);
+      // Only release the user lock immediately if no purchase is winding down.
+      if (!(hasProcessingSession || (activeOperation && activeOperation.type === 'purchase'))) {
+        this.clearUserOperation(telegramUserId, activeOperation ? activeOperation.id : null);
+      }
 
       await this.bot.sendMessage(
         chatId,
-        '✅ *Cancelled*\nUse /start for new order.',
+        hasProcessingSession || (activeOperation && activeOperation.type === 'purchase')
+          ? '🛑 *Cancellation requested*\nThe active order is stopping now.'
+          : '✅ *Cancelled*\nUse /start for new order.',
         { parse_mode: 'Markdown' }
       );
     } catch (err) {
