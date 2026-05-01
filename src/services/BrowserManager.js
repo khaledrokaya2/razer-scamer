@@ -107,7 +107,15 @@ class BrowserManager {
 
       // Create new browser only when user has no live browser session.
       logger.system(`Creating new browser for key ${browserKey}`);
-      const browser = await this.launchBrowser();
+      
+      // For Bright Data: Use browser key as session ID to keep same IP for this user's browser lifetime
+      const proxySessionId = `user_${browserKey}`.replace(/[^a-zA-Z0-9_]/g, '_').substring(0, 32);
+      
+      const browser = await this.launchBrowser({
+        sessionId: proxySessionId, // Keep same IP for this user's entire session
+        country: process.env.PROXY_COUNTRY || null // Optional: geo-target
+      });
+      
       const existingPages = await browser.pages();
       const page = existingPages[0] || await browser.newPage();
 
@@ -132,7 +140,9 @@ class BrowserManager {
         isReady: false,
         proxyConfig: {
           username: process.env.PROXY_USERNAME || null,
-          password: process.env.PROXY_PASSWORD || null
+          password: process.env.PROXY_PASSWORD || null,
+          sessionId: proxySessionId,
+          country: process.env.PROXY_COUNTRY || null
         }
       });
 
@@ -204,13 +214,44 @@ class BrowserManager {
   }
 
   /**
+   * Build Bright Data proxy username with optional session and country targeting
+   * @param {Object} options - Options
+   * @param {string} options.baseUsername - Base username (e.g., brd-customer-hl_ba50512c-zone-residential_proxy1)
+   * @param {string} options.sessionId - Optional session ID to keep same IP (e.g., 'my_session_1')
+   * @param {string} options.country - Optional country code (e.g., 'us', 'gb', 'de')
+   * @returns {string} Complete proxy username with options
+   */
+  _buildBrightDataUsername(options = {}) {
+    let username = options.baseUsername || process.env.PROXY_USERNAME || '';
+    
+    // Add country targeting if specified
+    if (options.country) {
+      username += `-country-${options.country.toLowerCase()}`;
+    }
+    
+    // Add session ID to keep same IP for this browser session
+    if (options.sessionId) {
+      username += `-session-${options.sessionId}`;
+    }
+    
+    return username;
+  }
+
+  /**
    * Launch browser with optional proxy support
    * Supports both stealth mode (already enabled via AntibanService)
    * and proxy configuration for avoiding IP bans
+   * 
+   * For Bright Data proxies, supports:
+   * - Session IDs (keep same IP for browser lifetime)
+   * - Country targeting (e.g., -country-us)
+   * 
    * @param {Object} proxyConfig - Optional proxy configuration
    * @param {string} proxyConfig.url - Proxy URL (e.g., 'http://PROXY_IP:PORT')
    * @param {string} proxyConfig.username - Proxy username (optional)
    * @param {string} proxyConfig.password - Proxy password (optional)
+   * @param {string} proxyConfig.sessionId - Optional session ID for Bright Data (keeps same IP)
+   * @param {string} proxyConfig.country - Optional country code for Bright Data (e.g., 'us', 'gb')
    * @returns {Promise<Browser>} Puppeteer browser instance
    */
   async launchBrowser(proxyConfig = null) {
@@ -239,11 +280,23 @@ class BrowserManager {
     }
 
     // Get proxy config from parameter, env vars, or default to null
-    const proxy = proxyConfig || {
+    let proxy = proxyConfig || {
       url: process.env.PROXY_URL || null,
       username: process.env.PROXY_USERNAME || null,
-      password: process.env.PROXY_PASSWORD || null
+      password: process.env.PROXY_PASSWORD || null,
+      sessionId: process.env.PROXY_SESSION_ID || null,
+      country: process.env.PROXY_COUNTRY || null
     };
+
+    // Build complete Bright Data username if sessionId or country is specified
+    if (proxy.username && (proxy.sessionId || proxy.country)) {
+      proxy.username = this._buildBrightDataUsername({
+        baseUsername: proxy.username,
+        sessionId: proxy.sessionId,
+        country: proxy.country
+      });
+      logger.info(`Bright Data proxy configured with options: ${proxy.sessionId ? 'session=' + proxy.sessionId : ''}${proxy.country ? ' country=' + proxy.country : ''}`);
+    }
 
     const launchArgs = [
       '--no-sandbox',
