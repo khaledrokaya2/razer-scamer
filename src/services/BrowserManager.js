@@ -111,6 +111,14 @@ class BrowserManager {
       const existingPages = await browser.pages();
       const page = existingPages[0] || await browser.newPage();
 
+      // Apply proxy authentication if configured
+      if (process.env.PROXY_URL && process.env.PROXY_USERNAME && process.env.PROXY_PASSWORD) {
+        await page.authenticate({
+          username: process.env.PROXY_USERNAME,
+          password: process.env.PROXY_PASSWORD
+        });
+      }
+
       // Configure page with safe timeouts for reliability
       await setupPage(page);
       await page.setDefaultTimeout(45000);
@@ -121,7 +129,11 @@ class BrowserManager {
         page,
         lastActivity: Date.now(),
         inUse: false,
-        isReady: false
+        isReady: false,
+        proxyConfig: {
+          username: process.env.PROXY_USERNAME || null,
+          password: process.env.PROXY_PASSWORD || null
+        }
       });
 
       // Auto-recover if browser dies unexpectedly.
@@ -192,10 +204,16 @@ class BrowserManager {
   }
 
   /**
-   * Launch browser based on environment
+   * Launch browser with optional proxy support
+   * Supports both stealth mode (already enabled via AntibanService)
+   * and proxy configuration for avoiding IP bans
+   * @param {Object} proxyConfig - Optional proxy configuration
+   * @param {string} proxyConfig.url - Proxy URL (e.g., 'http://PROXY_IP:PORT')
+   * @param {string} proxyConfig.username - Proxy username (optional)
+   * @param {string} proxyConfig.password - Proxy password (optional)
    * @returns {Promise<Browser>} Puppeteer browser instance
    */
-  async launchBrowser() {
+  async launchBrowser(proxyConfig = null) {
     const configuredHeadlessMode = appConfig.browser.headlessMode;
     const headlessMode = configuredHeadlessMode ?? 'true';
 
@@ -220,6 +238,13 @@ class BrowserManager {
       resolvedHeadless = true;
     }
 
+    // Get proxy config from parameter, env vars, or default to null
+    const proxy = proxyConfig || {
+      url: process.env.PROXY_URL || null,
+      username: process.env.PROXY_USERNAME || null,
+      password: process.env.PROXY_PASSWORD || null
+    };
+
     const launchArgs = [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -237,12 +262,32 @@ class BrowserManager {
       '--js-flags=--max-old-space-size=256'
     ];
 
+    // OPTION 1: Add proxy support if proxy URL is configured
+    if (proxy.url) {
+      launchArgs.push(`--proxy-server=${proxy.url}`);
+      logger.info(`Browser launched with proxy: ${proxy.url}`);
+    }
+
+    // OPTION 2: Stealth mode is already enabled via AntibanService.getPuppeteer()
+    // which automatically patches browser fingerprints to avoid bot detection
 
     const browser = await puppeteer.launch({
       headless: resolvedHeadless,
       protocolTimeout: 180000,
       args: launchArgs
     });
+
+    // If proxy requires authentication, set it after browser creation
+    if (proxy.url && proxy.username && proxy.password) {
+      const pages = await browser.pages();
+      for (const page of pages) {
+        await page.authenticate({
+          username: proxy.username,
+          password: proxy.password
+        });
+      }
+      logger.debug(`Proxy authentication configured for browser`);
+    }
 
     return browser;
   }
