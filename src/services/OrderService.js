@@ -1,13 +1,13 @@
 /**
  * Order Service
- * 
+ *
  * Manages order creation, updates, and purchase tracking
  * Coordinates between database and purchase service
  */
 
-const purchaseService = require('./PurchaseService');
-const logger = require('../utils/logger');
-const appConfig = require('../config/app-config');
+const purchaseService = require("./PurchaseService");
+const logger = require("../utils/logger");
+const appConfig = require("../config/app-config");
 
 class OrderService {
   constructor() {
@@ -19,8 +19,8 @@ class OrderService {
     // CONCURRENCY FIX: Track active orders to prevent cleanup during processing
     this.activeOrders = new Set(); // Set of order IDs currently being processed
 
-    // Start automatic cleanup
-    this.startPinCleanup();
+    // OPTIMIZATION: Cleanup interval will start on demand when orders exist
+    this.cleanupInterval = null;
   }
 
   /**
@@ -37,9 +37,10 @@ class OrderService {
    * Start automatic cleanup of old pins
    * Runs every 30 minutes to remove pins older than 2 hours
    * CONCURRENCY FIX: Skips active orders to prevent data loss
+   * OPTIMIZATION: Only runs if there are active orders
    */
   startPinCleanup() {
-    setInterval(() => {
+    const cleanup = () => {
       const now = Date.now();
       let cleaned = 0;
       let skipped = 0;
@@ -60,10 +61,32 @@ class OrderService {
       }
 
       if (cleaned > 0 || skipped > 0) {
-        logger.order(`Cleanup: ${cleaned} old orders removed, ${skipped} active orders skipped`);
-        logger.order(`Memory: ${this.orderPins.size} orders, ${this.activeOrders.size} active`);
+        logger.order(
+          `Cleanup: ${cleaned} old orders removed, ${skipped} active orders skipped`,
+        );
+        logger.order(
+          `Memory: ${this.orderPins.size} orders, ${this.activeOrders.size} active`,
+        );
       }
-    }, appConfig.order.cleanupIntervalMs);
+
+      // Stop cleanup if no more active orders
+      if (this.activeOrders.size === 0 && this.orderPins.size === 0) {
+        logger.order("PIN cleanup stopped (no active orders)");
+        if (this.cleanupInterval) {
+          clearInterval(this.cleanupInterval);
+          this.cleanupInterval = null;
+        }
+      }
+    };
+
+    // Only start if not already running
+    if (!this.cleanupInterval) {
+      this.cleanupInterval = setInterval(
+        cleanup,
+        appConfig.order.cleanupIntervalMs,
+      );
+      logger.order("PIN cleanup started");
+    }
   }
 
   /**
@@ -73,7 +96,7 @@ class OrderService {
    */
   async createOrderSimple({ telegramUserId, gameName, cardName, cardsCount }) {
     try {
-      logger.order('Creating in-memory order...');
+      logger.order("Creating in-memory order...");
 
       const order = {
         id: this.generateOrderId(),
@@ -81,22 +104,21 @@ class OrderService {
         cards_count: cardsCount,
         card_value: cardName,
         game_name: gameName,
-        status: 'pending',
+        status: "pending",
         completed_purchases: 0,
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
       };
 
       // Initialize empty pins array for this order WITH TIMESTAMP
       this.orderPins.set(order.id, {
         pins: [],
-        timestamp: Date.now()
+        timestamp: Date.now(),
       });
 
       logger.success(`In-memory order created: ID ${order.id}`);
       return order;
-
     } catch (err) {
-      logger.error('Error creating order:', err);
+      logger.error("Error creating order:", err);
       throw err;
     }
   }
@@ -107,14 +129,14 @@ class OrderService {
    * @returns {Promise<Object>} Order result with pins
    */
   async processOrder({
-    telegramUserId,  // Changed from userId to telegramUserId
+    telegramUserId, // Changed from userId to telegramUserId
     gameName,
     gameUrl,
     cardName,
     cardIndex,
     quantity,
-    onProgress,  // UX FIX #16: Progress callback
-    checkCancellation  // Cancellation check callback
+    onProgress, // UX FIX #16: Progress callback
+    checkCancellation, // Cancellation check callback
   }) {
     let order = null;
 
@@ -124,19 +146,26 @@ class OrderService {
         telegramUserId,
         gameName,
         cardName,
-        cardsCount: quantity
+        cardsCount: quantity,
       });
 
       // CONCURRENCY FIX: Mark order as active to prevent cleanup
       this.activeOrders.add(order.id);
-      logger.order(`Order ${order.id} marked as active (total active: ${this.activeOrders.size})`);
+      logger.order(
+        `Order ${order.id} marked as active (total active: ${this.activeOrders.size})`,
+      );
 
-      logger.order(`\n${'='.repeat(60)}`);
+      // OPTIMIZATION: Start cleanup if not already running
+      if (!this.cleanupInterval) {
+        this.startPinCleanup();
+      }
+
+      logger.order(`\n${"=".repeat(60)}`);
       logger.order(`Processing Order #${order.id}`);
       logger.order(`   Game: ${gameName}`);
       logger.order(`   Card: ${cardName}`);
       logger.order(`   Quantity: ${quantity}`);
-      logger.order(`${'='.repeat(60)}\n`);
+      logger.order(`${"=".repeat(60)}\n`);
 
       // Step 2: Process purchases and keep per-card details in memory only.
       const purchases = await purchaseService.processBulkPurchases({
@@ -146,7 +175,7 @@ class OrderService {
         cardName,
         gameName,
         quantity,
-        onProgress,  // Telegram progress update
+        onProgress, // Telegram progress update
         checkCancellation,
         // Called after each card purchase (success or confirmed-but-failed)
         onCardCompleted: async (purchaseResult, cardNumber) => {
@@ -156,7 +185,9 @@ class OrderService {
 
             // Keep aggregate progress in memory only.
             order.completed_purchases += 1;
-            logger.order(`   Order progress: ${order.completed_purchases}/${order.cards_count}`);
+            logger.order(
+              `   Order progress: ${order.completed_purchases}/${order.cards_count}`,
+            );
 
             // Store card details in memory for sending PIN files at the end.
             const orderData = this.orderPins.get(order.id);
@@ -166,17 +197,21 @@ class OrderService {
                 serialNumber: purchaseResult.serialNumber,
                 transactionId: purchaseResult.transactionId,
                 success: isSuccess,
-                requiresManualCheck: purchaseResult.requiresManualCheck || !isSuccess,
+                requiresManualCheck:
+                  purchaseResult.requiresManualCheck || !isSuccess,
                 error: purchaseResult.error || null,
                 gameName: gameName,
-                cardValue: cardName
+                cardValue: cardName,
               });
             }
           } catch (trackErr) {
-            logger.error(`Failed to track card ${cardNumber} result:`, trackErr.message);
+            logger.error(
+              `Failed to track card ${cardNumber} result:`,
+              trackErr.message,
+            );
             // Don't throw - continue processing remaining cards
           }
-        }
+        },
       });
 
       // Step 3: Handle failed cards NOT already tracked via onCardCompleted.
@@ -193,15 +228,15 @@ class OrderService {
           const orderData = this.orderPins.get(order.id);
           if (orderData && orderData.pins) {
             orderData.pins.push({
-              pinCode: 'FAILED',
-              serialNumber: 'FAILED',
+              pinCode: "FAILED",
+              serialNumber: "FAILED",
               transactionId: purchase.transactionId || null,
               success: false,
               requiresManualCheck: true,
-              error: purchase.error || null,  // Preserve error message
+              error: purchase.error || null, // Preserve error message
               stage: purchase.stage || null,
               gameName: gameName,
-              cardValue: cardName
+              cardValue: cardName,
             });
           }
         }
@@ -211,72 +246,96 @@ class OrderService {
       // (Enrichment happens after purchase loop, so we need to update any PENDING pins with real data)
       const orderData = this.orderPins.get(order.id);
       if (orderData && orderData.pins && purchases.length > 0) {
-        for (let i = 0; i < purchases.length && i < orderData.pins.length; i++) {
+        for (
+          let i = 0;
+          i < purchases.length && i < orderData.pins.length;
+          i++
+        ) {
           const purchase = purchases[i];
           const storedPin = orderData.pins[i];
-          
+
           // If this purchase was enriched (has real pin now instead of PENDING), update the stored entry
-          if (purchase.pinCode && purchase.pinCode !== 'PENDING' && purchase.pinCode !== 'FAILED') {
+          if (
+            purchase.pinCode &&
+            purchase.pinCode !== "PENDING" &&
+            purchase.pinCode !== "FAILED"
+          ) {
             storedPin.pinCode = purchase.pinCode;
-            storedPin.serialNumber = purchase.serialNumber || '';
-            storedPin.transactionId = purchase.transactionId || '';
+            storedPin.serialNumber = purchase.serialNumber || "";
+            storedPin.transactionId = purchase.transactionId || "";
             storedPin.requiresManualCheck = false;
-            logger.debug(`Synced enriched pin for card ${i + 1}: ${purchase.pinCode.substring(0, 4)}...`);
+            logger.debug(
+              `Synced enriched pin for card ${i + 1}: ${purchase.pinCode.substring(0, 4)}...`,
+            );
           }
         }
       }
 
       // Step 4: Mark order as completed in memory.
-      order.status = 'completed';
+      order.status = "completed";
 
       logger.success(`Order #${order.id} completed successfully!`);
-      logger.order(`   Total purchases: ${order.completed_purchases}/${order.cards_count}`);
+      logger.order(
+        `   Total purchases: ${order.completed_purchases}/${order.cards_count}`,
+      );
       logger.order(`   Status: ${order.status}`);
 
       // CONCURRENCY FIX: Remove from active orders after completion
       this.activeOrders.delete(order.id);
-      logger.order(`Order ${order.id} marked as inactive (total active: ${this.activeOrders.size})`);
+      logger.order(
+        `Order ${order.id} marked as inactive (total active: ${this.activeOrders.size})`,
+      );
 
       return {
         order,
-        pins: (this.orderPins.get(order.id) && this.orderPins.get(order.id).pins) || []
+        pins:
+          (this.orderPins.get(order.id) && this.orderPins.get(order.id).pins) ||
+          [],
       };
-
     } catch (err) {
       // Log cancellations as info, other errors as error
-      if (err.message && err.message.includes('cancelled by user')) {
-        logger.info('Order processing cancelled:', err.message);
+      if (err.message && err.message.includes("cancelled by user")) {
+        logger.info("Order processing cancelled:", err.message);
       } else {
-        logger.error('Order processing failed:', err.message);
+        logger.error("Order processing failed:", err.message);
       }
 
       // CONCURRENCY FIX: Remove from active orders on ANY error
       if (order) {
         this.activeOrders.delete(order.id);
-        logger.order(`Order ${order.id} marked as inactive after error (total active: ${this.activeOrders.size})`);
+        logger.order(
+          `Order ${order.id} marked as inactive after error (total active: ${this.activeOrders.size})`,
+        );
       }
 
       // Handle cancellation - save what we have and return partial results
-      if (err.message && err.message.includes('cancelled by user')) {
-        logger.order('Processing cancellation - returning partial order...');
+      if (err.message && err.message.includes("cancelled by user")) {
+        logger.order("Processing cancellation - returning partial order...");
 
         if (order && err.purchases && err.purchases.length > 0) {
           // Results are already tracked in memory via onCardCompleted.
 
           // Mark partial order as completed in memory.
-          order.status = 'completed';
+          order.status = "completed";
 
-          logger.success(`Partial order saved: ${order.completed_purchases}/${order.cards_count} cards`);
+          logger.success(
+            `Partial order saved: ${order.completed_purchases}/${order.cards_count} cards`,
+          );
 
           // Return partial results
           err.partialOrder = {
             order,
-            pins: (this.orderPins.get(order.id) && this.orderPins.get(order.id).pins) || []
+            pins:
+              (this.orderPins.get(order.id) &&
+                this.orderPins.get(order.id).pins) ||
+              [],
           };
         } else if (order) {
           // No purchases completed, just mark as failed
-          order.status = 'failed';
-          logger.order(`Order #${order.id} cancelled with no completed purchases`);
+          order.status = "failed";
+          logger.order(
+            `Order #${order.id} cancelled with no completed purchases`,
+          );
         }
 
         throw err;
@@ -284,7 +343,7 @@ class OrderService {
 
       // Mark order as failed if it was created (for non-cancellation errors)
       if (order) {
-        order.status = 'failed';
+        order.status = "failed";
       }
 
       throw err;
@@ -298,10 +357,10 @@ class OrderService {
    * @returns {Array<string>} Array with single message (100 PINs won't exceed limit)
    */
   formatPinsPlain(pins) {
-    let message = '';
+    let message = "";
 
     pins.forEach((pin) => {
-      if (pin.pinCode === 'FAILED') {
+      if (pin.pinCode === "FAILED") {
         message += `FAILED\n`;
       } else {
         message += `\`${pin.pinCode}\`\n`;

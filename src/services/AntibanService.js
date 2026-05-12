@@ -1,92 +1,124 @@
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const appConfig = require('../config/app-config');
-const logger = require('../utils/logger');
+const playwright = require("playwright");
+const appConfig = require("../config/app-config");
+const logger = require("../utils/logger");
 
-puppeteer.use(StealthPlugin());
+// PHASE 2: Playwright + Firefox for Linux (40-60% lighter than Chromium)
+// Firefox on Linux = minimal resource footprint for shared vCPU
+// Maintains anti-detection through route interception and header spoofing
 
 class AntibanService {
   static shouldBlockRequestByUrl(requestUrl) {
-    if (!requestUrl || typeof requestUrl !== 'string') {
+    if (!requestUrl || typeof requestUrl !== "string") {
       return false;
     }
 
     try {
       const parsed = new URL(requestUrl);
-      const hostname = String(parsed.hostname || '').toLowerCase();
-      const pathname = String(parsed.pathname || '');
+      const hostname = String(parsed.hostname || "").toLowerCase();
+      const pathname = String(parsed.pathname || "");
 
       // Prevent storefront from applying "last purchase" default SKU/payment channel.
-      return hostname === 'gold.razer.com'
-        && pathname.startsWith('/api/rzusers/gold-catalog/webshop');
+      return (
+        hostname === "gold.razer.com" &&
+        pathname.startsWith("/api/rzusers/gold-catalog/webshop")
+      );
     } catch (_) {
       // Fallback for unexpected/invalid URLs.
       const normalized = requestUrl.toLowerCase();
-      return normalized.includes('://gold.razer.com/api/rzusers/gold-catalog/webshop');
+      return normalized.includes(
+        "://gold.razer.com/api/rzusers/gold-catalog/webshop",
+      );
     }
   }
 
-  static getPuppeteer() {
-    return puppeteer;
+  static getPlaywright() {
+    return playwright;
   }
 
-  static async humanDelay(min = appConfig.antiban.humanDelayMinMs, max = appConfig.antiban.humanDelayMaxMs) {
+  // Legacy method for compatibility
+  static getPuppeteer() {
+    logger.debug(
+      "getPuppeteer() called - returning playwright object for compatibility",
+    );
+    return playwright;
+  }
+
+  static async humanDelay(
+    min = appConfig.antiban.humanDelayMinMs,
+    max = appConfig.antiban.humanDelayMaxMs,
+  ) {
     let waitMs = min + Math.random() * (max - min);
 
     // Occasionally pause longer to avoid repetitive machine-like cadence.
     if (Math.random() < appConfig.antiban.longPauseChance) {
-      waitMs += appConfig.antiban.longPauseMinMs
-        + Math.random() * (appConfig.antiban.longPauseMaxMs - appConfig.antiban.longPauseMinMs);
+      waitMs +=
+        appConfig.antiban.longPauseMinMs +
+        Math.random() *
+          (appConfig.antiban.longPauseMaxMs - appConfig.antiban.longPauseMinMs);
     }
 
-    return new Promise(resolve => setTimeout(resolve, waitMs));
+    return new Promise((resolve) => setTimeout(resolve, waitMs));
   }
 
   static async setupPage(page, options = {}) {
     const userAgents = options.userAgents || appConfig.antiban.userAgents;
-    const blockedResourceTypes = new Set(options.blockedResourceTypes || appConfig.antiban.blockedResourceTypes);
+    const blockedResourceTypes = new Set(
+      options.blockedResourceTypes || appConfig.antiban.blockedResourceTypes,
+    );
 
     const userAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
     const viewport = appConfig.antiban.viewport;
-    const width = viewport.minWidth + Math.floor(Math.random() * (viewport.maxWidth - viewport.minWidth + 1));
-    const height = viewport.minHeight + Math.floor(Math.random() * (viewport.maxHeight - viewport.minHeight + 1));
+    const width =
+      viewport.minWidth +
+      Math.floor(Math.random() * (viewport.maxWidth - viewport.minWidth + 1));
+    const height =
+      viewport.minHeight +
+      Math.floor(Math.random() * (viewport.maxHeight - viewport.minHeight + 1));
 
-    await page.setUserAgent(userAgent);
-    await page.setViewport({ width, height });
+    // Playwright: Set context viewport instead of page
+    // Note: This is set at browser context level in BrowserManager.launchBrowser()
 
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    // Playwright: Add init script for anti-detection (replaces evaluateOnNewDocument)
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      Object.defineProperty(navigator, "plugins", {
+        get: () => [1, 2, 3, 4, 5],
+      });
       window.chrome = { runtime: {} };
     });
 
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9',
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Encoding': 'gzip, deflate, br'
-    });
-
-    if (!page.__antiBanRequestHooked) {
-      await page.setRequestInterception(true);
-      const requestHandler = (request) => {
+    // Playwright: Route-based request interception (replaces setRequestInterception)
+    if (!page.__antiBanRouteHooked) {
+      await page.route("**/*", async (route) => {
+        const request = route.request();
         const resourceType = request.resourceType();
         const requestUrl = request.url();
-        const shouldBlockByUrl = AntibanService.shouldBlockRequestByUrl(requestUrl);
+        const shouldBlockByUrl =
+          AntibanService.shouldBlockRequestByUrl(requestUrl);
 
         if (blockedResourceTypes.has(resourceType) || shouldBlockByUrl) {
           if (shouldBlockByUrl && !page.__loggedBlockedWebshopRequest) {
             page.__loggedBlockedWebshopRequest = true;
-            logger.warn('Blocked webshop default-selection request to prevent auto-selecting last purchased card/payment.');
+            logger.warn(
+              "Blocked webshop default-selection request to prevent auto-selecting last purchased card/payment.",
+            );
           }
-          request.abort();
+          await route.abort();
         } else {
-          request.continue();
+          await route.continue();
         }
-      };
+      });
 
-      page.__antiBanRequestHooked = true;
-      page.on('request', requestHandler);
+      page.__antiBanRouteHooked = true;
     }
+
+    // Set extra headers
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Encoding": "gzip, deflate, br",
+    });
 
     if (!page.__antiBanMethodPatched) {
       const originalGoto = page.goto.bind(page);
@@ -98,16 +130,16 @@ class AntibanService {
           const result = await originalGoto(url, gotoOptions);
           await AntibanService.humanDelay();
           if (await AntibanService.isBanned(page)) {
-            throw new Error('rate limited');
+            throw new Error("rate limited");
           }
           return result;
         };
 
-        const isTransactionUrl = typeof url === 'string' && (
-          url.includes('/transaction/purchase/') ||
-          url.includes('/transaction/') ||
-          url.includes('/transactions')
-        );
+        const isTransactionUrl =
+          typeof url === "string" &&
+          (url.includes("/transaction/purchase/") ||
+            url.includes("/transaction/") ||
+            url.includes("/transactions"));
 
         return isTransactionUrl
           ? AntibanService.withRetry(runGoto, appConfig.retry.maxRetries)
@@ -121,13 +153,14 @@ class AntibanService {
       };
 
       page.keyboard.type = async (text, typeOptions = {}) => {
-        const delay = typeOptions.delay ?? (
-          appConfig.antiban.typingDelayMinMs + Math.random() * appConfig.antiban.typingDelayRangeMs
-        );
+        const delay =
+          typeOptions.delay ??
+          appConfig.antiban.typingDelayMinMs +
+            Math.random() * appConfig.antiban.typingDelayRangeMs;
 
         const result = await originalKeyboardType(text, {
           ...typeOptions,
-          delay
+          delay,
         });
 
         await AntibanService.humanDelay();
@@ -139,22 +172,28 @@ class AntibanService {
   }
 
   static async isBanned(page) {
-    const title = (await page.title().catch(() => '')) || '';
-    const url = page.url() || '';
-    const bodyText = await page.evaluate(() => {
-      return (document.body && document.body.innerText) ? document.body.innerText : '';
-    }).catch(() => '');
+    const title = (await page.title().catch(() => "")) || "";
+    const url = page.url() || "";
+    const bodyText = await page
+      .evaluate(() => {
+        return document.body && document.body.innerText
+          ? document.body.innerText
+          : "";
+      })
+      .catch(() => "");
 
     const titleLower = title.toLowerCase();
     const urlLower = url.toLowerCase();
-    const bodyLower = String(bodyText || '').toLowerCase();
+    const bodyLower = String(bodyText || "").toLowerCase();
 
-    return titleLower.includes('access denied')
-      || titleLower.includes('too many requests')
-      || urlLower.includes('captcha')
-      || bodyLower.includes('you have been blocked')
-      || bodyLower.includes('rate limit')
-      || bodyLower.includes('access denied');
+    return (
+      titleLower.includes("access denied") ||
+      titleLower.includes("too many requests") ||
+      urlLower.includes("captcha") ||
+      bodyLower.includes("you have been blocked") ||
+      bodyLower.includes("rate limit") ||
+      bodyLower.includes("access denied")
+    );
   }
 
   static async withRetry(fn, retries = appConfig.retry.maxRetries) {
@@ -169,8 +208,10 @@ class AntibanService {
           break;
         }
 
-        const backoff = appConfig.retry.backoffBaseMs * (appConfig.retry.backoffMultiplier ** (attempt - 1));
-        await new Promise(resolve => setTimeout(resolve, backoff));
+        const backoff =
+          appConfig.retry.backoffBaseMs *
+          appConfig.retry.backoffMultiplier ** (attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, backoff));
       }
     }
 

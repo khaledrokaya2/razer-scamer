@@ -1,17 +1,17 @@
 /**
  * Database Service
- * 
+ *
  * Handles all database operations for the application.
  * Uses Azure SQL (MSSQL) for data persistence.
- * 
+ *
  * Simplified version - no user management
  * Stores orders and purchases with encrypted PINs
  */
 
-const sql = require('mssql');
-const { Order, Purchase } = require('../models/DatabaseModels');
-const encryptionService = require('../utils/encryption');
-const logger = require('../utils/logger');
+const sql = require("mssql");
+const { Order, Purchase } = require("../models/DatabaseModels");
+const encryptionService = require("../utils/encryption");
+const logger = require("../utils/logger");
 
 class DatabaseService {
   constructor() {
@@ -24,9 +24,9 @@ class DatabaseService {
     this.config = process.env.DB_CONNECTION_STRING;
 
     this.poolConfig = {
-      max: 10,        // Max 10 connections (max 5 users, 2 concurrent)
-      min: 2,         // Keep 2 connections alive
-      idleTimeoutMillis: 30000,  // Close idle connections after 30s
+      max: 3, // Max 3 connections (for 1-2 users)
+      min: 1, // Keep 1 connection alive
+      idleTimeoutMillis: 30000, // Close idle connections after 30s
       acquireTimeoutMillis: 30000, // Wait max 30s for connection
     };
 
@@ -38,9 +38,10 @@ class DatabaseService {
     this.parseConnectionString();
 
     // Shared-operator mode: all bot users read/write same credentials and backup codes.
-    this.SHARED_OPERATOR_USER_ID = process.env.GLOBAL_OPERATOR_USER_ID || '900000000000000001';
+    this.SHARED_OPERATOR_USER_ID =
+      process.env.GLOBAL_OPERATOR_USER_ID || "900000000000000001";
 
-    logger.database('Database pool configured: 2-10 connections');
+    logger.database("Database pool configured: 2-10 connections");
   }
 
   getSharedOperatorUserId() {
@@ -52,25 +53,33 @@ class DatabaseService {
   }
 
   isMissingUsedAtColumnError(err) {
-    return this.isMissingColumnError(err, 'used_at');
+    return this.isMissingColumnError(err, "used_at");
   }
 
   isMissingStatusColumnError(err) {
-    return this.isMissingColumnError(err, 'status');
+    return this.isMissingColumnError(err, "status");
   }
 
   isMissingIsUsedColumnError(err) {
-    return this.isMissingColumnError(err, 'is_used');
+    return this.isMissingColumnError(err, "is_used");
   }
 
   isMissingColumnError(err, columnName) {
-    const message = String((err && err.message) || '').toLowerCase();
-    return message.includes(`invalid column name '${String(columnName).toLowerCase()}'`)
-      || message.includes(`invalid column name "${String(columnName).toLowerCase()}"`);
+    const message = String((err && err.message) || "").toLowerCase();
+    return (
+      message.includes(
+        `invalid column name '${String(columnName).toLowerCase()}'`,
+      ) ||
+      message.includes(
+        `invalid column name "${String(columnName).toLowerCase()}"`,
+      )
+    );
   }
 
   logUsedAtFallback(opName) {
-    logger.warn(`[DB fallback] ${opName}: backup_codes.used_at is missing, using legacy status-only update. Run setup-database-new.sql to migrate schema.`);
+    logger.warn(
+      `[DB fallback] ${opName}: backup_codes.used_at is missing, using legacy status-only update. Run setup-database-new.sql to migrate schema.`,
+    );
   }
 
   /**
@@ -80,24 +89,24 @@ class DatabaseService {
     if (!this.config) return;
 
     const config = {};
-    const parts = this.config.split(';').filter(p => p.trim());
+    const parts = this.config.split(";").filter((p) => p.trim());
 
     for (const part of parts) {
-      const [key, value] = part.split('=').map(s => s.trim());
+      const [key, value] = part.split("=").map((s) => s.trim());
       if (key && value) {
         const lowerKey = key.toLowerCase();
-        if (lowerKey === 'server' || lowerKey === 'data source') {
+        if (lowerKey === "server" || lowerKey === "data source") {
           config.server = value;
-        } else if (lowerKey === 'database' || lowerKey === 'initial catalog') {
+        } else if (lowerKey === "database" || lowerKey === "initial catalog") {
           config.database = value;
-        } else if (lowerKey === 'user id' || lowerKey === 'uid') {
+        } else if (lowerKey === "user id" || lowerKey === "uid") {
           config.user = value;
-        } else if (lowerKey === 'password' || lowerKey === 'pwd') {
+        } else if (lowerKey === "password" || lowerKey === "pwd") {
           config.password = value;
-        } else if (lowerKey === 'encrypt') {
-          config.encrypt = value.toLowerCase() === 'true';
-        } else if (lowerKey === 'trustservercertificate') {
-          config.trustServerCertificate = value.toLowerCase() === 'true';
+        } else if (lowerKey === "encrypt") {
+          config.encrypt = value.toLowerCase() === "true";
+        } else if (lowerKey === "trustservercertificate") {
+          config.trustServerCertificate = value.toLowerCase() === "true";
         }
       }
     }
@@ -111,7 +120,7 @@ class DatabaseService {
       trustServerCertificate: config.trustServerCertificate || false,
       requestTimeout: 30000,
       connectionTimeout: 15000,
-      enableArithAbort: true
+      enableArithAbort: true,
     };
 
     this.parsedConfig = config;
@@ -123,32 +132,32 @@ class DatabaseService {
   async connect() {
     try {
       if (!this.pool) {
-        logger.database('Connecting to SQL Database (MonsterASP)...');
+        logger.database("Connecting to SQL Database (MonsterASP)...");
 
         // OPTIMIZATION: Use pre-parsed config
         if (!this.parsedConfig) {
-          throw new Error('Database configuration not parsed');
+          throw new Error("Database configuration not parsed");
         }
 
         // Create pool with pre-parsed config
         this.pool = new sql.ConnectionPool(this.parsedConfig);
 
         // Monitor pool health
-        this.pool.on('error', err => {
-          logger.error('Database pool error:', err);
+        this.pool.on("error", (err) => {
+          logger.error("Database pool error:", err);
           // Reset pool on critical errors
-          if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
-            logger.database('Resetting connection pool...');
+          if (err.code === "ECONNRESET" || err.code === "ETIMEDOUT") {
+            logger.database("Resetting connection pool...");
             this.pool = null;
           }
         });
 
         await this.pool.connect();
-        logger.success('Database connected (pool: 2-10 connections)');
+        logger.success("Database connected (pool: 2-10 connections)");
       }
       return this.pool;
     } catch (err) {
-      logger.error('Database connection failed:', err.message);
+      logger.error("Database connection failed:", err.message);
       throw err;
     }
   }
@@ -167,15 +176,15 @@ class DatabaseService {
     } catch (err) {
       // Transient errors that should be retried
       const isTransient =
-        err.code === 'ECONNRESET' ||
-        err.code === 'ETIMEDOUT' ||
-        err.code === 'ESOCKET' ||
-        err.message?.includes('timeout') ||
-        err.message?.includes('Connection is closed');
+        err.code === "ECONNRESET" ||
+        err.code === "ETIMEDOUT" ||
+        err.code === "ESOCKET" ||
+        err.message?.includes("timeout") ||
+        err.message?.includes("Connection is closed");
 
       if (isTransient && retries > 0) {
         logger.warn(`Transient DB error, retrying... (${retries} left)`);
-        await new Promise(resolve => setTimeout(resolve, this.RETRY_DELAY));
+        await new Promise((resolve) => setTimeout(resolve, this.RETRY_DELAY));
         return this.executeWithRetry(queryFn, retries - 1);
       }
       throw err;
@@ -194,12 +203,12 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .input('cards_count', sql.Int, cardsCount)
-        .input('card_value', sql.NVarChar(100), cardValue)
-        .input('game_name', sql.NVarChar(100), gameName)
-        .query(`
+      const result = await this.pool
+        .request()
+        .input("telegram_user_id", sql.BigInt, telegramUserId)
+        .input("cards_count", sql.Int, cardsCount)
+        .input("card_value", sql.NVarChar(100), cardValue)
+        .input("game_name", sql.NVarChar(100), gameName).query(`
           INSERT INTO orders (telegram_user_id, cards_count, card_value, game_name, status, completed_purchases)
           OUTPUT INSERTED.*
           VALUES (@telegram_user_id, @cards_count, @card_value, @game_name, 'pending', 0)
@@ -207,7 +216,7 @@ class DatabaseService {
 
       return new Order(result.recordset[0]);
     } catch (err) {
-      logger.error('Error creating order:', err);
+      logger.error("Error creating order:", err);
       throw err;
     }
   }
@@ -220,13 +229,16 @@ class DatabaseService {
   async getOrderById(orderId) {
     try {
       await this.connect();
-      const result = await this.pool.request()
-        .input('id', sql.Int, orderId)
-        .query('SELECT * FROM orders WHERE id = @id');
+      const result = await this.pool
+        .request()
+        .input("id", sql.Int, orderId)
+        .query("SELECT * FROM orders WHERE id = @id");
 
-      return result.recordset.length > 0 ? new Order(result.recordset[0]) : null;
+      return result.recordset.length > 0
+        ? new Order(result.recordset[0])
+        : null;
     } catch (err) {
-      logger.error('Error getting order:', err);
+      logger.error("Error getting order:", err);
       throw err;
     }
   }
@@ -241,11 +253,11 @@ class DatabaseService {
   async getUserOrdersPaginated(telegramUserId, limit, offset) {
     try {
       await this.connect();
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .input('limit', sql.Int, limit)
-        .input('offset', sql.Int, offset)
-        .query(`
+      const result = await this.pool
+        .request()
+        .input("telegram_user_id", sql.BigInt, telegramUserId)
+        .input("limit", sql.Int, limit)
+        .input("offset", sql.Int, offset).query(`
           SELECT * FROM orders 
           WHERE telegram_user_id = @telegram_user_id 
           ORDER BY created_at DESC
@@ -253,9 +265,9 @@ class DatabaseService {
           FETCH NEXT @limit ROWS ONLY
         `);
 
-      return result.recordset.map(row => new Order(row));
+      return result.recordset.map((row) => new Order(row));
     } catch (err) {
-      logger.error('Error getting paginated orders:', err);
+      logger.error("Error getting paginated orders:", err);
       throw err;
     }
   }
@@ -268,13 +280,16 @@ class DatabaseService {
   async getUserOrderCount(telegramUserId) {
     try {
       await this.connect();
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .query('SELECT COUNT(*) as count FROM orders WHERE telegram_user_id = @telegram_user_id');
+      const result = await this.pool
+        .request()
+        .input("telegram_user_id", sql.BigInt, telegramUserId)
+        .query(
+          "SELECT COUNT(*) as count FROM orders WHERE telegram_user_id = @telegram_user_id",
+        );
 
       return result.recordset[0].count;
     } catch (err) {
-      logger.error('Error getting order count:', err);
+      logger.error("Error getting order count:", err);
       throw err;
     }
   }
@@ -290,11 +305,11 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const result = await this.pool.request()
-        .input('id', sql.Int, orderId)
-        .input('status', sql.NVarChar(50), status)
-        .input('count', sql.Int, purchaseCount)
-        .query(`
+      const result = await this.pool
+        .request()
+        .input("id", sql.Int, orderId)
+        .input("status", sql.NVarChar(50), status)
+        .input("count", sql.Int, purchaseCount).query(`
           UPDATE orders 
           SET status = @status, completed_purchases = @count
           OUTPUT INSERTED.*
@@ -303,7 +318,7 @@ class DatabaseService {
 
       return new Order(result.recordset[0]);
     } catch (err) {
-      logger.error('Error updating order status with count:', err);
+      logger.error("Error updating order status with count:", err);
       throw err;
     }
   }
@@ -318,10 +333,10 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const result = await this.pool.request()
-        .input('id', sql.Int, orderId)
-        .input('status', sql.NVarChar(50), status)
-        .query(`
+      const result = await this.pool
+        .request()
+        .input("id", sql.Int, orderId)
+        .input("status", sql.NVarChar(50), status).query(`
           UPDATE orders 
           SET status = @status
           OUTPUT INSERTED.*
@@ -330,7 +345,7 @@ class DatabaseService {
 
       return new Order(result.recordset[0]);
     } catch (err) {
-      logger.error('Error updating order status:', err);
+      logger.error("Error updating order status:", err);
       throw err;
     }
   }
@@ -344,8 +359,7 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const result = await this.pool.request()
-        .input('id', sql.Int, orderId)
+      const result = await this.pool.request().input("id", sql.Int, orderId)
         .query(`
           UPDATE orders 
           SET completed_purchases = completed_purchases + 1
@@ -355,7 +369,7 @@ class DatabaseService {
 
       return new Order(result.recordset[0]);
     } catch (err) {
-      logger.error('Error incrementing order progress:', err);
+      logger.error("Error incrementing order progress:", err);
       throw err;
     }
   }
@@ -368,13 +382,16 @@ class DatabaseService {
   async getOrderPurchases(orderId) {
     try {
       await this.connect();
-      const result = await this.pool.request()
-        .input('order_id', sql.Int, orderId)
-        .query('SELECT * FROM purchases WHERE order_id = @order_id ORDER BY card_number ASC');
+      const result = await this.pool
+        .request()
+        .input("order_id", sql.Int, orderId)
+        .query(
+          "SELECT * FROM purchases WHERE order_id = @order_id ORDER BY card_number ASC",
+        );
 
-      return result.recordset.map(row => new Purchase(row));
+      return result.recordset.map((row) => new Purchase(row));
     } catch (err) {
-      logger.error('Error getting order purchases:', err);
+      logger.error("Error getting order purchases:", err);
       throw err;
     }
   }
@@ -384,24 +401,35 @@ class DatabaseService {
    * @param {Object} purchaseData - {orderId, transactionId, cardNumber, status, pinCode, serialNumber, gameName, cardValue}
    * @returns {Promise<Purchase>} Created purchase
    */
-  async createPurchaseWithEncryptedPin({ orderId, transactionId, cardNumber, status = 'pending', pinCode, serialNumber, gameName, cardValue }) {
+  async createPurchaseWithEncryptedPin({
+    orderId,
+    transactionId,
+    cardNumber,
+    status = "pending",
+    pinCode,
+    serialNumber,
+    gameName,
+    cardValue,
+  }) {
     try {
       await this.connect();
 
       // Encrypt PIN and serial number if provided
       const encryptedPin = pinCode ? encryptionService.encrypt(pinCode) : null;
-      const encryptedSerial = serialNumber ? encryptionService.encrypt(serialNumber) : null;
+      const encryptedSerial = serialNumber
+        ? encryptionService.encrypt(serialNumber)
+        : null;
 
-      const result = await this.pool.request()
-        .input('order_id', sql.Int, orderId)
-        .input('razer_transaction_id', sql.NVarChar(100), transactionId)
-        .input('card_number', sql.Int, cardNumber)
-        .input('status', sql.NVarChar(20), status)
-        .input('pin_encrypted', sql.NVarChar(500), encryptedPin)
-        .input('serial_number_encrypted', sql.NVarChar(500), encryptedSerial)
-        .input('game_name', sql.NVarChar(100), gameName)
-        .input('card_value', sql.NVarChar(100), cardValue)
-        .query(`
+      const result = await this.pool
+        .request()
+        .input("order_id", sql.Int, orderId)
+        .input("razer_transaction_id", sql.NVarChar(100), transactionId)
+        .input("card_number", sql.Int, cardNumber)
+        .input("status", sql.NVarChar(20), status)
+        .input("pin_encrypted", sql.NVarChar(500), encryptedPin)
+        .input("serial_number_encrypted", sql.NVarChar(500), encryptedSerial)
+        .input("game_name", sql.NVarChar(100), gameName)
+        .input("card_value", sql.NVarChar(100), cardValue).query(`
           INSERT INTO purchases (order_id, razer_transaction_id, card_number, status, pin_encrypted, serial_number_encrypted, game_name, card_value, purchased_at)
           OUTPUT INSERTED.*
           VALUES (@order_id, @razer_transaction_id, @card_number, @status, @pin_encrypted, @serial_number_encrypted, @game_name, @card_value, SYSUTCDATETIME())
@@ -409,7 +437,7 @@ class DatabaseService {
 
       return new Purchase(result.recordset[0]);
     } catch (err) {
-      logger.error('Error creating purchase with encrypted PIN:', err);
+      logger.error("Error creating purchase with encrypted PIN:", err);
       throw err;
     }
   }
@@ -424,10 +452,10 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const result = await this.pool.request()
-        .input('id', sql.Int, purchaseId)
-        .input('status', sql.NVarChar(20), status)
-        .query(`
+      const result = await this.pool
+        .request()
+        .input("id", sql.Int, purchaseId)
+        .input("status", sql.NVarChar(20), status).query(`
           UPDATE purchases 
           SET status = @status
           OUTPUT INSERTED.*
@@ -436,7 +464,7 @@ class DatabaseService {
 
       return new Purchase(result.recordset[0]);
     } catch (err) {
-      logger.error('Error updating purchase status:', err);
+      logger.error("Error updating purchase status:", err);
       throw err;
     }
   }
@@ -452,16 +480,19 @@ class DatabaseService {
   async getUserByTelegramId(telegramUserId) {
     try {
       await this.connect();
-      const { User } = require('../models/DatabaseModels');
+      const { User } = require("../models/DatabaseModels");
       const scopedUserId = this.normalizeSharedOperatorId();
 
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, scopedUserId)
-        .query('SELECT * FROM user_accounts WHERE telegram_user_id = @telegram_user_id');
+      const result = await this.pool
+        .request()
+        .input("telegram_user_id", sql.BigInt, scopedUserId)
+        .query(
+          "SELECT * FROM user_accounts WHERE telegram_user_id = @telegram_user_id",
+        );
 
       return result.recordset.length > 0 ? new User(result.recordset[0]) : null;
     } catch (err) {
-      logger.error('Error getting user:', err);
+      logger.error("Error getting user:", err);
       throw err;
     }
   }
@@ -476,14 +507,18 @@ class DatabaseService {
       const user = await this.getUserByTelegramId(telegramUserId);
       if (!user) return null;
 
-      const encryption = require('../utils/encryption');
+      const encryption = require("../utils/encryption");
 
       return {
-        email: user.email_encrypted ? encryption.decrypt(user.email_encrypted) : null,
-        password: user.password_encrypted ? encryption.decrypt(user.password_encrypted) : null
+        email: user.email_encrypted
+          ? encryption.decrypt(user.email_encrypted)
+          : null,
+        password: user.password_encrypted
+          ? encryption.decrypt(user.password_encrypted)
+          : null,
       };
     } catch (err) {
-      logger.error('Error getting user credentials:', err);
+      logger.error("Error getting user credentials:", err);
       throw err;
     }
   }
@@ -505,17 +540,17 @@ class DatabaseService {
       // Create user account with username based on telegram_user_id
       const username = `user_${scopedUserId}`;
 
-      await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, scopedUserId)
-        .input('username', sql.NVarChar(50), username)
-        .query(`
+      await this.pool
+        .request()
+        .input("telegram_user_id", sql.BigInt, scopedUserId)
+        .input("username", sql.NVarChar(50), username).query(`
           INSERT INTO user_accounts (telegram_user_id, username, created_at)
           VALUES (@telegram_user_id, @username, GETDATE())
         `);
 
       logger.info(`Created shared operator user account: ${scopedUserId}`);
     } catch (err) {
-      logger.error('Error ensuring user exists:', err);
+      logger.error("Error ensuring user exists:", err);
       throw err;
     }
   }
@@ -530,7 +565,7 @@ class DatabaseService {
   async saveUserCredentials(telegramUserId, emailEncrypted, passwordEncrypted) {
     try {
       await this.connect();
-      const { User } = require('../models/DatabaseModels');
+      const { User } = require("../models/DatabaseModels");
       const scopedUserId = this.normalizeSharedOperatorId();
 
       // Check if user exists
@@ -538,10 +573,11 @@ class DatabaseService {
 
       if (existingUser) {
         // Update existing user
-        const result = await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, scopedUserId)
-          .input('email_encrypted', sql.NVarChar(500), emailEncrypted)
-          .input('password_encrypted', sql.NVarChar(500), passwordEncrypted)
+        const result = await this.pool
+          .request()
+          .input("telegram_user_id", sql.BigInt, scopedUserId)
+          .input("email_encrypted", sql.NVarChar(500), emailEncrypted)
+          .input("password_encrypted", sql.NVarChar(500), passwordEncrypted)
           .query(`
             UPDATE user_accounts 
             SET email_encrypted = @email_encrypted, 
@@ -556,10 +592,11 @@ class DatabaseService {
         await this.ensureUserExists(scopedUserId);
 
         // Now update with credentials
-        const result = await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, scopedUserId)
-          .input('email_encrypted', sql.NVarChar(500), emailEncrypted)
-          .input('password_encrypted', sql.NVarChar(500), passwordEncrypted)
+        const result = await this.pool
+          .request()
+          .input("telegram_user_id", sql.BigInt, scopedUserId)
+          .input("email_encrypted", sql.NVarChar(500), emailEncrypted)
+          .input("password_encrypted", sql.NVarChar(500), passwordEncrypted)
           .query(`
             UPDATE user_accounts 
             SET email_encrypted = @email_encrypted, 
@@ -571,7 +608,7 @@ class DatabaseService {
         return new User(result.recordset[0]);
       }
     } catch (err) {
-      logger.error('Error saving user credentials:', err);
+      logger.error("Error saving user credentials:", err);
       throw err;
     }
   }
@@ -586,9 +623,9 @@ class DatabaseService {
       await this.connect();
       const scopedUserId = this.normalizeSharedOperatorId();
 
-      await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, scopedUserId)
-        .query(`
+      await this.pool
+        .request()
+        .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
           UPDATE user_accounts 
           SET email_encrypted = NULL, password_encrypted = NULL 
           WHERE telegram_user_id = @telegram_user_id
@@ -596,7 +633,7 @@ class DatabaseService {
 
       return true;
     } catch (err) {
-      logger.error('Error deleting user credentials:', err);
+      logger.error("Error deleting user credentials:", err);
       throw err;
     }
   }
@@ -621,9 +658,9 @@ class DatabaseService {
 
       // First, deactivate all existing active codes (schema-compatible fallback chain)
       try {
-        await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, scopedUserId)
-          .query(`
+        await this.pool
+          .request()
+          .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
             UPDATE dbo.backup_codes
             SET status = 'expired'
             WHERE telegram_user_id = @telegram_user_id AND status = 'active'
@@ -633,11 +670,11 @@ class DatabaseService {
           throw err;
         }
 
-        this.logUsedAtFallback('saveBackupCodes deactivate/status');
+        this.logUsedAtFallback("saveBackupCodes deactivate/status");
         try {
-          await this.pool.request()
-            .input('telegram_user_id', sql.BigInt, scopedUserId)
-            .query(`
+          await this.pool
+            .request()
+            .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
               UPDATE dbo.backup_codes
               SET is_used = 1
               WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
@@ -648,9 +685,9 @@ class DatabaseService {
           }
 
           try {
-            await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 UPDATE dbo.backup_codes
                 SET used_at = SYSUTCDATETIME()
                 WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
@@ -661,9 +698,9 @@ class DatabaseService {
             }
 
             // Last resort legacy schema: clear all and reinsert fresh set.
-            await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 DELETE FROM dbo.backup_codes
                 WHERE telegram_user_id = @telegram_user_id
               `);
@@ -676,10 +713,10 @@ class DatabaseService {
         const codeEncrypted = encryptionService.encrypt(code);
 
         try {
-          await this.pool.request()
-            .input('telegram_user_id', sql.BigInt, scopedUserId)
-            .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
-            .query(`
+          await this.pool
+            .request()
+            .input("telegram_user_id", sql.BigInt, scopedUserId)
+            .input("code_encrypted", sql.NVarChar(500), codeEncrypted).query(`
               INSERT INTO dbo.backup_codes (telegram_user_id, code_encrypted, status)
               VALUES (@telegram_user_id, @code_encrypted, 'active')
             `);
@@ -689,10 +726,10 @@ class DatabaseService {
           }
 
           try {
-            await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
-              .query(`
+            await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId)
+              .input("code_encrypted", sql.NVarChar(500), codeEncrypted).query(`
                 INSERT INTO dbo.backup_codes (telegram_user_id, code_encrypted, is_used)
                 VALUES (@telegram_user_id, @code_encrypted, 0)
               `);
@@ -702,9 +739,10 @@ class DatabaseService {
             }
 
             try {
-              await this.pool.request()
-                .input('telegram_user_id', sql.BigInt, scopedUserId)
-                .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
+              await this.pool
+                .request()
+                .input("telegram_user_id", sql.BigInt, scopedUserId)
+                .input("code_encrypted", sql.NVarChar(500), codeEncrypted)
                 .query(`
                   INSERT INTO dbo.backup_codes (telegram_user_id, code_encrypted, used_at)
                   VALUES (@telegram_user_id, @code_encrypted, NULL)
@@ -714,9 +752,10 @@ class DatabaseService {
                 throw usedAtErr;
               }
 
-              await this.pool.request()
-                .input('telegram_user_id', sql.BigInt, scopedUserId)
-                .input('code_encrypted', sql.NVarChar(500), codeEncrypted)
+              await this.pool
+                .request()
+                .input("telegram_user_id", sql.BigInt, scopedUserId)
+                .input("code_encrypted", sql.NVarChar(500), codeEncrypted)
                 .query(`
                   INSERT INTO dbo.backup_codes (telegram_user_id, code_encrypted)
                   VALUES (@telegram_user_id, @code_encrypted)
@@ -726,10 +765,12 @@ class DatabaseService {
         }
       }
 
-      logger.database(`Saved ${codes.length} backup codes for shared operator ${scopedUserId}`);
+      logger.database(
+        `Saved ${codes.length} backup codes for shared operator ${scopedUserId}`,
+      );
       return codes.length;
     } catch (err) {
-      logger.error('Error saving backup codes:', err);
+      logger.error("Error saving backup codes:", err);
       throw err;
     }
   }
@@ -746,9 +787,9 @@ class DatabaseService {
 
       let result;
       try {
-        result = await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, scopedUserId)
-          .query(`
+        result = await this.pool
+          .request()
+          .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
             SELECT TOP 1 id, code_encrypted
             FROM dbo.backup_codes
             WHERE telegram_user_id = @telegram_user_id AND status = 'active'
@@ -760,9 +801,9 @@ class DatabaseService {
         }
 
         try {
-          result = await this.pool.request()
-            .input('telegram_user_id', sql.BigInt, scopedUserId)
-            .query(`
+          result = await this.pool
+            .request()
+            .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
               SELECT TOP 1 id, code_encrypted
               FROM dbo.backup_codes
               WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
@@ -774,9 +815,9 @@ class DatabaseService {
           }
 
           try {
-            result = await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            result = await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 SELECT TOP 1 id, code_encrypted
                 FROM dbo.backup_codes
                 WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
@@ -787,9 +828,9 @@ class DatabaseService {
               throw usedAtErr;
             }
 
-            result = await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            result = await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 SELECT TOP 1 id, code_encrypted
                 FROM dbo.backup_codes
                 WHERE telegram_user_id = @telegram_user_id
@@ -806,7 +847,7 @@ class DatabaseService {
       const codeEncrypted = result.recordset[0].code_encrypted;
       return encryptionService.decrypt(codeEncrypted);
     } catch (err) {
-      logger.error('Error getting backup code:', err);
+      logger.error("Error getting backup code:", err);
       throw err;
     }
   }
@@ -824,9 +865,9 @@ class DatabaseService {
 
       let result;
       try {
-        result = await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, scopedUserId)
-          .query(`
+        result = await this.pool
+          .request()
+          .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
             ;WITH next_code AS (
               SELECT TOP (1) id, code_encrypted, status, used_at
               FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
@@ -838,17 +879,23 @@ class DatabaseService {
             OUTPUT inserted.id, inserted.code_encrypted;
           `);
       } catch (err) {
-        if (!this.isMissingUsedAtColumnError(err) && !this.isMissingStatusColumnError(err)) {
+        if (
+          !this.isMissingUsedAtColumnError(err) &&
+          !this.isMissingStatusColumnError(err)
+        ) {
           throw err;
         }
 
-        this.logUsedAtFallback('reserveNextBackupCode');
+        this.logUsedAtFallback("reserveNextBackupCode");
 
         // Fallback 1: status exists, used_at missing
-        if (this.isMissingUsedAtColumnError(err) && !this.isMissingStatusColumnError(err)) {
-          result = await this.pool.request()
-            .input('telegram_user_id', sql.BigInt, scopedUserId)
-            .query(`
+        if (
+          this.isMissingUsedAtColumnError(err) &&
+          !this.isMissingStatusColumnError(err)
+        ) {
+          result = await this.pool
+            .request()
+            .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
               ;WITH next_code AS (
                 SELECT TOP (1) id, code_encrypted, status
                 FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
@@ -862,9 +909,9 @@ class DatabaseService {
         } else {
           // Fallback 2: status missing -> legacy is_used/used_at/no-flag schemas
           try {
-            result = await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            result = await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 ;WITH next_code AS (
                   SELECT TOP (1) id, code_encrypted, is_used, used_at
                   FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
@@ -876,14 +923,17 @@ class DatabaseService {
                 OUTPUT inserted.id, inserted.code_encrypted;
               `);
           } catch (legacyErr) {
-            if (!this.isMissingUsedAtColumnError(legacyErr) && !this.isMissingIsUsedColumnError(legacyErr)) {
+            if (
+              !this.isMissingUsedAtColumnError(legacyErr) &&
+              !this.isMissingIsUsedColumnError(legacyErr)
+            ) {
               throw legacyErr;
             }
 
             try {
-              result = await this.pool.request()
-                .input('telegram_user_id', sql.BigInt, scopedUserId)
-                .query(`
+              result = await this.pool
+                .request()
+                .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                   ;WITH next_code AS (
                     SELECT TOP (1) id, code_encrypted, is_used
                     FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
@@ -900,9 +950,9 @@ class DatabaseService {
               }
 
               try {
-                result = await this.pool.request()
-                  .input('telegram_user_id', sql.BigInt, scopedUserId)
-                  .query(`
+                result = await this.pool
+                  .request()
+                  .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                     ;WITH next_code AS (
                       SELECT TOP (1) id, code_encrypted, used_at
                       FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
@@ -919,9 +969,9 @@ class DatabaseService {
                 }
 
                 // Last-resort old schema: consume by deleting one row and output deleted payload.
-                result = await this.pool.request()
-                  .input('telegram_user_id', sql.BigInt, scopedUserId)
-                  .query(`
+                result = await this.pool
+                  .request()
+                  .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                     ;WITH next_code AS (
                       SELECT TOP (1) id, code_encrypted
                       FROM dbo.backup_codes WITH (UPDLOCK, READPAST, ROWLOCK)
@@ -944,10 +994,10 @@ class DatabaseService {
       const row = result.recordset[0];
       return {
         id: row.id,
-        code: encryptionService.decrypt(row.code_encrypted)
+        code: encryptionService.decrypt(row.code_encrypted),
       };
     } catch (err) {
-      logger.error('Error reserving backup code:', err);
+      logger.error("Error reserving backup code:", err);
       throw err;
     }
   }
@@ -965,23 +1015,26 @@ class DatabaseService {
       // Mark the oldest active code as used
       let result;
       try {
-        result = await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, scopedUserId)
-          .query(`
+        result = await this.pool
+          .request()
+          .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
             UPDATE TOP (1) dbo.backup_codes
             SET status = 'used', used_at = SYSUTCDATETIME()
             WHERE telegram_user_id = @telegram_user_id AND status = 'active'
           `);
       } catch (err) {
-        if (!this.isMissingUsedAtColumnError(err) && !this.isMissingStatusColumnError(err)) {
+        if (
+          !this.isMissingUsedAtColumnError(err) &&
+          !this.isMissingStatusColumnError(err)
+        ) {
           throw err;
         }
 
-        this.logUsedAtFallback('markBackupCodeAsUsed');
+        this.logUsedAtFallback("markBackupCodeAsUsed");
         try {
-          result = await this.pool.request()
-            .input('telegram_user_id', sql.BigInt, scopedUserId)
-            .query(`
+          result = await this.pool
+            .request()
+            .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
               UPDATE TOP (1) dbo.backup_codes
               SET status = 'used'
               WHERE telegram_user_id = @telegram_user_id AND status = 'active'
@@ -992,9 +1045,9 @@ class DatabaseService {
           }
 
           try {
-            result = await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            result = await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 UPDATE TOP (1) dbo.backup_codes
                 SET is_used = 1
                 WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
@@ -1005,9 +1058,9 @@ class DatabaseService {
             }
 
             try {
-              result = await this.pool.request()
-                .input('telegram_user_id', sql.BigInt, scopedUserId)
-                .query(`
+              result = await this.pool
+                .request()
+                .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                   UPDATE TOP (1) dbo.backup_codes
                   SET used_at = SYSUTCDATETIME()
                   WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
@@ -1017,9 +1070,9 @@ class DatabaseService {
                 throw usedAtErr;
               }
 
-              result = await this.pool.request()
-                .input('telegram_user_id', sql.BigInt, scopedUserId)
-                .query(`
+              result = await this.pool
+                .request()
+                .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                   DELETE TOP (1)
                   FROM dbo.backup_codes
                   WHERE telegram_user_id = @telegram_user_id
@@ -1031,7 +1084,7 @@ class DatabaseService {
 
       return result.rowsAffected[0] > 0;
     } catch (err) {
-      logger.error('Error marking backup code as used:', err);
+      logger.error("Error marking backup code as used:", err);
       throw err;
     }
   }
@@ -1049,9 +1102,9 @@ class DatabaseService {
 
       let result;
       try {
-        result = await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, scopedUserId)
-          .query(`
+        result = await this.pool
+          .request()
+          .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
             SELECT id, code_encrypted
             FROM dbo.backup_codes
             WHERE telegram_user_id = @telegram_user_id AND status = 'active'
@@ -1063,9 +1116,9 @@ class DatabaseService {
         }
 
         try {
-          result = await this.pool.request()
-            .input('telegram_user_id', sql.BigInt, scopedUserId)
-            .query(`
+          result = await this.pool
+            .request()
+            .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
               SELECT id, code_encrypted
               FROM dbo.backup_codes
               WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
@@ -1077,9 +1130,9 @@ class DatabaseService {
           }
 
           try {
-            result = await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            result = await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 SELECT id, code_encrypted
                 FROM dbo.backup_codes
                 WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
@@ -1090,9 +1143,9 @@ class DatabaseService {
               throw usedAtErr;
             }
 
-            result = await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            result = await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 SELECT id, code_encrypted
                 FROM dbo.backup_codes
                 WHERE telegram_user_id = @telegram_user_id
@@ -1102,12 +1155,12 @@ class DatabaseService {
         }
       }
 
-      return result.recordset.map(row => ({
+      return result.recordset.map((row) => ({
         id: row.id,
-        code: encryptionService.decrypt(row.code_encrypted)
+        code: encryptionService.decrypt(row.code_encrypted),
       }));
     } catch (err) {
-      logger.error('Error getting all active backup codes:', err);
+      logger.error("Error getting all active backup codes:", err);
       throw err;
     }
   }
@@ -1124,25 +1177,26 @@ class DatabaseService {
       if (!codeIds || codeIds.length === 0) return 0;
 
       // Safe: IDs are integers from our own database
-      const idList = codeIds.map(id => parseInt(id)).join(',');
+      const idList = codeIds.map((id) => parseInt(id)).join(",");
 
       let result;
       try {
-        result = await this.pool.request()
-          .query(`
+        result = await this.pool.request().query(`
             UPDATE dbo.backup_codes
             SET status = 'used', used_at = SYSUTCDATETIME()
             WHERE id IN (${idList})
           `);
       } catch (err) {
-        if (!this.isMissingUsedAtColumnError(err) && !this.isMissingStatusColumnError(err)) {
+        if (
+          !this.isMissingUsedAtColumnError(err) &&
+          !this.isMissingStatusColumnError(err)
+        ) {
           throw err;
         }
 
-        this.logUsedAtFallback('markBackupCodesAsUsedByIds');
+        this.logUsedAtFallback("markBackupCodesAsUsedByIds");
         try {
-          result = await this.pool.request()
-            .query(`
+          result = await this.pool.request().query(`
               UPDATE dbo.backup_codes
               SET status = 'used'
               WHERE id IN (${idList})
@@ -1153,8 +1207,7 @@ class DatabaseService {
           }
 
           try {
-            result = await this.pool.request()
-              .query(`
+            result = await this.pool.request().query(`
                 UPDATE dbo.backup_codes
                 SET is_used = 1
                 WHERE id IN (${idList})
@@ -1165,8 +1218,7 @@ class DatabaseService {
             }
 
             try {
-              result = await this.pool.request()
-                .query(`
+              result = await this.pool.request().query(`
                   UPDATE dbo.backup_codes
                   SET used_at = SYSUTCDATETIME()
                   WHERE id IN (${idList}) AND used_at IS NULL
@@ -1176,8 +1228,7 @@ class DatabaseService {
                 throw usedAtErr;
               }
 
-              result = await this.pool.request()
-                .query(`
+              result = await this.pool.request().query(`
                   DELETE FROM dbo.backup_codes
                   WHERE id IN (${idList})
                 `);
@@ -1186,10 +1237,12 @@ class DatabaseService {
         }
       }
 
-      logger.database(`Marked ${result.rowsAffected[0]} backup codes as used (IDs: ${idList})`);
+      logger.database(
+        `Marked ${result.rowsAffected[0]} backup codes as used (IDs: ${idList})`,
+      );
       return result.rowsAffected[0];
     } catch (err) {
-      logger.error('Error marking backup codes as used by IDs:', err);
+      logger.error("Error marking backup codes as used by IDs:", err);
       throw err;
     }
   }
@@ -1206,9 +1259,9 @@ class DatabaseService {
 
       let result;
       try {
-        result = await this.pool.request()
-          .input('telegram_user_id', sql.BigInt, scopedUserId)
-          .query(`
+        result = await this.pool
+          .request()
+          .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
             SELECT COUNT(*) as count
             FROM dbo.backup_codes
             WHERE telegram_user_id = @telegram_user_id AND status = 'active'
@@ -1219,9 +1272,9 @@ class DatabaseService {
         }
 
         try {
-          result = await this.pool.request()
-            .input('telegram_user_id', sql.BigInt, scopedUserId)
-            .query(`
+          result = await this.pool
+            .request()
+            .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
               SELECT COUNT(*) as count
               FROM dbo.backup_codes
               WHERE telegram_user_id = @telegram_user_id AND ISNULL(is_used, 0) = 0
@@ -1232,9 +1285,9 @@ class DatabaseService {
           }
 
           try {
-            result = await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            result = await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 SELECT COUNT(*) as count
                 FROM dbo.backup_codes
                 WHERE telegram_user_id = @telegram_user_id AND used_at IS NULL
@@ -1244,9 +1297,9 @@ class DatabaseService {
               throw usedAtErr;
             }
 
-            result = await this.pool.request()
-              .input('telegram_user_id', sql.BigInt, scopedUserId)
-              .query(`
+            result = await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
                 SELECT COUNT(*) as count
                 FROM dbo.backup_codes
                 WHERE telegram_user_id = @telegram_user_id
@@ -1257,7 +1310,7 @@ class DatabaseService {
 
       return result.recordset[0].count;
     } catch (err) {
-      logger.error('Error getting backup code count:', err);
+      logger.error("Error getting backup code count:", err);
       throw err;
     }
   }
@@ -1272,16 +1325,16 @@ class DatabaseService {
       await this.connect();
       const scopedUserId = this.normalizeSharedOperatorId();
 
-      await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, scopedUserId)
-        .query(`
+      await this.pool
+        .request()
+        .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
           DELETE FROM dbo.backup_codes 
           WHERE telegram_user_id = @telegram_user_id
         `);
 
       return true;
     } catch (err) {
-      logger.error('Error deleting backup codes:', err);
+      logger.error("Error deleting backup codes:", err);
       throw err;
     }
   }
@@ -1302,17 +1355,17 @@ class DatabaseService {
       // Ensure user account exists
       await this.ensureUserExists(orderData.telegramUserId);
 
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, orderData.telegramUserId)
-        .input('chat_id', sql.BigInt, orderData.chatId)
-        .input('game_name', sql.NVarChar(100), orderData.gameName)
-        .input('game_url', sql.NVarChar(500), orderData.gameUrl)
-        .input('card_name', sql.NVarChar(100), orderData.cardName)
-        .input('card_value', sql.NVarChar(100), orderData.cardValue)
-        .input('card_index', sql.Int, orderData.cardIndex)
-        .input('quantity', sql.Int, orderData.quantity)
-        .input('scheduled_time', sql.DateTime2, orderData.scheduledTime)
-        .query(`
+      const result = await this.pool
+        .request()
+        .input("telegram_user_id", sql.BigInt, orderData.telegramUserId)
+        .input("chat_id", sql.BigInt, orderData.chatId)
+        .input("game_name", sql.NVarChar(100), orderData.gameName)
+        .input("game_url", sql.NVarChar(500), orderData.gameUrl)
+        .input("card_name", sql.NVarChar(100), orderData.cardName)
+        .input("card_value", sql.NVarChar(100), orderData.cardValue)
+        .input("card_index", sql.Int, orderData.cardIndex)
+        .input("quantity", sql.Int, orderData.quantity)
+        .input("scheduled_time", sql.DateTime2, orderData.scheduledTime).query(`
           INSERT INTO scheduled_orders 
           (telegram_user_id, chat_id, game_name, game_url, card_name, card_value, card_index, quantity, scheduled_time)
           OUTPUT INSERTED.id
@@ -1321,7 +1374,7 @@ class DatabaseService {
 
       return result.recordset[0].id;
     } catch (err) {
-      logger.error('Error creating scheduled order:', err);
+      logger.error("Error creating scheduled order:", err);
       throw err;
     }
   }
@@ -1334,23 +1387,26 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const result = await this.pool.request()
-        .query(`
+      const result = await this.pool.request().query(`
           SELECT * FROM scheduled_orders 
           WHERE status = 'pending' AND scheduled_time <= SYSUTCDATETIME()
           ORDER BY scheduled_time ASC
         `);
 
-      logger.debug(`getPendingScheduledOrders: Found ${result.recordset.length} pending orders`);
+      logger.debug(
+        `getPendingScheduledOrders: Found ${result.recordset.length} pending orders`,
+      );
       if (result.recordset.length > 0) {
-        result.recordset.forEach(order => {
-          logger.debug(`  Order #${order.id}: scheduled for ${order.scheduled_time}, status: ${order.status}`);
+        result.recordset.forEach((order) => {
+          logger.debug(
+            `  Order #${order.id}: scheduled for ${order.scheduled_time}, status: ${order.status}`,
+          );
         });
       }
 
       return result.recordset;
     } catch (err) {
-      logger.error('Error getting pending scheduled orders:', err);
+      logger.error("Error getting pending scheduled orders:", err);
       throw err;
     }
   }
@@ -1364,17 +1420,18 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const result = await this.pool.request()
-        .query(`
+      const result = await this.pool.request().query(`
           SELECT COUNT(*) as count FROM scheduled_orders 
           WHERE status = 'pending'
         `);
 
       const count = result.recordset[0].count;
-      logger.debug(`hasAnyPendingScheduledOrders: Found ${count} pending orders (all times)`);
+      logger.debug(
+        `hasAnyPendingScheduledOrders: Found ${count} pending orders (all times)`,
+      );
       return count > 0;
     } catch (err) {
-      logger.error('Error checking for any pending scheduled orders:', err);
+      logger.error("Error checking for any pending scheduled orders:", err);
       throw err;
     }
   }
@@ -1387,36 +1444,42 @@ class DatabaseService {
    * @param {string} errorMessage - Error message (optional)
    * @returns {Promise<boolean>} True if updated
    */
-  async updateScheduledOrderStatus(scheduledOrderId, status, orderId = null, errorMessage = null) {
+  async updateScheduledOrderStatus(
+    scheduledOrderId,
+    status,
+    orderId = null,
+    errorMessage = null,
+  ) {
     try {
       await this.connect();
 
-      const request = this.pool.request()
-        .input('id', sql.Int, scheduledOrderId)
-        .input('status', sql.NVarChar(20), status);
+      const request = this.pool
+        .request()
+        .input("id", sql.Int, scheduledOrderId)
+        .input("status", sql.NVarChar(20), status);
 
-      let query = 'UPDATE scheduled_orders SET status = @status';
+      let query = "UPDATE scheduled_orders SET status = @status";
 
       if (orderId) {
-        request.input('order_id', sql.Int, orderId);
-        query += ', order_id = @order_id';
+        request.input("order_id", sql.Int, orderId);
+        query += ", order_id = @order_id";
       }
 
       if (errorMessage) {
-        request.input('error_message', sql.NVarChar(sql.MAX), errorMessage);
-        query += ', error_message = @error_message';
+        request.input("error_message", sql.NVarChar(sql.MAX), errorMessage);
+        query += ", error_message = @error_message";
       }
 
-      if (status === 'completed' || status === 'failed') {
-        query += ', executed_at = SYSUTCDATETIME()';
+      if (status === "completed" || status === "failed") {
+        query += ", executed_at = SYSUTCDATETIME()";
       }
 
-      query += ' WHERE id = @id';
+      query += " WHERE id = @id";
 
       await request.query(query);
       return true;
     } catch (err) {
-      logger.error('Error updating scheduled order status:', err);
+      logger.error("Error updating scheduled order status:", err);
       throw err;
     }
   }
@@ -1430,9 +1493,9 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const result = await this.pool.request()
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .query(`
+      const result = await this.pool
+        .request()
+        .input("telegram_user_id", sql.BigInt, telegramUserId).query(`
           SELECT * FROM scheduled_orders 
           WHERE telegram_user_id = @telegram_user_id 
           ORDER BY scheduled_time DESC
@@ -1440,7 +1503,7 @@ class DatabaseService {
 
       return result.recordset;
     } catch (err) {
-      logger.error('Error getting user scheduled orders:', err);
+      logger.error("Error getting user scheduled orders:", err);
       throw err;
     }
   }
@@ -1455,10 +1518,10 @@ class DatabaseService {
     try {
       await this.connect();
 
-      const result = await this.pool.request()
-        .input('id', sql.Int, scheduledOrderId)
-        .input('telegram_user_id', sql.BigInt, telegramUserId)
-        .query(`
+      const result = await this.pool
+        .request()
+        .input("id", sql.Int, scheduledOrderId)
+        .input("telegram_user_id", sql.BigInt, telegramUserId).query(`
           UPDATE scheduled_orders 
           SET status = 'cancelled' 
           WHERE id = @id AND telegram_user_id = @telegram_user_id AND status = 'pending'
@@ -1466,7 +1529,7 @@ class DatabaseService {
 
       return result.rowsAffected[0] > 0;
     } catch (err) {
-      logger.error('Error cancelling scheduled order:', err);
+      logger.error("Error cancelling scheduled order:", err);
       throw err;
     }
   }
@@ -1478,7 +1541,7 @@ class DatabaseService {
     if (this.pool) {
       await this.pool.close();
       this.pool = null;
-      logger.database('Database connection closed');
+      logger.database("Database connection closed");
     }
   }
 }
