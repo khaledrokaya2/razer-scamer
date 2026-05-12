@@ -60,3 +60,10 @@ build/
 
 # Test scripts and captured artifacts
 test/
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/

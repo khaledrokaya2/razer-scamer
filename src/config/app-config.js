@@ -1,15 +1,15 @@
 const APP_CONFIG = {
   browser: {
-    headlessMode: 'false',
+    headlessMode: "true",
     defaultTimeoutMs: 30000,
     reloadCheckIntervalMs: 500,
     maxReloadAttempts: 600,
-    inactivityTimeoutMs: 24 * 60 * 60 * 1000
+    inactivityTimeoutMs: 24 * 60 * 60 * 1000,
   },
   retry: {
     maxRetries: 3,
     backoffBaseMs: 12000,
-    backoffMultiplier: 2
+    backoffMultiplier: 2,
   },
   antiban: {
     humanDelayMinMs: 350,
@@ -23,16 +23,16 @@ const APP_CONFIG = {
       minWidth: 1280,
       maxWidth: 1480,
       minHeight: 800,
-      maxHeight: 1000
+      maxHeight: 1000,
     },
-    blockedResourceTypes: ['image', 'media', 'font'],
+    blockedResourceTypes: ["image", "media", "font"],
     userAgents: [
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36',
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36'
-    ]
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36",
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36",
+    ],
   },
   purchase: {
     // Single global browser + single page model.
@@ -67,25 +67,25 @@ const APP_CONFIG = {
     transactionDetailJitterMs: 2600,
     transactionApiRateDelayMs: 100,
     apiReplayDelayMinMs: 500,
-    apiReplayDelayMaxMs: 800
+    apiReplayDelayMaxMs: 800,
   },
   orderFlow: {
     sessionTimeoutMs: 30 * 60 * 1000,
-    cleanupIntervalMs: 10 * 60 * 1000
+    cleanupIntervalMs: 10 * 60 * 1000,
   },
   session: {
     sessionTimeoutMs: 2 * 60 * 60 * 1000,
-    cleanupIntervalMs: 30 * 60 * 1000
+    cleanupIntervalMs: 30 * 60 * 1000,
   },
   order: {
     pinTtlMs: 2 * 60 * 60 * 1000,
-    cleanupIntervalMs: 15 * 60 * 1000
+    cleanupIntervalMs: 15 * 60 * 1000,
   },
   bot: {
     rateLimitMs: 800,
     rateLimitEntryTtlMs: 5 * 60 * 1000,
-    rateLimitCleanupIntervalMs: 10 * 60 * 1000
-  }
+    rateLimitCleanupIntervalMs: 10 * 60 * 1000,
+  },
 };
 
 module.exports = APP_CONFIG;
