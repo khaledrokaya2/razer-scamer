@@ -61,12 +61,10 @@ class AntibanService {
   }
 
   static async setupPage(page, options = {}) {
-    const userAgents = options.userAgents || appConfig.antiban.userAgents;
     const blockedResourceTypes = new Set(
       options.blockedResourceTypes || appConfig.antiban.blockedResourceTypes,
     );
 
-    const userAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
     const viewport = appConfig.antiban.viewport;
     const width =
       viewport.minWidth +
@@ -75,8 +73,13 @@ class AntibanService {
       viewport.minHeight +
       Math.floor(Math.random() * (viewport.maxHeight - viewport.minHeight + 1));
 
-    // Playwright: Set context viewport instead of page
-    // Note: This is set at browser context level in BrowserManager.launchBrowser()
+    // Playwright: Set viewport on page
+    // User agent is already set at browser launch time via Firefox launch args
+    try {
+      await page.setViewportSize({ width, height });
+    } catch (err) {
+      logger.debug(`Viewport setup warning: ${err.message}`);
+    }
 
     // Playwright: Add init script for anti-detection (replaces evaluateOnNewDocument)
     await page.addInitScript(() => {

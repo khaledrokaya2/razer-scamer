@@ -25,7 +25,7 @@ const APP_CONFIG = {
       minHeight: 800,
       maxHeight: 1000,
     },
-    blockedResourceTypes: ["image", "media", "font", "manifest", "other"],
+    blockedResourceTypes: ["image", "media", "font"],
     userAgents: [
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36",
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.207 Safari/537.36",
