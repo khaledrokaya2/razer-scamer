@@ -38,6 +38,7 @@ const logger = require('./src/utils/logger');
 const authService = require('./src/services/AuthorizationService');
 const botController = require('./src/controllers/TelegramBotController');
 const getScheduledOrderService = require('./src/services/ScheduledOrderService');
+const browserManager = require('./src/services/BrowserManager');
 
 // Global scheduled order service instance
 let scheduledOrderService = null;
@@ -83,6 +84,8 @@ async function initializeServices(config) {
   await scheduledOrderService.ensureMonitoring();
   logger.success('Scheduled order service initialized');
 
+  await browserManager.initializeBrowserAtStartup();
+
   logger.success('All services initialized');
 }
 
@@ -106,7 +109,7 @@ async function startApplication() {
 
   logger.separator();
   logger.success('Bot is ready to accept commands!');
-  logger.info('Users can start interacting with /start command');
+  logger.info('Browser is ready - all commands work immediately');
   logger.separator();
 }
 
@@ -125,7 +128,9 @@ async function handleShutdown() {
       logger.success('Scheduled order service stopped');
     }
 
-    // Stop the bot
+    browserManager.stopAutoRestartTimer();
+    await browserManager.closeAll();
+
     await botController.stop();
 
     logger.success('Shutdown complete');

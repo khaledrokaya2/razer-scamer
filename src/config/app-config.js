@@ -3,8 +3,10 @@ const APP_CONFIG = {
     headlessMode: "true",
     defaultTimeoutMs: 30000,
     reloadCheckIntervalMs: 500,
-    maxReloadAttempts: 600,
+    maxReloadAttempts: 100,
     inactivityTimeoutMs: 24 * 60 * 60 * 1000,
+    browserRestartIntervalMs: 6 * 60 * 60 * 1000,
+    browserRestartRetryIntervalMs: 30 * 60 * 1000,
   },
   retry: {
     maxRetries: 3,
@@ -20,9 +22,9 @@ const APP_CONFIG = {
     longPauseMinMs: 1500,
     longPauseMaxMs: 3200,
     viewport: {
-      minWidth: 1280,
+      minWidth: 880,
       maxWidth: 1480,
-      minHeight: 800,
+      minHeight: 500,
       maxHeight: 1000,
     },
     blockedResourceTypes: ["image", "media", "font"],

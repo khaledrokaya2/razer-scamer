@@ -131,7 +131,7 @@ class DatabaseService {
    */
   async connect() {
     try {
-      if (!this.pool) {
+      if (!this.pool || !this.pool.connected) {
         logger.database("Connecting to SQL Database (MonsterASP)...");
 
         // OPTIMIZATION: Use pre-parsed config
@@ -1353,11 +1353,12 @@ class DatabaseService {
       await this.connect();
 
       // Ensure user account exists
+      const scopedUserId = this.normalizeSharedOperatorId();
       await this.ensureUserExists(orderData.telegramUserId);
 
       const result = await this.pool
         .request()
-        .input("telegram_user_id", sql.BigInt, orderData.telegramUserId)
+        .input("telegram_user_id", sql.BigInt, scopedUserId)
         .input("chat_id", sql.BigInt, orderData.chatId)
         .input("game_name", sql.NVarChar(100), orderData.gameName)
         .input("game_url", sql.NVarChar(500), orderData.gameUrl)

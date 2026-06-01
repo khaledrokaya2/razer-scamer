@@ -12,6 +12,7 @@ module.exports = {
   PROCESSING_2FA: 'processing_2fa',
   REACHED_TRANSACTION: 'reached_transaction_page',
   EXTRACTING_DATA: 'extracting_pin_data',
+  WAITING_FOR_RESTOCK: 'waiting_for_restock',
   COMPLETED: 'completed',
   FAILED: 'failed'
 };

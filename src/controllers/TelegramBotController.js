@@ -11,6 +11,7 @@ const authService = require("../services/AuthorizationService");
 const sessionManager = require("../services/SessionManager");
 const scraperService = require("../services/RazerScraperService");
 const browserManager = require("../services/BrowserManager");
+const { BrowserBusyError } = require("../services/BrowserManager");
 const orderFlowHandler = require("./OrderFlowHandler");
 const orderHistoryHandler = require("./OrderHistoryHandler");
 const fileGenerator = require("../utils/FileGenerator");
@@ -546,44 +547,43 @@ class TelegramBotController {
       // Cards are loaded from local catalog cache first, then user browser when needed.
       orderFlowHandler.initSession(chatId);
       await orderFlowHandler.showGameSelection(this.bot, chatId);
-    } catch (err) {
+} catch (err) {
       logger.error("Error in /start command:", err);
-      this.bot.sendMessage(chatId, "❌ Error. Try again later.");
+      if (err instanceof BrowserBusyError) {
+        this.bot.sendMessage(chatId, `⚠️ Browser is busy with: ${err.browserBusyReason}\n\nYou can cancel the running process by sending /cancel.`);
+      } else {
+        this.bot.sendMessage(chatId, "❌ Error. Try again later.");
+      }
     } finally {
       this.clearUserOperation(telegramUserId, operation.id);
     }
   }
 
   /**
-   * Auto-login user if credentials exist
+    * Auto-login user if credentials exist
    * @param {string} chatId - Chat ID
    * @param {string} telegramUserId - Telegram user ID
    */
   async autoLoginUser(chatId, telegramUserId) {
+    // Safety check: don't auto-login if already logging in
+    if (this.usersLoggingIn.has(telegramUserId)) {
+      logger.debug(
+        `User ${telegramUserId} is already logging in, skipping auto-login`,
+      );
+      return;
+    }
+
     try {
-      // Safety check: don't auto-login if already logging in
-      if (this.usersLoggingIn.has(telegramUserId)) {
-        logger.debug(
-          `User ${telegramUserId} is already logging in, skipping auto-login`,
-        );
-        return;
-      }
-
       const db = require("../services/DatabaseService");
-      const browserManager = require("../services/BrowserManager");
-
-      // Check if user has credentials
       const credentials = await db.getUserCredentials(telegramUserId);
 
       if (!credentials || !credentials.email || !credentials.password) {
-        // No credentials, just skip auto-login
         logger.debug(
           `User ${telegramUserId} has no credentials, skipping auto-login`,
         );
         return;
       }
 
-      // Check if already has active browser session
       if (browserManager.hasActiveBrowser(telegramUserId)) {
         logger.debug(
           `User ${telegramUserId} already has active browser session`,
@@ -591,21 +591,18 @@ class TelegramBotController {
         return;
       }
 
-      // Mark user as logging in - block all interactions
       this.usersLoggingIn.add(telegramUserId);
 
-      // Show login message
       const loginMsg = await this.bot.sendMessage(chatId, "🔐 Logging in...");
 
+      const lockId = browserManager.markBrowserBusy('login');
       try {
-        // Perform login
-        await scraperService.login(
+        await browserManager.login(
           telegramUserId,
           credentials.email,
           credentials.password,
         );
 
-        // Delete login message and show success
         await this.bot
           .deleteMessage(chatId, loginMsg.message_id)
           .catch(() => {});
@@ -613,7 +610,6 @@ class TelegramBotController {
 
         logger.success(`Auto-login successful for user ${telegramUserId}`);
       } catch (loginErr) {
-        // Delete login message and show error
         await this.bot
           .deleteMessage(chatId, loginMsg.message_id)
           .catch(() => {});
@@ -626,11 +622,16 @@ class TelegramBotController {
           chatId,
           "⚠️ Login failed. Check credentials in /settings",
         );
+      } finally {
+        browserManager.markBrowserFree(lockId);
+        this.usersLoggingIn.delete(telegramUserId);
       }
     } catch (err) {
-      logger.error("Error in auto-login:", err);
-    } finally {
-      // Always remove user from logging-in set
+      if (err instanceof BrowserBusyError) {
+        this.bot.sendMessage(chatId, `⚠️ Browser is busy with: ${err.browserBusyReason}\n\nYou can cancel the running process by sending /cancel.`);
+      } else {
+        logger.error("Error in auto-login:", err);
+      }
       this.usersLoggingIn.delete(telegramUserId);
     }
   }
@@ -663,16 +664,20 @@ class TelegramBotController {
       }
 
       await this.handleCheckBalanceButton(chatId, telegramUserId);
-    } catch (err) {
+} catch (err) {
       logger.error("Error in /check_balance command:", err);
-      this.bot.sendMessage(chatId, "❌ Error.");
+      if (err instanceof BrowserBusyError) {
+        this.bot.sendMessage(chatId, `⚠️ Browser is busy with: ${err.browserBusyReason}\n\nYou can cancel the running process by sending /cancel.`);
+      } else {
+        this.bot.sendMessage(chatId, "❌ Error.");
+      }
     } finally {
       this.clearUserOperation(telegramUserId, operation.id);
     }
   }
 
   /**
-   * Handle /transactions command
+    * Handle /transactions command
    * @param {object} msg - Telegram message object
    */
   async handleTransactionsCommand(msg) {
@@ -1439,7 +1444,11 @@ class TelegramBotController {
       }
     } catch (err) {
       logger.error("Error in user callback:", err);
-      await this.safeSendMessage(chatId, "❌ Error. Try again.");
+      if (err instanceof BrowserBusyError) {
+        await this.safeSendMessage(chatId, `⚠️ Browser is busy with: ${err.browserBusyReason}\n\nYou can cancel the running process by sending /cancel.`);
+      } else {
+        await this.safeSendMessage(chatId, "❌ Error. Try again.");
+      }
     }
   }
 
@@ -1529,7 +1538,11 @@ class TelegramBotController {
       this.bot.sendMessage(chatId, "📧 Enter your Razer email:");
     } catch (err) {
       logger.error("Error in login button handler:", err);
-      await this.safeSendMessage(chatId, "❌ Error. Try again.");
+      if (err instanceof BrowserBusyError) {
+        await this.safeSendMessage(chatId, `⚠️ Browser is busy with: ${err.browserBusyReason}\n\nYou can cancel the running process by sending /cancel.`);
+      } else {
+        await this.safeSendMessage(chatId, "❌ Error. Try again.");
+      }
     }
   }
 
@@ -1618,7 +1631,12 @@ class TelegramBotController {
         err.message !== "Balance check cancelled by user" &&
         this.balanceCheckInProgress.has(scopeKey)
       ) {
-        if (err.message.includes("No ready browser session available")) {
+        if (err instanceof BrowserBusyError) {
+          await this.bot.sendMessage(
+            chatId,
+            `⚠️ Browser is busy with: ${err.browserBusyReason}\n\nYou can cancel the running process by sending /cancel.`,
+          );
+        } else if (err.message.includes("No ready browser session available")) {
           await this.bot.sendMessage(
             chatId,
             "⚠️ No ready browser available. Use /start first, then try /check_balance again.",
@@ -1724,7 +1742,6 @@ class TelegramBotController {
    * @param {string} telegramUserId - Telegram user ID
    */
   async handleLogoutButton(chatId, telegramUserId) {
-    const browserManager = require("../services/BrowserManager");
 
     try {
       // Close browser session for this user
@@ -2107,10 +2124,17 @@ class TelegramBotController {
       sessionManager.clearCredentials(chatId);
       sessionManager.updateState(chatId, "idle");
 
-      await this.safeSendMessage(
-        chatId,
-        "❌ Error during login. Check your credentials then try again.",
-      );
+      if (err instanceof BrowserBusyError) {
+        await this.safeSendMessage(
+          chatId,
+          `⚠️ Browser is busy with: ${err.browserBusyReason}\n\nYour new credentials could not be tested right now. Please try again in a few minutes using /settings.`,
+        );
+      } else {
+        await this.safeSendMessage(
+          chatId,
+          "❌ Error during login. Check your credentials then try again.",
+        );
+      }
     } finally {
       this.credentialsUpdateControllers.delete(telegramUserId);
       this.clearUserOperation(telegramUserId, operation.id);
@@ -2231,7 +2255,6 @@ class TelegramBotController {
 
         // Reset session state and close browser
         sessionManager.updateState(chatId, "idle");
-        const browserManager = require("../services/BrowserManager");
         await browserManager.closeBrowser(telegramUserId);
       }
     } finally {

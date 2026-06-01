@@ -28,7 +28,6 @@ const {
   createCatalogPageMatcher
 } = require('./purchase/url');
 const AntibanService = require('./AntibanService');
-const RazerLoginService = require('./RazerLoginService');
 const setupPage = AntibanService.setupPage;
 const isBanned = AntibanService.isBanned;
 const withRetry = AntibanService.withRetry;
@@ -94,6 +93,73 @@ class PurchaseService {
     this.STAGES = PurchaseStages;
 
     this.GLOBAL_SCOPE_KEY = '__GLOBAL_BOT_SCOPE__';
+  }
+
+  async registerStartupBrowser() {
+    const scopeKey = this.getGlobalScopeKey();
+    const sessionMap = new Map();
+
+    for (let slot = 1; slot <= this.MAX_READY_BROWSERS; slot++) {
+      const browserKey = this.getGlobalBrowserKeyForSlot(slot);
+      if (!browserManager.hasActiveBrowser(browserKey)) {
+        continue;
+      }
+
+      try {
+        const { browser, page } = await browserManager.getBrowser(browserKey);
+        if (browser && browser.isConnected() && page && !page.isClosed()) {
+          await page.setDefaultTimeout(45000);
+          await page.setDefaultNavigationTimeout(60000);
+
+          if (!browser.__purchaseReadyDisconnectHooked) {
+            browser.__purchaseReadyDisconnectHooked = true;
+            const db = require('./DatabaseService');
+            const sharedOperatorUserId = db.getSharedOperatorUserId();
+            browser.on('disconnected', () => {
+              if (this.intentionalReadyCloseUsers.has(scopeKey)) {
+                return;
+              }
+              if (browserManager.isBrowserBusy) {
+                logger.debug(`[Ready ${slot}] Skipping recovery - browser busy with: ${browserManager.busyReason}`);
+                return;
+              }
+              this.clearTwoFactorWindowState(scopeKey);
+              logger.warn(`[Ready ${slot}] Browser disconnected (${browserKey}). Recreating...`);
+              setTimeout(() => {
+                if (this.intentionalReadyCloseUsers.has(scopeKey)) {
+                  return;
+                }
+                if (browserManager.isBrowserBusy) {
+                  logger.debug(`[Ready ${slot}] Skipping delayed recovery - browser busy with: ${browserManager.busyReason}`);
+                  return;
+                }
+                this.ensureReadyBrowsers(sharedOperatorUserId, { forceRestart: false }).catch(err => {
+                  logger.error(`[Ready ${slot}] Failed to recover ready browser:`, err.message);
+                });
+              }, 1500);
+            });
+          }
+
+          sessionMap.set(slot, { browser, page, slot });
+        }
+      } catch (err) {
+        logger.warn(`[Ready ${slot}] Could not register startup browser: ${err.message}`);
+      }
+    }
+
+    if (sessionMap.size > 0) {
+      this.readyBrowsersByUser.set(scopeKey, sessionMap);
+      logger.success(`Startup browser registered in ready pool: ${sessionMap.size}/${this.MAX_READY_BROWSERS}`);
+    }
+  }
+
+  async runWithBrowserLock(reason, task) {
+    const lockId = browserManager.markBrowserBusy(reason);
+    try {
+      return await task();
+    } finally {
+      browserManager.markBrowserFree(lockId);
+    }
   }
 
   getGlobalScopeKey() {
@@ -349,6 +415,7 @@ class PurchaseService {
    * @returns {Promise<{ready: boolean, count: number, reason?: string}>}
    */
   async ensureReadyBrowsers(telegramUserId, { forceRestart = false, onProgress = null, credentialsOverride = null } = {}) {
+    return this.runWithBrowserLock('ready-browser-init', async () => {
     const scopeKey = this.getGlobalScopeKey();
     if (this.readyInitLocks.has(scopeKey)) {
       return this.readyInitLocks.get(scopeKey);
@@ -467,6 +534,7 @@ class PurchaseService {
     } finally {
       this.readyInitLocks.delete(scopeKey);
     }
+    });
   }
 
   /**
@@ -497,59 +565,24 @@ class PurchaseService {
         browser = managedSession.browser;
         page = managedSession.page;
 
-        // ANTI-BAN
         await setupPage(page);
         await page.setDefaultTimeout(45000);
         await page.setDefaultNavigationTimeout(60000);
 
-        const verifyAuthenticatedSession = async () => {
-          await withRetry(async () => {
-            await page.goto('https://razerid.razer.com/dashboard', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            if (await isBanned(page)) throw new Error('rate limited');
-          });
-
-          const afterDashboardUrl = String(page.url() || '').toLowerCase();
-          // Strict check: session is considered authenticated only if dashboard is actually reached.
-          if (!afterDashboardUrl.includes('/dashboard') || afterDashboardUrl.includes('login') || afterDashboardUrl.includes('signin')) {
-            return false;
-          }
-
-          const sessionValid = await browserManager.checkSessionValid(page);
-          if (!sessionValid) {
-            return false;
-          }
-
-          return await page.evaluate(() => {
-            const href = (window.location.href || '').toLowerCase();
-            const hasEmailInput = !!document.querySelector('#input-login-email, input[type="email"]');
-            const hasPasswordInput = !!document.querySelector('#input-login-password, input[type="password"]');
-            const hasLoginForm = !!document.querySelector('form[action*="login"], form[action*="signin"]');
-            return !href.includes('login') && !(hasEmailInput && hasPasswordInput) && !hasLoginForm;
-          }).catch(() => false);
-        };
-
-        const runFullLogin = async () => {
-          this.clearTwoFactorWindowState(scopeKey);
-          logger.system(`${logPrefix} Running full login flow...`);
-          await RazerLoginService.loginOnPage(page, credentials.email, credentials.password, {
-            openLabel: `${logPrefix} Opening Razer login page...`,
-            waitLabel: `${logPrefix} Waiting for login form...`,
-            typeLabel: `${logPrefix} Typing credentials...`,
-            submitLabel: `${logPrefix} Submitting login form...`
-          });
-        };
-
         let loggedIn = false;
 
         if (!hadActiveBrowser) {
-          // Fresh slot browser must always perform a real login before being marked ready.
-          await runFullLogin();
-          loggedIn = await verifyAuthenticatedSession();
+          this.clearTwoFactorWindowState(scopeKey);
+          logger.system(`${logPrefix} Running full login flow...`);
+          await browserManager.login(browserKey, credentials.email, credentials.password);
+          loggedIn = await browserManager.verifyAuthenticatedSession(browserKey);
         } else {
-          loggedIn = await verifyAuthenticatedSession();
+          loggedIn = await browserManager.verifyAuthenticatedSession(browserKey);
           if (!loggedIn) {
-            await runFullLogin();
-            loggedIn = await verifyAuthenticatedSession();
+            this.clearTwoFactorWindowState(scopeKey);
+            logger.system(`${logPrefix} Running full login flow...`);
+            await browserManager.login(browserKey, credentials.email, credentials.password);
+            loggedIn = await browserManager.verifyAuthenticatedSession(browserKey);
           }
         }
 
@@ -575,11 +608,19 @@ class PurchaseService {
               logger.debug(`${logPrefix} Ignoring disconnect recovery for intentional close`);
               return;
             }
+            if (browserManager.isBrowserBusy) {
+              logger.debug(`${logPrefix} Skipping recovery - browser busy with: ${browserManager.busyReason}`);
+              return;
+            }
             this.clearTwoFactorWindowState(scopeKey);
             logger.warn(`${logPrefix} Browser disconnected (${browserKey}). Recreating...`);
             setTimeout(() => {
               if (this.intentionalReadyCloseUsers.has(scopeKey)) {
                 logger.debug(`${logPrefix} Recovery skipped after intentional close`);
+                return;
+              }
+              if (browserManager.isBrowserBusy) {
+                logger.debug(`${logPrefix} Skipping delayed recovery - browser busy with: ${browserManager.busyReason}`);
                 return;
               }
               this.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch(err => {
@@ -670,6 +711,7 @@ class PurchaseService {
    * @returns {Promise<Array>} Array of card options {name, index, disabled}
    */
   async getAvailableCards(telegramUserId, gameUrl) {
+    return this.runWithBrowserLock('card-fetch', async () => {
     const readySession = this.getReadySessions(telegramUserId)[0];
     if (!readySession) {
       throw new Error('No ready browser session found. Use /start first to open and login your persistent browser.');
@@ -964,6 +1006,7 @@ class PurchaseService {
       logger.error('Error getting available cards:', err.message);
       throw err;
     }
+    });
   }
 
   /**
@@ -973,7 +1016,7 @@ class PurchaseService {
    * @param {Function} checkCancellation - Function to check if order was cancelled
    * @returns {Promise<boolean>} True if in stock
    */
-  async waitForCardInStock(page, cardIndex, checkCancellation) {
+  async waitForCardInStock(page, cardIndex, checkCancellation, onProgress = null, cardNumber = 1) {
     // ANTI-BAN
     await setupPage(page);
     let attempts = 0;
@@ -988,14 +1031,22 @@ class PurchaseService {
 
       logger.debug(`Checking stock status... (Attempt ${attempts + 1}/${this.MAX_RELOAD_ATTEMPTS})`);
 
-      const isInStock = await page.evaluate((index, selector) => {
+      const isInStock = await page.evaluate(({ index, selector }) => {
         const radioInputs = document.querySelectorAll(selector);
         return radioInputs[index] ? !radioInputs[index].disabled : false;
-      }, cardIndex, cardSelector);
+      }, { index: cardIndex, selector: cardSelector });
 
       if (isInStock) {
         logger.success('Card is IN STOCK!');
         return true;
+      }
+
+      if (onProgress) {
+        try {
+          await onProgress({ phase: 'waiting_for_restock', cardNumber, attempt: attempts + 1, maxAttempts: this.MAX_RELOAD_ATTEMPTS });
+        } catch (progressErr) {
+          logger.debug(`Restock progress callback error: ${progressErr.message}`);
+        }
       }
 
       logger.debug('Out of stock, waiting 0.5 seconds before retry...');
@@ -1026,7 +1077,7 @@ class PurchaseService {
    * @param {Object} params - Purchase parameters {userId, page, gameUrl, cardIndex, backupCode, checkCancellation, orderId, cardNumber}
    * @returns {Promise<Object>} Purchase data
    */
-  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '', onTwoFactorStart = null, onTwoFactorEnd = null, waitForTwoFactorPause = null, resumeFromTwoFactor = false, resumeFromCheckout = false, stopBeforeCheckout = false, preferExistingSelection = false, actionScopeKey = null }) {
+  async completePurchase({ telegramUserId, page, gameUrl, cardIndex, backupCode, backupCodeId, checkCancellation, cardNumber = 1, gameName, cardName, label = '', onTwoFactorStart = null, onTwoFactorEnd = null, waitForTwoFactorPause = null, resumeFromTwoFactor = false, resumeFromCheckout = false, stopBeforeCheckout = false, preferExistingSelection = false, actionScopeKey = null, onProgress = null }) {
     // ANTI-BAN
     await setupPage(page);
     let currentStage = this.STAGES.IDLE;
@@ -1313,7 +1364,9 @@ class PurchaseService {
 
       if (!isInStock) {
         log.warn('Card is OUT OF STOCK, waiting for restock...');
-        await this.waitForCardInStock(page, cardIndex, checkCancellation);
+        currentStage = this.STAGES.WAITING_FOR_RESTOCK;
+        await this.waitForCardInStock(page, cardIndex, checkCancellation, onProgress, cardNumber);
+        currentStage = this.STAGES.SELECTING_CARD;
       }
 
       let cardAlreadySelected = false;
@@ -2576,6 +2629,7 @@ class PurchaseService {
    * with automatic fallback to scraper when API fails.
    */
   async processBulkPurchases({ telegramUserId, gameUrl, cardIndex, cardName, gameName, quantity, onProgress, onCardCompleted, checkCancellation }) {
+    return this.runWithBrowserLock('purchase', async () => {
     const db = require('./DatabaseService');
 
     const credentials = await db.getUserCredentials(telegramUserId);
@@ -2633,7 +2687,8 @@ class PurchaseService {
             gameName,
             cardName,
             label,
-            resumeFromTwoFactor
+            resumeFromTwoFactor,
+            onProgress: emitProgress
           });
         };
 
@@ -2804,6 +2859,7 @@ class PurchaseService {
       err.purchases = purchases;
       throw err;
     }
+    });
   }
 
   /**
@@ -3344,6 +3400,7 @@ class PurchaseService {
    * @returns {Promise<{dateLabel: string, totalTransactions: number, matchedTransactions: Array, groupedPins: Object, failures: Array}>}
    */
   async fetchTransactionPinsForDate(telegramUserId, dateInput, { checkCancellation = null, onProgress = null } = {}) {
+    return this.runWithBrowserLock('transaction-fetch', async () => {
     const targetDate = this.parseTransactionsDateInput(dateInput);
     const readySessions = this.getReadySessions(telegramUserId);
 
@@ -3556,6 +3613,7 @@ class PurchaseService {
     } finally {
       await this.restoreReadySessionPages(usableSessions);
     }
+    });
   }
 }
 

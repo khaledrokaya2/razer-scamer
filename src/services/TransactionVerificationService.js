@@ -7,211 +7,165 @@ const setupPage = AntibanService.setupPage;
 const isBanned = AntibanService.isBanned;
 const withRetry = AntibanService.withRetry;
 
-/**
- * Service for verifying Razer transaction status by scraping transaction pages
- */
 class TransactionVerificationService {
   constructor() {
     this.browserManager = BrowserManager;
   }
 
-  /**
-   * Verify a purchase transaction by visiting Razer transaction page
-   * @param {string} transactionId - Razer transaction ID
-   * @param {Object} page - Puppeteer page object (already logged in)
-   * @returns {Promise<Object>} {success: boolean, status: string, pin?: string, serial?: string, error?: string}
-   */
   async verifyTransaction(transactionId, page) {
     const url = `https://gold.razer.com/global/en/transaction/purchase/${transactionId}`;
 
+    await setupPage(page, { blockedResourceTypes: ['image', 'media', 'font', 'stylesheet'] });
+    logger.http(`Verifying transaction: ${transactionId}`);
+
+    await withRetry(async () => {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await humanDelay();
+      if (await isBanned(page)) throw new Error('rate limited');
+    });
+
     try {
-      // ANTI-BAN
-      await setupPage(page, { blockedResourceTypes: ['image', 'media', 'font', 'stylesheet'] });
-      logger.http(`Verifying transaction: ${transactionId}`);
-
-      // Navigate to transaction page with fast loading
-      // ANTI-BAN
-      await withRetry(async () => {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-        await humanDelay();
-        if (await isBanned(page)) throw new Error('rate limited');
-      });
-
-      // Wait for the status element to appear (this ensures dynamic content is loaded)
-      try {
-        await page.waitForFunction(() => {
-          // Check if status element exists
-          const statusElements = document.querySelectorAll('p.text-uppercase.mb-0');
-          for (const el of statusElements) {
-            if (el.textContent.includes('Status')) {
-              return true;
-            }
+      await page.waitForFunction(() => {
+        const statusElements = document.querySelectorAll('p.text-uppercase.mb-0');
+        for (const el of statusElements) {
+          if (el.textContent.includes('Status')) {
+            return true;
           }
-          return false;
-        }, { timeout: 15000, polling: 100 });
-
-        logger.debug(`Transaction ${transactionId}: Status element loaded`);
-      } catch (waitErr) {
-        logger.debug(`Transaction ${transactionId}: Timeout waiting for status element`);
-        // Continue anyway and try to extract
-      }
-
-      // Get page HTML to determine state
-      const html = await page.content();
-
-      // Check for loading error
-      if (html.includes('Transaction Loading Error')) {
-        logger.warn(`Transaction ${transactionId}: Loading error detected`);
-        return {
-          success: false,
-          status: 'failed',
-          error: 'Transaction loading error'
-        };
-      }
-
-      // Check if not logged in (redirected to login)
-      if (html.includes('login-form') || page.url().includes('/login')) {
-        logger.warn(`Transaction ${transactionId}: Not logged in`);
-        return {
-          success: false,
-          status: 'failed',
-          error: 'Not logged in to Razer'
-        };
-      }
-
-      // Extract status, PIN, and Serial from page
-      // Status is in: <p class="text-uppercase mb-0">Status</p><p class="text--brand">SUCCESS</p>
-      // PIN is in: <p class="text-uppercase mb-0">PIN</p><p class="text--brand">...</p>
-      // Serial is in: <p class="text-uppercase mb-0">Serial No.</p><p class="text--brand">...</p>
-
-      const statusMatch = html.match(/<p[^>]*class="text-uppercase mb-0">Status<\/p>\s*<p[^>]*class="text--brand">([^<]+)<\/p>/i);
-      if (!statusMatch) {
-        logger.debug(`Transaction ${transactionId}: Could not find status in HTML`);
-
-        // Debug: Check what status-related content exists
-        const debugMatch = html.match(/<p[^>]*class="text-uppercase mb-0">[^<]*status[^<]*<\/p>/gi);
-        if (debugMatch) {
-          logger.debug(`   Found status labels:`, debugMatch);
         }
+        return false;
+      }, { timeout: 15000, polling: 100 });
 
-        return {
-          success: false,
-          status: 'failed',
-          error: 'Could not extract transaction status'
-        };
-      }
+      logger.debug(`Transaction ${transactionId}: Status element loaded`);
+    } catch (waitErr) {
+      logger.debug(`Transaction ${transactionId}: Timeout waiting for status element`);
+    }
 
-      const transactionStatus = statusMatch[1].trim();
-      logger.debug(`Transaction ${transactionId}: Status = ${transactionStatus}`);
+    const html = await page.content();
 
-      // Check if status is SUCCESS
-      if (transactionStatus === 'SUCCESS') {
-        // Extract PIN and Serial
-        const pinMatch = html.match(/<p[^>]*class="text-uppercase mb-0">PIN<\/p>\s*<p[^>]*class="text--brand">([^<]+)<\/p>/i);
-        const serialMatch = html.match(/<p[^>]*class="text-uppercase mb-0">Serial No\.<\/p>\s*<p[^>]*class="text--brand">([^<]+)<\/p>/i);
-
-        if (!pinMatch || !serialMatch) {
-          logger.warn(`Transaction ${transactionId}: SUCCESS but could not extract PIN/Serial`);
-          return {
-            success: false,
-            status: 'failed',
-            error: 'Could not extract PIN or Serial from successful transaction'
-          };
-        }
-
-        const pin = pinMatch[1].trim();
-        const serial = serialMatch[1].trim();
-
-        logger.success(`Transaction ${transactionId}: SUCCESS - Data extracted`);
-        // 🔒 SECURITY: PIN and Serial not logged to console
-        return {
-          success: true,
-          status: 'success',
-          pin,
-          serial
-        };
-      } else {
-        // Transaction failed (OUT_OF_STOCK, CANCELLED, etc.)
-        logger.warn(`Transaction ${transactionId}: Failed with status ${transactionStatus}`);
-        return {
-          success: false,
-          status: 'failed',
-          error: `Transaction status: ${transactionStatus}`
-        };
-      }
-    } catch (err) {
-      logger.error(`Error verifying transaction ${transactionId}:`, err);
+    if (html.includes('Transaction Loading Error')) {
+      logger.warn(`Transaction ${transactionId}: Loading error detected`);
       return {
         success: false,
         status: 'failed',
-        error: err.message
+        error: 'Transaction loading error'
+      };
+    }
+
+    if (html.includes('login-form') || page.url().includes('/login')) {
+      logger.warn(`Transaction ${transactionId}: Not logged in`);
+      return {
+        success: false,
+        status: 'failed',
+        error: 'Not logged in to Razer'
+      };
+    }
+
+    const statusMatch = html.match(/<p[^>]*class="text-uppercase mb-0">Status<\/p>\s*<p[^>]*class="text--brand">([^<]+)<\/p>/i);
+    if (!statusMatch) {
+      logger.debug(`Transaction ${transactionId}: Could not find status in HTML`);
+
+      const debugMatch = html.match(/<p[^>]*class="text-uppercase mb-0">[^<]*status[^<]*<\/p>/gi);
+      if (debugMatch) {
+        logger.debug(`   Found status labels:`, debugMatch);
+      }
+
+      return {
+        success: false,
+        status: 'failed',
+        error: 'Could not extract transaction status'
+      };
+    }
+
+    const transactionStatus = statusMatch[1].trim();
+    logger.debug(`Transaction ${transactionId}: Status = ${transactionStatus}`);
+
+    if (transactionStatus === 'SUCCESS') {
+      const pinMatch = html.match(/<p[^>]*class="text-uppercase mb-0">PIN<\/p>\s*<p[^>]*class="text--brand">([^<]+)<\/p>/i);
+      const serialMatch = html.match(/<p[^>]*class="text-uppercase mb-0">Serial No\.<\/p>\s*<p[^>]*class="text--brand">([^<]+)<\/p>/i);
+
+      if (!pinMatch || !serialMatch) {
+        logger.warn(`Transaction ${transactionId}: SUCCESS but could not extract PIN/Serial`);
+        return {
+          success: false,
+          status: 'failed',
+          error: 'Could not extract PIN or Serial from successful transaction'
+        };
+      }
+
+      const pin = pinMatch[1].trim();
+      const serial = serialMatch[1].trim();
+
+      logger.success(`Transaction ${transactionId}: SUCCESS - Data extracted`);
+      return {
+        success: true,
+        status: 'success',
+        pin,
+        serial
+      };
+    } else {
+      logger.warn(`Transaction ${transactionId}: Failed with status ${transactionStatus}`);
+      return {
+        success: false,
+        status: 'failed',
+        error: `Transaction status: ${transactionStatus}`
       };
     }
   }
 
-  /**
-   * Verify multiple transactions (Sequential - one at a time for reliability)
-   * @param {Array<Object>} purchases - Array of purchase objects with transactionId
-   * @param {Object} page - Puppeteer page object (already logged in)
-   * @param {Function} onProgress - Optional progress callback (current, total)
-   * @param {Function} checkCancellation - Optional cancellation check callback
-   * @returns {Promise<Array<Object>>} Array of verification results with purchaseId
-   */
   async verifyMultipleTransactions(purchases, page, onProgress = null, checkCancellation = null) {
-    const results = [];
-    const total = purchases.length;
+    const lockId = this.browserManager.markBrowserBusy('verify-batch');
+    try {
+      const results = [];
+      const total = purchases.length;
 
-    for (let i = 0; i < purchases.length; i++) {
-      const purchase = purchases[i];
-      const current = i + 1;
+      for (let i = 0; i < purchases.length; i++) {
+        const purchase = purchases[i];
+        const current = i + 1;
 
-      // Check if verification was cancelled
-      if (checkCancellation && checkCancellation()) {
-        logger.order('Verification cancelled by user');
-        const error = new Error('Verification cancelled by user');
-        error.partialResults = results;
-        throw error;
-      }
+        if (checkCancellation && checkCancellation()) {
+          logger.order('Verification cancelled by user');
+          const error = new Error('Verification cancelled by user');
+          error.partialResults = results;
+          throw error;
+        }
 
-      // Call progress callback if provided
-      if (onProgress) {
-        try {
-          await onProgress(current, total);
-        } catch (err) {
-          logger.warn('Progress callback error:', err.message);
+        if (onProgress) {
+          try {
+            await onProgress(current, total);
+          } catch (err) {
+            logger.warn('Progress callback error:', err.message);
+          }
+        }
+
+        if (!purchase.hasTransactionId()) {
+          results.push({
+            purchaseId: purchase.id,
+            cardNumber: purchase.card_number,
+            success: false,
+            status: 'failed',
+            error: 'No transaction ID - purchase failed before reaching transaction page'
+          });
+        } else {
+          const result = await this.verifyTransaction(purchase.razer_transaction_id, page);
+          results.push({
+            purchaseId: purchase.id,
+            cardNumber: purchase.card_number,
+            transactionId: purchase.razer_transaction_id,
+            ...result
+          });
+        }
+
+        if (i < purchases.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
       }
 
-      if (!purchase.hasTransactionId()) {
-        // Transaction ID not saved - purchase failed before transaction page
-        results.push({
-          purchaseId: purchase.id,
-          cardNumber: purchase.card_number,
-          success: false,
-          status: 'failed',
-          error: 'No transaction ID - purchase failed before reaching transaction page'
-        });
-      } else {
-        // Verify transaction
-        const result = await this.verifyTransaction(purchase.razer_transaction_id, page);
-        results.push({
-          purchaseId: purchase.id,
-          cardNumber: purchase.card_number,
-          transactionId: purchase.razer_transaction_id,
-          ...result
-        });
-      }
-
-      // Minimal delay between requests (reduced for speed)
-      if (i < purchases.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
+      return results;
+    } finally {
+      this.browserManager.markBrowserFree(lockId);
     }
-
-    return results;
   }
 }
 
-// Singleton instance
 const instance = new TransactionVerificationService();
 module.exports = instance;

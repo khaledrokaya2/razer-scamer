@@ -932,16 +932,33 @@ class OrderFlowHandler {
             const totalTx = completed.total || 0;
             const matched = completed.matched || 0;
             const failures = completed.failures || 0;
-            
-            progressBar = this.createProgressBar(processed, totalTx);
-            let statusLine = '⏳ Preparing...';
-            if (phase === 'loading_history') statusLine = '📥 Loading transactions history';
-            if (phase === 'filtering') statusLine = '🔍 Filtering successful transactions';
-            if (phase === 'fetching') statusLine = '📦 Fetching transaction details';
-            if (phase === 'complete') statusLine = '✓ Finalizing results';
-            
-            const percentage = totalTx > 0 ? Math.round((processed / totalTx) * 100) : 0;
-            progressText = `⏳ *Enriching API Purchases*\n${statusLine}\n${progressBar}\n\n✅ ${processed}/${Math.max(1, totalTx)} | 🎯 Matched: ${matched} | ⚠️ Failed: ${failures} (📊 ${percentage}%)`;
+
+            if (phase === 'waiting_for_restock') {
+              const restockCardNumber = completed.cardNumber || 1;
+              const restockAttempt = completed.attempt || 1;
+              const restockMaxAttempts = completed.maxAttempts || '?';
+              const progressBar = this.createProgressBar(0, quantity);
+              progressText =
+                `${gameName}\n` +
+                `💎 ${cardName}\n` +
+                `📦 Quantity: ${quantity}\n\n` +
+                `⏳PROGRESS\n` +
+                `${progressBar}\n` +
+                `✅ 0/${quantity} (📊 0%)\n\n` +
+                `⏳ *Waiting for Restock*\n` +
+                `🃏 Card ${restockCardNumber} is out of stock\n` +
+                `🔄 Checking... (attempt ${restockAttempt}/${restockMaxAttempts})`;
+            } else {
+              progressBar = this.createProgressBar(processed, totalTx);
+              let statusLine = '⏳ Preparing...';
+              if (phase === 'loading_history') statusLine = '📥 Loading transactions history';
+              if (phase === 'filtering') statusLine = '🔍 Filtering successful transactions';
+              if (phase === 'fetching') statusLine = '📦 Fetching transaction details';
+              if (phase === 'complete') statusLine = '✓ Finalizing results';
+              
+              const percentage = totalTx > 0 ? Math.round((processed / totalTx) * 100) : 0;
+              progressText = `⏳ *Enriching API Purchases*\n${statusLine}\n${progressBar}\n\n✅ ${processed}/${Math.max(1, totalTx)} | 🎯 Matched: ${matched} | ⚠️ Failed: ${failures} (📊 ${percentage}%)`;
+            }
           } else {
             // Handle purchase progress (original number format)
             completed = typeof completed === 'number' ? completed : 0;
