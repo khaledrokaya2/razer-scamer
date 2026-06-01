@@ -14,8 +14,8 @@ const APP_CONFIG = {
     backoffMultiplier: 2,
   },
   antiban: {
-    humanDelayMinMs: 80,
-    humanDelayMaxMs: 250,
+    humanDelayMinMs: 40,
+    humanDelayMaxMs: 120,
     typingDelayMinMs: 12,
     typingDelayRangeMs: 8,
     longPauseChance: 0.002,

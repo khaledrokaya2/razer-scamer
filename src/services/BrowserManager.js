@@ -157,22 +157,37 @@ class BrowserManager {
       await page.setDefaultTimeout(45000);
       await page.setDefaultNavigationTimeout(60000);
 
-      this.userBrowsers.set(browserKey, {
-        browser,
-        page,
-        lastActivity: Date.now(),
-        inUse: false,
-        isReady: false,
-      });
-
-      // Auto-recover if browser dies unexpectedly.
-      browser.on("disconnected", () => {
+      // OPTIMIZATION: Track disconnect handler for cleanup
+      const disconnectHandler = () => {
         this.handleUnexpectedDisconnect(browserKey).catch((err) => {
           logger.error(
             `Browser recovery failed for key ${browserKey}:`,
             err.message,
           );
         });
+      };
+
+      this.userBrowsers.set(browserKey, {
+        browser,
+        page,
+        lastActivity: Date.now(),
+        inUse: false,
+        isReady: false,
+        disconnectHandler, // Store for cleanup
+      });
+
+      // Auto-recover if browser dies unexpectedly.
+      browser.on("disconnected", disconnectHandler);
+
+      // OPTIMIZATION: Clean up page hooks on close to prevent memory leaks
+      page.on("close", () => {
+        logger.debug(`Page closed for key ${browserKey}, cleaning up hooks`);
+        if (page.__antiBanRouteHooked) {
+          page.__antiBanRouteHooked = false;
+        }
+        if (page.__antiBanMethodPatched) {
+          page.__antiBanMethodPatched = false;
+        }
       });
 
       return { browser, page };
@@ -267,8 +282,8 @@ class BrowserManager {
   }
 
   /**
-   * Launch browser based on environment - using Playwright Firefox
-   * @returns {Promise<Browser>} Playwright Firefox browser instance
+   * Launch browser based on environment - using Playwright Chromium
+   * @returns {Promise<Browser>} Playwright Chromium browser instance
    */
   async launchBrowser() {
     const configuredHeadlessMode = appConfig.browser.headlessMode;
@@ -305,25 +320,32 @@ class BrowserManager {
       resolvedHeadless = true;
     }
 
-    // PHASE 2: Use Firefox instead of Chromium (40-60% lighter resource footprint)
-    // Firefox-specific launch arguments (Chrome-specific args are ignored by Firefox)
+    // Use Chromium for optimal memory efficiency and performance
+    // Chromium-specific launch arguments for stealth and resource optimization
     const launchArgs = [
+      // Disable automation detection
+      "--disable-blink-features=AutomationControlled",
+      // Disable auto-update and default checks
+      "--no-service-autorun",
+      "--no-default-browser-check",
+      "--disable-default-apps",
       // Security & privacy
-      "-no-remote",
-      "-new-instance",
-      // Disable features that waste resources
-      "-pref",
-      "dom.webdriver.enabled=false",
-      "-pref",
-      "useragent.override=Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+      "--no-sandbox",
+      "--disable-gpu",
+      // Disable resource-intensive features
+      "--disable-dev-shm-usage",
+      "--disable-extensions",
+      "--disable-sync",
+      "--disable-translate",
+      "--disable-background-networking",
     ];
 
-    logger.info("🦊 Launching Firefox browser via Playwright");
+    logger.info("🌐 Launching Chromium browser via Playwright");
 
-    const browser = await playwright.firefox.launch({
+    const browser = await playwright.chromium.launch({
       headless: resolvedHeadless,
       args: launchArgs,
-      // Playwright-specific options for Firefox
+      // Playwright-specific options for Chromium
       timeout: 180000,
     });
 
@@ -536,6 +558,12 @@ class BrowserManager {
     if (existing) {
       logger.system(`Closing browser for key ${browserKey}`);
       this.intentionalCloseUsers.add(browserKey);
+      
+      // OPTIMIZATION: Remove disconnect handler to prevent memory leak
+      if (existing.disconnectHandler && existing.browser) {
+        existing.browser.removeListener("disconnected", existing.disconnectHandler);
+      }
+      
       try {
         await existing.browser.close();
       } catch (err) {
