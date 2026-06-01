@@ -320,24 +320,23 @@ class BrowserManager {
       resolvedHeadless = true;
     }
 
-    // Use Chromium for optimal memory efficiency and performance
-    // Chromium-specific launch arguments for stealth and resource optimization
     const launchArgs = [
-      // Disable automation detection
       "--disable-blink-features=AutomationControlled",
-      // Disable auto-update and default checks
       "--no-service-autorun",
       "--no-default-browser-check",
       "--disable-default-apps",
-      // Security & privacy
       "--no-sandbox",
       "--disable-gpu",
-      // Disable resource-intensive features
       "--disable-dev-shm-usage",
       "--disable-extensions",
       "--disable-sync",
       "--disable-translate",
       "--disable-background-networking",
+    '--disable-dev-shm-usage',
+    '--single-process',         
+    '--no-zygote',       
+    '--js-flags=--max-old-space-size=256', 
+    '--memory-pressure-off',
     ];
 
     logger.info("🌐 Launching Chromium browser via Playwright");
