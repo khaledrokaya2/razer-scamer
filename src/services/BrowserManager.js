@@ -332,11 +332,16 @@ class BrowserManager {
       "--disable-sync",
       "--disable-translate",
       "--disable-background-networking",
-    '--disable-dev-shm-usage',
     '--single-process',         
     '--no-zygote',       
     '--js-flags=--max-old-space-size=256', 
-    '--memory-pressure-off',
+    '--renderer-process-limit=1',
+    '--disk-cache-size=1',              // minimize disk cache
+    '--media-cache-size=1',             // minimize media cache
+    '--aggressive-cache-discard',       // discard cache aggressively
+    '--disable-application-cache',
+    '--disable-offline-load-stale-cache',
+    '--enable-low-end-device-mode',     // activates memory saving behaviors
     ];
 
     logger.info("🌐 Launching Chromium browser via Playwright");
