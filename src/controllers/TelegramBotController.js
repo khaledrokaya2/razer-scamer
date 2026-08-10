@@ -1989,12 +1989,12 @@ class TelegramBotController {
 
       await this.safeSendMessage(
         chatId,
-        "⏳ Browser is getting ready. Testing your new credentials now...\nUse /cancel to keep old credentials.",
+        "⏳ Testing new credentials (up to 3 attempts)...\nUse /cancel to keep old credentials.",
       );
 
       throwIfCancelled();
 
-      // Credentials changed: restart both global browsers and test new credentials on both.
+      // Credentials changed: restart browsers and test new credentials (max 3 attempts).
       await purchaseService.resetUserBrowsers(telegramUserId);
       throwIfCancelled();
 
@@ -2002,6 +2002,7 @@ class TelegramBotController {
         telegramUserId,
         {
           forceRestart: true,
+          maxLoginAttempts: 3,
           credentialsOverride: {
             email,
             password: passwordTrimmed,
@@ -2011,7 +2012,10 @@ class TelegramBotController {
       throwIfCancelled();
 
       if (!readyResult || readyResult.count <= 0) {
-        throw new Error("Both browser logins failed with new credentials");
+        const failure = new Error("New credentials failed login after 3 attempts");
+        failure.code = "INVALID_NEW_CREDENTIALS";
+        failure.failures = readyResult?.failures || [];
+        throw failure;
       }
 
       // At least one browser login succeeded - persist encrypted credentials.
@@ -2068,41 +2072,49 @@ class TelegramBotController {
       const cancelledByUser =
         err.message === "Credentials update cancelled by user" ||
         (controller && controller.cancelled);
+      const invalidNewCredentials = err.code === "INVALID_NEW_CREDENTIALS";
 
-      if (cancelledByUser) {
+      const restorePreviousCredentials = async (successMessage) => {
+        await purchaseService.resetUserBrowsers(telegramUserId);
+
+        if (
+          controller &&
+          controller.previousCredentials &&
+          controller.previousCredentials.email &&
+          controller.previousCredentials.password
+        ) {
+          await scraperService.login(
+            telegramUserId,
+            controller.previousCredentials.email,
+            controller.previousCredentials.password,
+          );
+
+          purchaseService
+            .ensureReadyBrowsers(telegramUserId, { forceRestart: false })
+            .catch((syncErr) => {
+              logger.warn(
+                `Background ready-session sync failed after credentials rollback for user ${telegramUserId}: ${syncErr.message}`,
+              );
+            });
+
+          await this.safeSendMessage(chatId, successMessage, {
+            parse_mode: "Markdown",
+          });
+        } else {
+          await this.safeSendMessage(
+            chatId,
+            "❌ Credentials were not saved. No old credentials found to restore.",
+          );
+        }
+      };
+
+      if (cancelledByUser || invalidNewCredentials) {
         try {
-          await purchaseService.resetUserBrowsers(telegramUserId);
+          const message = invalidNewCredentials
+            ? "❌ *New credentials are wrong*\nLogin failed after 3 attempts. Old credentials were kept and session restored."
+            : "❌ Credentials were not saved. Restored previous credentials and browser session is ready.";
 
-          if (
-            controller &&
-            controller.previousCredentials &&
-            controller.previousCredentials.email &&
-            controller.previousCredentials.password
-          ) {
-            await scraperService.login(
-              telegramUserId,
-              controller.previousCredentials.email,
-              controller.previousCredentials.password,
-            );
-
-            purchaseService
-              .ensureReadyBrowsers(telegramUserId, { forceRestart: false })
-              .catch((syncErr) => {
-                logger.warn(
-                  `Background ready-session sync failed after credentials rollback for user ${telegramUserId}: ${syncErr.message}`,
-                );
-              });
-
-            await this.safeSendMessage(
-              chatId,
-              "❌ Credentials were not saved. Restored previous credentials and browser session is ready.",
-            );
-          } else {
-            await this.safeSendMessage(
-              chatId,
-              "❌ Credentials were not saved. No old credentials found to restore.",
-            );
-          }
+          await restorePreviousCredentials(message);
         } catch (rollbackErr) {
           logger.error(
             "Error restoring previous credentials session:",
@@ -2110,7 +2122,9 @@ class TelegramBotController {
           );
           await this.safeSendMessage(
             chatId,
-            "❌ Credentials were not saved, but restoring old browser session failed. Use /start or /settings.",
+            invalidNewCredentials
+              ? "❌ New credentials are wrong and were not saved. Restoring old browser session failed. Use /start or /settings."
+              : "❌ Credentials were not saved, but restoring old browser session failed. Use /start or /settings.",
           );
         } finally {
           sessionManager.clearCredentials(chatId);

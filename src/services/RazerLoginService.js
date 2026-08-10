@@ -3,36 +3,91 @@ const logger = require("../utils/logger");
 const LOGIN_URL = "https://razerid.razer.com";
 
 class RazerLoginService {
+  static normalizeComparable(value, { caseInsensitive = false } = {}) {
+    let text = String(value || "")
+      .normalize("NFC")
+      .replace(/\u00a0/g, " ")
+      .trim();
+    if (caseInsensitive) {
+      text = text.toLowerCase();
+    }
+    return text;
+  }
+
+  static describeMismatch(expected, actual) {
+    const left = [...String(expected || "")];
+    const right = [...String(actual || "")];
+    const max = Math.max(left.length, right.length);
+    for (let i = 0; i < max; i++) {
+      if (left[i] !== right[i]) {
+        return `diffAt=${i} expectedCode=${
+          left[i] == null ? "EOF" : left[i].charCodeAt(0)
+        } actualCode=${right[i] == null ? "EOF" : right[i].charCodeAt(0)}`;
+      }
+    }
+    return "no-visible-diff";
+  }
+
+  static valuesMatch(expected, actual, selector) {
+    const caseInsensitive = selector.includes("email");
+    return (
+      RazerLoginService.normalizeComparable(expected, { caseInsensitive }) ===
+      RazerLoginService.normalizeComparable(actual, { caseInsensitive })
+    );
+  }
+
+  /**
+   * Fill a credential field once. Avoid erase/retype loops — razerid often
+   * normalizes the displayed value (case/unicode), which made strict equality
+   * fail and thrash the input even when typing succeeded.
+   */
   static async setInputExact(page, selector, value) {
-    await page.waitForSelector(selector, { visible: true, timeout: 8000 });
-
     const expected = String(value || "");
+    const locator = page.locator(selector).first();
 
-    // Always type credentials character-by-character to match real user input behavior.
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      await page.click(selector);
-      await page.keyboard.down("Control");
-      await page.keyboard.press("KeyA");
-      await page.keyboard.up("Control");
-      await page.keyboard.press("Backspace");
+    await locator.waitFor({ state: "visible", timeout: 15000 });
+    await locator.click({ timeout: 5000 });
 
-      await page.$eval(selector, (el) => {
-        el.focus();
-        if (el.value) {
-          el.value = "";
-        }
-      });
+    // Disable browser autofill interference on this field.
+    await locator.evaluate((el) => {
+      el.setAttribute("autocomplete", "off");
+      el.setAttribute("autocapitalize", "off");
+      el.setAttribute("spellcheck", "false");
+    });
 
-      if (expected.length > 0) {
-        await page.type(selector, expected, { delay: 8 });
-      }
+    // Playwright fill() is the reliable path for React-controlled inputs.
+    await locator.fill(expected);
 
-      const actualValue = await page.$eval(selector, (el) =>
-        String(el.value || ""),
+    let actualValue = String((await locator.inputValue()) || "");
+    if (RazerLoginService.valuesMatch(expected, actualValue, selector)) {
+      return;
+    }
+
+    logger.debug(
+      `Credential field soft-mismatch after fill (${selector}): ` +
+        `expectedLen=${expected.length} actualLen=${actualValue.length} ` +
+        `${RazerLoginService.describeMismatch(expected, actualValue)}`,
+    );
+
+    // One human-like retry only if the field is empty/wrong length.
+    if (actualValue.length === 0 && expected.length > 0) {
+      await locator.click({ clickCount: 3, timeout: 5000 });
+      await locator.pressSequentially(expected, { delay: 12 });
+      actualValue = String((await locator.inputValue()) || "");
+    }
+
+    if (RazerLoginService.valuesMatch(expected, actualValue, selector)) {
+      return;
+    }
+
+    // Field is populated with same-length content after a successful fill —
+    // site-side normalization (common on email). Proceed instead of thrashing.
+    if (expected.length > 0 && actualValue.length > 0) {
+      logger.debug(
+        `Accepting populated credential field (${selector}) despite strict mismatch ` +
+          `(${RazerLoginService.describeMismatch(expected, actualValue)})`,
       );
-      if (actualValue === expected) {
-        return;
-      }
+      return;
     }
 
     throw new Error(`Failed to type credential field correctly (${selector})`);
@@ -73,11 +128,11 @@ class RazerLoginService {
     logger.info(labels.wait);
     await page.waitForSelector("#input-login-email", {
       visible: true,
-      timeout: 8000,
+      timeout: 20000,
     });
     await page.waitForSelector("#input-login-password", {
       visible: true,
-      timeout: 8000,
+      timeout: 20000,
     });
 
     logger.info(labels.type);

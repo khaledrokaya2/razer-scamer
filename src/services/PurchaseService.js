@@ -414,7 +414,7 @@ class PurchaseService {
     * @param {Function} options.onProgress - Optional callback: ({ready, target, phase})
    * @returns {Promise<{ready: boolean, count: number, reason?: string}>}
    */
-  async ensureReadyBrowsers(telegramUserId, { forceRestart = false, onProgress = null, credentialsOverride = null } = {}) {
+  async ensureReadyBrowsers(telegramUserId, { forceRestart = false, onProgress = null, credentialsOverride = null, maxLoginAttempts = null } = {}) {
     return this.runWithBrowserLock('ready-browser-init', async () => {
     const scopeKey = this.getGlobalScopeKey();
     if (this.readyInitLocks.has(scopeKey)) {
@@ -424,6 +424,17 @@ class PurchaseService {
     const initPromise = (async () => {
       const db = require('./DatabaseService');
       const credentials = credentialsOverride || await db.getUserCredentials(telegramUserId);
+      // Credential-update tests should fail fast (3 tries). Normal pool init keeps 5.
+      const resolvedMaxLoginAttempts = (() => {
+        const raw =
+          maxLoginAttempts != null
+            ? maxLoginAttempts
+            : credentialsOverride
+              ? 3
+              : 5;
+        const parsed = Number.parseInt(raw, 10);
+        return Number.isInteger(parsed) && parsed > 0 ? parsed : 5;
+      })();
 
       if (!credentials || !credentials.email || !credentials.password) {
         await this.closeReadyBrowsersForUser(telegramUserId);
@@ -477,7 +488,8 @@ class PurchaseService {
           const browserKey = this.getGlobalBrowserKeyForSlot(slot);
           const session = await this.launchReadyBrowserWithRetry(telegramUserId, credentials, slot, {
             browserKey,
-            logPrefix: `[Ready ${slot}]`
+            logPrefix: `[Ready ${slot}]`,
+            maxAttempts: resolvedMaxLoginAttempts,
           });
           sessionMap.set(slot, session);
 
@@ -545,12 +557,12 @@ class PurchaseService {
    * @returns {Promise<{browser: Object, page: Object, slot: number}>}
    */
   async launchReadyBrowserWithRetry(telegramUserId, credentials, slot, options = {}) {
-    const maxAttempts = 5;
     const {
       keepPoolAtMaxOnDisconnect = true,
       headless = true,
       logPrefix = `[Ready ${slot}]`,
-      browserKey = this.getGlobalBrowserKeyForSlot(slot)
+      browserKey = this.getGlobalBrowserKeyForSlot(slot),
+      maxAttempts = 5,
     } = options;
     const scopeKey = this.getGlobalScopeKey();
 
