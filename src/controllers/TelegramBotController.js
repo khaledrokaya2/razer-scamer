@@ -38,6 +38,8 @@ class TelegramBotController {
     this.operationSeq = 0;
     // Track in-progress credential update tests for /cancel rollback support.
     this.credentialsUpdateControllers = new Map(); // userId -> { cancelled: boolean, previousCredentials }
+    // Track in-progress backup-code reload for exclusive busy + immediate /cancel.
+    this.backupCodeReloadControllers = new Map(); // scopeKey -> { cancelled: boolean }
     this.GLOBAL_SCOPE_KEY = "__GLOBAL_BOT_SCOPE__";
     // Cleanup rate limit map periodically
     this.startRateLimitCleanup();
@@ -96,11 +98,21 @@ class TelegramBotController {
     if (type === "settings") return "settings update";
     if (type === "info") return "info request";
     if (type === "callback") return "current action";
+    if (type === "reload_backup") return "backup code reload";
     return type;
   }
 
   async sendBusyMessage(chatId, operation) {
-    const operationName = this.formatOperationName(operation && operation.type);
+    const type = operation && operation.type;
+    if (type === "reload_backup") {
+      await this.safeSendMessage(
+        chatId,
+        "⏳ Bot is busy reloading the backup codes.\nUse /cancel to stop immediately. Existing codes will be kept.",
+      );
+      return;
+    }
+
+    const operationName = this.formatOperationName(type);
     const cancellableHint =
       operation && operation.cancellable
         ? "\nUse /cancel if you want to stop it."
@@ -229,9 +241,25 @@ class TelegramBotController {
       activeOperation &&
       (activeOperation.type === "purchase" ||
         activeOperation.type === "check_balance" ||
-        activeOperation.type === "transactions")
+        activeOperation.type === "transactions" ||
+        activeOperation.type === "reload_backup")
     ) {
       return activeOperation;
+    }
+
+    const reloadController = this.backupCodeReloadControllers.get(scopeKey);
+    if (reloadController && reloadController.cancelled !== true) {
+      return {
+        id: -4,
+        type: "reload_backup",
+        cancellable: true,
+        startedAt: reloadController.startedAt || Date.now(),
+      };
+    }
+
+    const activeOp = this.getActiveOperation(telegramUserId);
+    if (activeOp && activeOp.type === "reload_backup") {
+      return activeOp;
     }
 
     return null;
@@ -254,6 +282,7 @@ class TelegramBotController {
     return (
       callbackData === "order_cancel" ||
       callbackData === "order_cancel_processing" ||
+      callbackData === "settings_backup_codes_cancel_manual" ||
       callbackData.startsWith("scheduled_cancel_")
     );
   }
@@ -468,6 +497,9 @@ class TelegramBotController {
     this.bot.onText(/\/schedule/, (msg) => this.handleScheduleCommand(msg));
     this.bot.onText(/\/info/, (msg) => this.handleInfoCommand(msg));
     this.bot.onText(/\/cancel/, (msg) => this.handleCancelCommand(msg));
+    this.bot.onText(/\/reload_backup/, (msg) =>
+      this.handleReloadBackupCommand(msg),
+    );
 
     // Handle callback queries (button clicks)
     this.bot.on("callback_query", (query) => this.handleCallbackQuery(query));
@@ -1046,6 +1078,42 @@ class TelegramBotController {
         return;
       }
 
+      // Immediate cancel for backup-code reload — keep existing DB codes
+      const scopeKeyEarly = this.getScopeKey(telegramUserId);
+      const reloadController =
+        this.backupCodeReloadControllers.get(scopeKeyEarly);
+      if (
+        (reloadController && reloadController.cancelled !== true) ||
+        (activeOperation && activeOperation.type === "reload_backup")
+      ) {
+        if (reloadController) {
+          reloadController.cancelled = true;
+        }
+        try {
+          if (sessionManager.getSession(chatId)?.state === "update_backup_codes") {
+            sessionManager.updateState(chatId, "idle");
+          }
+        } catch (_) {}
+        await this.bot.sendMessage(
+          chatId,
+          "🛑 Stopping backup code reload now.\nExisting backup codes were kept as they are.",
+        );
+        return;
+      }
+
+      // Cancel waiting for manual backup-code paste
+      try {
+        const session = sessionManager.getSession(chatId);
+        if (session && session.state === "update_backup_codes") {
+          sessionManager.updateState(chatId, "idle");
+          await this.bot.sendMessage(
+            chatId,
+            "✅ Cancelled. Bot is no longer waiting for backup codes.",
+          );
+          return;
+        }
+      } catch (_) {}
+
       if (activeOperation && !activeOperation.cancellable) {
         await this.bot.sendMessage(
           chatId,
@@ -1331,6 +1399,18 @@ class TelegramBotController {
 
         case "settings_backup_codes":
           await this.handleBackupCodesMenu(chatId, telegramUserId);
+          break;
+
+        case "settings_backup_codes_add_manual":
+          await this.handleBackupCodesAddManual(chatId, telegramUserId);
+          break;
+
+        case "settings_backup_codes_cancel_manual":
+          await this.handleBackupCodesCancelManual(chatId);
+          break;
+
+        case "settings_backup_codes_reload":
+          await this.handleBackupCodesReloadFromRazer(chatId, telegramUserId);
           break;
 
         case "close_menu":
@@ -1778,7 +1858,7 @@ class TelegramBotController {
   }
 
   /**
-   * Handle Backup Codes menu
+   * Handle Backup Codes menu — show counts + Add Manual / Reload actions.
    * @param {string} chatId - Chat ID
    * @param {string} telegramUserId - Telegram user ID
    */
@@ -1786,23 +1866,309 @@ class TelegramBotController {
     const db = require("../services/DatabaseService");
 
     try {
-      // Get current backup code count
-      const count = await db.getActiveBackupCodeCount(telegramUserId);
+      const counts = await db.getBackupCodeCounts(telegramUserId);
+      const keyboard = {
+        inline_keyboard: [
+          [
+            {
+              text: "✍️ Add Manual",
+              callback_data: "settings_backup_codes_add_manual",
+            },
+          ],
+          [
+            {
+              text: "🔄 Reload from Razer",
+              callback_data: "settings_backup_codes_reload",
+            },
+          ],
+        ],
+      };
 
       await this.bot.sendMessage(
         chatId,
-        `🔑 *BACKUP CODES* (${count}/10)\nEnter 10 codes, one per line\nExample: 12345678\n\u26a0️ Must be 8 digits each`,
-        { parse_mode: "Markdown" },
+        `🔑 *BACKUP CODES*\n✅ Active: *${counts.active}*\n🚫 Inactive: *${counts.inactive}*\n\nChoose how to update codes:`,
+        { parse_mode: "Markdown", reply_markup: keyboard },
       );
 
-      // Set session state
+      // Do not wait for paste until user picks Add Manual
+      try {
+        if (sessionManager.getSession(chatId)?.state === "update_backup_codes") {
+          sessionManager.updateState(chatId, "idle");
+        }
+      } catch (_) {}
+    } catch (err) {
+      logger.error("Error showing backup codes menu:", err);
+      await this.bot.sendMessage(chatId, "❌ Error. Try again.");
+    }
+  }
+
+  /**
+   * Prompt user to paste 10 backup codes, with cancel button.
+   */
+  async handleBackupCodesAddManual(chatId, telegramUserId) {
+    try {
       if (!sessionManager.getSession(chatId)) {
         sessionManager.createSession(chatId);
       }
       sessionManager.updateState(chatId, "update_backup_codes");
+
+      const keyboard = {
+        inline_keyboard: [
+          [
+            {
+              text: "❌ Cancel",
+              callback_data: "settings_backup_codes_cancel_manual",
+            },
+          ],
+        ],
+      };
+
+      await this.bot.sendMessage(
+        chatId,
+        "✍️ *ADD BACKUP CODES*\nEnter *10* codes, one per line.\nEach code must be *8 digits*.\nExample:\n`12345678`",
+        { parse_mode: "Markdown", reply_markup: keyboard },
+      );
     } catch (err) {
-      logger.error("Error showing backup codes menu:", err);
+      logger.error("Error starting manual backup codes input:", err);
       await this.bot.sendMessage(chatId, "❌ Error. Try again.");
+    }
+  }
+
+  /**
+   * Cancel waiting for manual backup-code paste.
+   */
+  async handleBackupCodesCancelManual(chatId) {
+    try {
+      if (sessionManager.getSession(chatId)) {
+        sessionManager.updateState(chatId, "idle");
+      }
+      await this.bot.sendMessage(
+        chatId,
+        "✅ Cancelled. Bot is no longer waiting for backup codes.",
+      );
+    } catch (err) {
+      logger.error("Error cancelling manual backup codes input:", err);
+      await this.bot.sendMessage(chatId, "❌ Error. Try again.");
+    }
+  }
+
+  clearBackupCodeReloadController(telegramUserId) {
+    const scopeKey = this.getScopeKey(telegramUserId);
+    this.backupCodeReloadControllers.delete(scopeKey);
+  }
+
+  /**
+   * Handle /reload_backup — generate fresh Razer backup codes (Settings-only).
+   * @param {object} msg - Telegram message object
+   */
+  async handleReloadBackupCommand(msg) {
+    const chatId = msg.chat.id.toString();
+    const telegramUserId = msg.from.id.toString();
+    const operation = await this.tryBeginCommandOperation(
+      chatId,
+      telegramUserId,
+      "reload_backup",
+      true,
+    );
+    if (!operation) {
+      return;
+    }
+
+    try {
+      const isAuthorized = await this.ensureAuthorized(chatId, telegramUserId);
+      if (!isAuthorized) {
+        return;
+      }
+
+      await this.handleBackupCodesReloadFromRazer(chatId, telegramUserId, {
+        operationAlreadyHeld: true,
+      });
+    } catch (err) {
+      logger.error("Error in /reload_backup command:", err);
+      if (err instanceof BrowserBusyError) {
+        await this.bot.sendMessage(
+          chatId,
+          `⚠️ Browser is busy with: ${err.browserBusyReason}\n\nYou can cancel the running process by sending /cancel.`,
+        );
+      } else {
+        await this.bot.sendMessage(chatId, "❌ Error. Try again later.");
+      }
+    } finally {
+      this.clearUserOperation(telegramUserId, operation.id);
+      this.clearBackupCodeReloadController(telegramUserId);
+    }
+  }
+
+  /**
+   * Unlock Razer ID → Generate New Codes → replace DB → reply with codes.
+   * Does not change purchase/checkout flow.
+   * @param {string} chatId
+   * @param {string} telegramUserId
+   * @param {{operationAlreadyHeld?: boolean}} [options]
+   */
+  async handleBackupCodesReloadFromRazer(
+    chatId,
+    telegramUserId,
+    options = {},
+  ) {
+    const { operationAlreadyHeld = false } = options;
+    const backupCodeReloadService = require("../services/BackupCodeReloadService");
+    const scopeKey = this.getScopeKey(telegramUserId);
+
+    const existingReload = this.backupCodeReloadControllers.get(scopeKey);
+    if (existingReload && existingReload.cancelled !== true) {
+      await this.bot.sendMessage(
+        chatId,
+        "⏳ Bot is busy reloading the backup codes.\nUse /cancel to stop immediately. Existing codes will be kept.",
+      );
+      return;
+    }
+
+    if (browserManager.isBrowserBusy) {
+      await this.bot.sendMessage(
+        chatId,
+        `⚠️ Browser is busy with: ${browserManager.busyReason || "another task"}\n\nTry again when it is free, or use /cancel if that task can be stopped.`,
+      );
+      return;
+    }
+
+    if (!(await this.ensureGlobalPoolReadyOrNotify(chatId, telegramUserId))) {
+      return;
+    }
+
+    let ownedOperation = null;
+    if (!operationAlreadyHeld) {
+      const active = this.getActiveOperation(telegramUserId);
+      if (
+        active &&
+        active.type !== "callback" &&
+        active.type !== "reload_backup"
+      ) {
+        await this.sendBusyMessage(chatId, active);
+        return;
+      }
+      if (!active) {
+        ownedOperation = this.beginUserOperation(
+          telegramUserId,
+          "reload_backup",
+          true,
+        );
+        if (!ownedOperation) {
+          await this.sendBusyMessage(
+            chatId,
+            this.getActiveOperation(telegramUserId),
+          );
+          return;
+        }
+      } else if (active.type === "callback") {
+        active.type = "reload_backup";
+        active.cancellable = true;
+      }
+    }
+
+    const reloadController = { cancelled: false, startedAt: Date.now() };
+    this.backupCodeReloadControllers.set(scopeKey, reloadController);
+
+    try {
+      if (sessionManager.getSession(chatId)?.state === "update_backup_codes") {
+        sessionManager.updateState(chatId, "idle");
+      }
+    } catch (_) {}
+
+    const loadingMsg = await this.bot.sendMessage(
+      chatId,
+      "⏳ Reloading backup codes from Razer ID (unlock → generate fresh → save)...\nUse /cancel to stop immediately. Existing codes stay unchanged until reload finishes.",
+    );
+
+    try {
+      const result = await backupCodeReloadService.reloadFreshBackupCodes(
+        telegramUserId,
+        {
+          checkCancelled: () => reloadController.cancelled === true,
+        },
+      );
+
+      try {
+        await this.bot.deleteMessage(chatId, loadingMsg.message_id);
+      } catch (_) {}
+
+      if (reloadController.cancelled || result.errorCode === "CANCELLED") {
+        await this.bot.sendMessage(
+          chatId,
+          "🛑 Backup code reload cancelled.\nExisting backup codes were kept as they are.",
+        );
+        return;
+      }
+
+      if (!result.ok) {
+        if (result.errorCode === "NO_ACTIVE_CODES") {
+          await this.bot.sendMessage(
+            chatId,
+            "⚠️ No active backup codes. Add codes first (Add Manual) before reload.",
+          );
+          return;
+        }
+
+        if (
+          result.errorCode === "OTP_FAILED" ||
+          result.errorCode === "OTP_FAILED_SINGLE"
+        ) {
+          await this.bot.sendMessage(
+            chatId,
+            "❌ Reload failed — backup code verification failed.",
+          );
+          return;
+        }
+
+        await this.bot.sendMessage(
+          chatId,
+          `❌ ${result.message || "Reload failed. Try again."}`,
+        );
+        return;
+      }
+
+      const list = (result.codes || []).map((c) => `\`${c}\``).join("\n");
+      await this.bot.sendMessage(
+        chatId,
+        `✅ Generated *${result.codes.length}* fresh backup codes:\n${list}`,
+        { parse_mode: "Markdown" },
+      );
+    } catch (err) {
+      logger.error("Error reloading backup codes from Razer:", err);
+
+      try {
+        await this.bot.deleteMessage(chatId, loadingMsg.message_id);
+      } catch (_) {}
+
+      if (
+        err.code === "RELOAD_CANCELLED" ||
+        reloadController.cancelled ||
+        /cancelled by user/i.test(String(err.message || ""))
+      ) {
+        await this.bot.sendMessage(
+          chatId,
+          "🛑 Backup code reload cancelled.\nExisting backup codes were kept as they are.",
+        );
+        return;
+      }
+
+      if (err instanceof BrowserBusyError) {
+        await this.bot.sendMessage(
+          chatId,
+          `⚠️ Browser is busy with: ${err.browserBusyReason}\n\nYou can cancel the running process by sending /cancel.`,
+        );
+        return;
+      }
+
+      await this.bot.sendMessage(
+        chatId,
+        `❌ Reload failed: ${err.message || "Unknown error"}`,
+      );
+    } finally {
+      this.clearBackupCodeReloadController(telegramUserId);
+      if (ownedOperation) {
+        this.clearUserOperation(telegramUserId, ownedOperation.id);
+      }
     }
   }
 

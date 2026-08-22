@@ -1316,6 +1316,88 @@ class DatabaseService {
   }
 
   /**
+   * Get active + inactive backup code counts for a user.
+   * Inactive = used/expired (or any non-active row when status column exists).
+   * @param {string} telegramUserId
+   * @returns {Promise<{active: number, inactive: number}>}
+   */
+  async getBackupCodeCounts(telegramUserId) {
+    try {
+      await this.connect();
+      const scopedUserId = this.normalizeSharedOperatorId();
+
+      try {
+        const result = await this.pool
+          .request()
+          .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
+            SELECT
+              SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_count,
+              SUM(CASE WHEN status <> 'active' OR status IS NULL THEN 1 ELSE 0 END) AS inactive_count
+            FROM dbo.backup_codes
+            WHERE telegram_user_id = @telegram_user_id
+          `);
+        const row = result.recordset[0] || {};
+        return {
+          active: Number(row.active_count) || 0,
+          inactive: Number(row.inactive_count) || 0,
+        };
+      } catch (err) {
+        if (!this.isMissingStatusColumnError(err)) {
+          throw err;
+        }
+
+        try {
+          const result = await this.pool
+            .request()
+            .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
+              SELECT
+                SUM(CASE WHEN ISNULL(is_used, 0) = 0 THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN ISNULL(is_used, 0) = 1 THEN 1 ELSE 0 END) AS inactive_count
+              FROM dbo.backup_codes
+              WHERE telegram_user_id = @telegram_user_id
+            `);
+          const row = result.recordset[0] || {};
+          return {
+            active: Number(row.active_count) || 0,
+            inactive: Number(row.inactive_count) || 0,
+          };
+        } catch (isUsedErr) {
+          if (!this.isMissingIsUsedColumnError(isUsedErr)) {
+            throw isUsedErr;
+          }
+
+          try {
+            const result = await this.pool
+              .request()
+              .input("telegram_user_id", sql.BigInt, scopedUserId).query(`
+                SELECT
+                  SUM(CASE WHEN used_at IS NULL THEN 1 ELSE 0 END) AS active_count,
+                  SUM(CASE WHEN used_at IS NOT NULL THEN 1 ELSE 0 END) AS inactive_count
+                FROM dbo.backup_codes
+                WHERE telegram_user_id = @telegram_user_id
+              `);
+            const row = result.recordset[0] || {};
+            return {
+              active: Number(row.active_count) || 0,
+              inactive: Number(row.inactive_count) || 0,
+            };
+          } catch (usedAtErr) {
+            if (!this.isMissingUsedAtColumnError(usedAtErr)) {
+              throw usedAtErr;
+            }
+
+            const active = await this.getActiveBackupCodeCount(telegramUserId);
+            return { active, inactive: 0 };
+          }
+        }
+      }
+    } catch (err) {
+      logger.error("Error getting backup code counts:", err);
+      throw err;
+    }
+  }
+
+  /**
    * Delete all backup codes for a user
    * @param {string} telegramUserId - Telegram user ID
    * @returns {Promise<boolean>} True if deleted
