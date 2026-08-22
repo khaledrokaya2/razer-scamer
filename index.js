@@ -87,6 +87,7 @@ async function initializeServices(config) {
   await browserManager.initializeBrowserAtStartup();
 
   logger.success('All services initialized');
+  return config;
 }
 
 /**
@@ -108,8 +109,20 @@ async function startApplication() {
   botController.start();
 
   logger.separator();
-  logger.success('Bot is ready to accept commands!');
-  logger.info('Browser is ready - all commands work immediately');
+  const bootstrapResult = browserManager.lastBootstrapResult;
+  if (bootstrapResult?.outcome === 'ready') {
+    logger.success('Bot is ready to accept commands!');
+    logger.info('Browser is ready - all commands work immediately');
+  } else if (bootstrapResult?.outcome === 'cleared') {
+    logger.warn('Bot started without a logged-in browser (stored credentials were cleared after failed login).');
+    logger.info('Add credentials in /settings before using purchase commands.');
+  } else if (bootstrapResult?.outcome === 'error') {
+    logger.warn(`Bot started but browser login hit an error: ${bootstrapResult.reason || 'unknown'}`);
+    logger.info('Stored credentials were kept. Retry with /settings or restart the bot.');
+  } else {
+    logger.success('Bot is ready to accept commands!');
+    logger.info('No stored credentials yet - add them in /settings to enable purchases.');
+  }
   logger.separator();
 }
 

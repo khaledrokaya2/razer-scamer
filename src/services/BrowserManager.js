@@ -11,6 +11,7 @@ const logger = require("../utils/logger");
 const appConfig = require("../config/app-config");
 const AntibanService = require("./AntibanService");
 const RazerLoginService = require("./RazerLoginService");
+const credentialBootstrapService = require("./CredentialBootstrapService");
 
 const playwright = AntibanService.getPlaywright();
 const setupPage = AntibanService.setupPage;
@@ -40,6 +41,7 @@ class BrowserManager {
     this.restartTimer = null;
     this.lastRestartTime = null;
     this.restartRetryTimer = null;
+    this.lastBootstrapResult = null;
 
     this.MAX_BROWSERS = appConfig.purchase.maxReadyBrowsers ?? 2;
     this.GLOBAL_BROWSER_SLOTS = this._generateBrowserSlots(this.MAX_BROWSERS);
@@ -320,6 +322,8 @@ class BrowserManager {
       resolvedHeadless = true;
     }
 
+    // Avoid --single-process / --no-zygote: they cause intermittent about:blank
+    // and net::ERR_ABORTED navigations even when the host network is fine.
     const launchArgs = [
       "--disable-blink-features=AutomationControlled",
       "--no-service-autorun",
@@ -332,16 +336,12 @@ class BrowserManager {
       "--disable-sync",
       "--disable-translate",
       "--disable-background-networking",
-    '--single-process',         
-    '--no-zygote',       
-    '--js-flags=--max-old-space-size=256', 
-    '--renderer-process-limit=1',
-    '--disk-cache-size=1',              // minimize disk cache
-    '--media-cache-size=1',             // minimize media cache
-    '--aggressive-cache-discard',       // discard cache aggressively
-    '--disable-application-cache',
-    '--disable-offline-load-stale-cache',
-    '--enable-low-end-device-mode',     // activates memory saving behaviors
+      "--js-flags=--max-old-space-size=512",
+      "--disk-cache-size=1",
+      "--media-cache-size=1",
+      "--aggressive-cache-discard",
+      "--disable-application-cache",
+      "--disable-offline-load-stale-cache",
     ];
 
     logger.info("🌐 Launching Chromium browser via Playwright");
@@ -755,9 +755,26 @@ class BrowserManager {
 
   async login(userId, email, password) {
     const browserKey = this.normalizeBrowserKey(userId);
-    const { page } = await this.getBrowser(browserKey);
+    let { page } = await this.getBrowser(browserKey);
 
     this.markSessionReady(userId, false);
+
+    // Only recreate for real Chromium error pages. Fresh pages are always
+    // about:blank — that is normal and must NOT trigger a recreate.
+    let pageUrl = "";
+    try {
+      pageUrl = page.url();
+    } catch (_) {
+      pageUrl = "";
+    }
+    if (RazerLoginService.isChromeErrorUrl(pageUrl)) {
+      logger.warn(
+        `Login page for ${browserKey} is on chrome-error (${pageUrl}) - recreating browser before login`,
+      );
+      await this.closeBrowser(browserKey);
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      ({ page } = await this.getBrowser(browserKey));
+    }
 
     await setupPage(page);
     await page.setDefaultTimeout(45000);
@@ -770,6 +787,13 @@ class BrowserManager {
       submitLabel: "Submitting login...",
     });
 
+    // Refresh page handle in case login recovered/replaced navigation state.
+    const session = this.userBrowsers.get(browserKey);
+    if (!session || !session.page) {
+      throw new Error(`Browser session lost during login for key ${browserKey}`);
+    }
+    page = session.page;
+
     await page.goto("https://gold.razer.com/global/en", {
       waitUntil: "domcontentloaded",
       timeout: 30000,
@@ -781,7 +805,7 @@ class BrowserManager {
     this.updateActivity(userId);
 
     logger.success(`Login successful for key ${browserKey}`);
-    return { browser: this.userBrowsers.get(browserKey).browser, page };
+    return { browser: session.browser, page };
   }
 
   async loginWithStoredCredentials(userId) {
@@ -891,107 +915,40 @@ class BrowserManager {
     logger.system("Restart Started: closing browser and re-launching");
 
     try {
-      const db = require("./DatabaseService");
-      const sharedOperatorUserId = db.getSharedOperatorUserId();
-      const credentials = await db.getUserCredentials(sharedOperatorUserId);
+      const result = await credentialBootstrapService.bootstrapRestartLogin();
 
-      if (!credentials || !credentials.email || !credentials.password) {
-        throw new Error("No credentials found for browser restart relogin");
-      }
-
-      for (const slotKey of this.GLOBAL_BROWSER_SLOTS) {
-        try {
-          await this.closeBrowser(slotKey);
-        } catch (err) {
-          logger.debug(
-            `Error closing browser slot ${slotKey} during restart: ${err.message}`,
-          );
-        }
-      }
-
-      const browserKey = this.GLOBAL_BROWSER_SLOTS[0];
-      const { page } = await this.getBrowser(browserKey);
-
-      await setupPage(page);
-      await RazerLoginService.loginOnPage(
-        page,
-        credentials.email,
-        credentials.password,
-        {
-          openLabel: "Opening Razer login page for restart relogin...",
-          waitLabel: "Waiting for restart relogin form...",
-          typeLabel: "Typing restart relogin credentials...",
-          submitLabel: "Submitting restart relogin...",
-        },
-      );
-
-      await page.goto("https://gold.razer.com/global/en", {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
-      });
-      await humanDelay();
-      if (await isBanned(page)) throw new Error("rate limited after restart");
-
-      this.markSessionReady(browserKey, true);
-
-      for (let i = 2; i <= this.MAX_BROWSERS; i++) {
-        const slotKey = this.getGlobalBrowserKeyForSlot(i);
-        try {
-          const slotResult = await this.getBrowser(slotKey);
-          const slotPage = slotResult.page;
-          await setupPage(slotPage);
-          await RazerLoginService.loginOnPage(
-            slotPage,
-            credentials.email,
-            credentials.password,
-            {
-              openLabel: `Restart relogin slot ${i}...`,
-              waitLabel: `Waiting for restart relogin form slot ${i}...`,
-              typeLabel: `Typing restart relogin credentials slot ${i}...`,
-              submitLabel: `Submitting restart relogin slot ${i}...`,
-            },
-          );
-          await slotPage.goto("https://gold.razer.com/global/en", {
-            waitUntil: "domcontentloaded",
-            timeout: 30000,
-          });
-          this.markSessionReady(slotKey, true);
-        } catch (slotErr) {
-          logger.warn(
-            `Restart relogin failed for slot ${i}: ${slotErr.message}`,
-          );
-        }
+      if (!result.success) {
+        this.markBrowserFree(restartLockId);
+        this.stopAutoRestartTimer();
+        logger.error(
+          "Restart failed after login attempts - stored account cleared",
+        );
+        return;
       }
 
       this.markBrowserFree(restartLockId);
       this.lastRestartTime = Date.now();
-
       logger.success("Restart Completed: browser re-launched and logged in");
-
-      try {
-        const purchaseService = require("./PurchaseService");
-        await purchaseService.registerStartupBrowser();
-      } catch (regErr) {
-        logger.warn(`Failed to register restarted browser in ready pool: ${regErr.message}`);
-      }
-
       this.startAutoRestartTimer();
     } catch (err) {
       this.markBrowserFree(restartLockId);
       logger.error(`Restart Failed: ${err.message}`);
 
-      try {
-        for (const slotKey of this.GLOBAL_BROWSER_SLOTS) {
-          await this.closeBrowser(slotKey);
+      // Do not wipe credentials on lock conflicts or transient restart errors.
+      const isBusy =
+        err?.name === "BrowserBusyError" ||
+        String(err?.message || "").includes("currently busy with");
+      if (!isBusy) {
+        try {
+          const db = require("./DatabaseService");
+          const sharedOperatorUserId = db.getSharedOperatorUserId();
+          await credentialBootstrapService.clearStoredAccount(sharedOperatorUserId);
+        } catch (clearErr) {
+          logger.debug(`Cleanup after failed restart: ${clearErr.message}`);
         }
-      } catch (closeErr) {
-        logger.debug(
-          `Cleanup after failed restart: ${closeErr.message}`,
-        );
       }
 
-      this.scheduleRestartWithRetry();
-      throw err;
+      this.stopAutoRestartTimer();
     }
   }
 
@@ -1049,83 +1006,15 @@ class BrowserManager {
     });
   }
 
+  /**
+   * Initialize browser at startup using shared credential bootstrap policy.
+   * @returns {Promise<{outcome: 'ready'|'skipped'|'cleared', reason?: string, readyResult?: object}>}
+   */
   async initializeBrowserAtStartup() {
     logger.system("Initializing browser at startup...");
-
-    const db = require("./DatabaseService");
-    const sharedOperatorUserId = db.getSharedOperatorUserId();
-
-    let credentials;
-    try {
-      credentials = await db.getUserCredentials(sharedOperatorUserId);
-    } catch (err) {
-      logger.warn(
-        `Could not check credentials at startup: ${err.message}`,
-      );
-    }
-
-    if (!credentials || !credentials.email || !credentials.password) {
-      logger.system(
-        "No credentials available - skipping browser startup. Browser will launch when credentials are provided.",
-      );
-      return;
-    }
-
-    this.isBrowserBusy = true;
-    this.busyReason = "startup";
-    const startupLockId = Date.now();
-    this.busyLockId = startupLockId;
-
-    try {
-      const browserKey = this.GLOBAL_BROWSER_SLOTS[0];
-      const { page } = await this.getBrowser(browserKey);
-
-      await setupPage(page);
-      await RazerLoginService.loginOnPage(
-        page,
-        credentials.email,
-        credentials.password,
-        {
-          openLabel: "Opening Razer login page at startup...",
-          waitLabel: "Waiting for startup login form...",
-          typeLabel: "Typing startup credentials...",
-          submitLabel: "Submitting startup login...",
-        },
-      );
-
-      await page.goto("https://gold.razer.com/global/en", {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
-      });
-      await humanDelay();
-      if (await isBanned(page)) throw new Error("rate limited at startup");
-
-      this.markSessionReady(browserKey, true);
-      this.lastRestartTime = Date.now();
-      this.markBrowserFree(startupLockId);
-
-      logger.success("Browser initialized and logged in at startup");
-
-      try {
-        const purchaseService = require("./PurchaseService");
-        await purchaseService.registerStartupBrowser();
-      } catch (regErr) {
-        logger.warn(`Failed to register startup browser in ready pool: ${regErr.message}`);
-      }
-
-      this.startAutoRestartTimer();
-    } catch (err) {
-      this.markBrowserFree(startupLockId);
-      logger.error(`Browser startup failed: ${err.message}`);
-
-      try {
-        for (const slotKey of this.GLOBAL_BROWSER_SLOTS) {
-          await this.closeBrowser(slotKey);
-        }
-      } catch (closeErr) {
-        logger.debug(`Cleanup after failed startup: ${closeErr.message}`);
-      }
-    }
+    this.lastBootstrapResult =
+      await credentialBootstrapService.bootstrapStartupLogin();
+    return this.lastBootstrapResult;
   }
 }
 

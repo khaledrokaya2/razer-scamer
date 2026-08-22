@@ -93,6 +93,60 @@ class PurchaseService {
     this.STAGES = PurchaseStages;
 
     this.GLOBAL_SCOPE_KEY = '__GLOBAL_BOT_SCOPE__';
+    this.disconnectRecoveryFailures = new Map();
+    this.DISCONNECT_RECOVERY_MAX =
+      appConfig.browser.disconnectRecoveryMaxAttempts ?? 3;
+  }
+
+  scheduleReadyBrowserRecovery(telegramUserId, logPrefix) {
+    const scopeKey = this.getGlobalScopeKey();
+
+    setTimeout(() => {
+      if (this.intentionalReadyCloseUsers.has(scopeKey)) {
+        logger.debug(`${logPrefix} Recovery skipped after intentional close`);
+        return;
+      }
+      if (browserManager.isBrowserBusy) {
+        logger.debug(
+          `${logPrefix} Skipping delayed recovery - browser busy with: ${browserManager.busyReason}`,
+        );
+        return;
+      }
+
+      this.ensureReadyBrowsers(telegramUserId, { forceRestart: false })
+        .then(async (result) => {
+          if (result && result.count > 0) {
+            this.disconnectRecoveryFailures.delete(scopeKey);
+            return;
+          }
+
+          throw new Error("recovery login returned no ready browsers");
+        })
+        .catch(async (err) => {
+          const failures =
+            (this.disconnectRecoveryFailures.get(scopeKey) || 0) + 1;
+          this.disconnectRecoveryFailures.set(scopeKey, failures);
+          logger.error(
+            `${logPrefix} Failed to recover ready browser (attempt ${failures}/${this.DISCONNECT_RECOVERY_MAX}): ${err.message}`,
+          );
+
+          if (failures >= this.DISCONNECT_RECOVERY_MAX) {
+            this.disconnectRecoveryFailures.delete(scopeKey);
+            try {
+              const credentialBootstrapService = require("./CredentialBootstrapService");
+              await credentialBootstrapService.clearStoredAccount(telegramUserId);
+              browserManager.stopAutoRestartTimer();
+              logger.error(
+                `${logPrefix} Disconnect recovery exhausted - stored account cleared`,
+              );
+            } catch (clearErr) {
+              logger.error(
+                `${logPrefix} Failed to clear account after recovery exhaustion: ${clearErr.message}`,
+              );
+            }
+          }
+        });
+    }, 1500);
   }
 
   async registerStartupBrowser() {
@@ -125,18 +179,7 @@ class PurchaseService {
               }
               this.clearTwoFactorWindowState(scopeKey);
               logger.warn(`[Ready ${slot}] Browser disconnected (${browserKey}). Recreating...`);
-              setTimeout(() => {
-                if (this.intentionalReadyCloseUsers.has(scopeKey)) {
-                  return;
-                }
-                if (browserManager.isBrowserBusy) {
-                  logger.debug(`[Ready ${slot}] Skipping delayed recovery - browser busy with: ${browserManager.busyReason}`);
-                  return;
-                }
-                this.ensureReadyBrowsers(sharedOperatorUserId, { forceRestart: false }).catch(err => {
-                  logger.error(`[Ready ${slot}] Failed to recover ready browser:`, err.message);
-                });
-              }, 1500);
+              this.scheduleReadyBrowserRecovery(sharedOperatorUserId, `[Ready ${slot}]`);
             });
           }
 
@@ -153,7 +196,10 @@ class PurchaseService {
     }
   }
 
-  async runWithBrowserLock(reason, task) {
+  async runWithBrowserLock(reason, task, { skipLock = false } = {}) {
+    if (skipLock) {
+      return task();
+    }
     const lockId = browserManager.markBrowserBusy(reason);
     try {
       return await task();
@@ -414,8 +460,10 @@ class PurchaseService {
     * @param {Function} options.onProgress - Optional callback: ({ready, target, phase})
    * @returns {Promise<{ready: boolean, count: number, reason?: string}>}
    */
-  async ensureReadyBrowsers(telegramUserId, { forceRestart = false, onProgress = null, credentialsOverride = null, maxLoginAttempts = null } = {}) {
-    return this.runWithBrowserLock('ready-browser-init', async () => {
+  async ensureReadyBrowsers(telegramUserId, { forceRestart = false, onProgress = null, credentialsOverride = null, maxLoginAttempts = null, skipBrowserLock = false } = {}) {
+    return this.runWithBrowserLock(
+      'ready-browser-init',
+      async () => {
     const scopeKey = this.getGlobalScopeKey();
     if (this.readyInitLocks.has(scopeKey)) {
       return this.readyInitLocks.get(scopeKey);
@@ -424,16 +472,12 @@ class PurchaseService {
     const initPromise = (async () => {
       const db = require('./DatabaseService');
       const credentials = credentialsOverride || await db.getUserCredentials(telegramUserId);
-      // Credential-update tests should fail fast (3 tries). Normal pool init keeps 5.
+      const defaultAttempts = appConfig.browser.credentialLoginMaxAttempts ?? 2;
       const resolvedMaxLoginAttempts = (() => {
         const raw =
-          maxLoginAttempts != null
-            ? maxLoginAttempts
-            : credentialsOverride
-              ? 3
-              : 5;
+          maxLoginAttempts != null ? maxLoginAttempts : defaultAttempts;
         const parsed = Number.parseInt(raw, 10);
-        return Number.isInteger(parsed) && parsed > 0 ? parsed : 5;
+        return Number.isInteger(parsed) && parsed > 0 ? parsed : defaultAttempts;
       })();
 
       if (!credentials || !credentials.email || !credentials.password) {
@@ -546,7 +590,9 @@ class PurchaseService {
     } finally {
       this.readyInitLocks.delete(scopeKey);
     }
-    });
+    },
+      { skipLock: skipBrowserLock },
+    );
   }
 
   /**
@@ -572,7 +618,22 @@ class PurchaseService {
       try {
         logger.system(`${logPrefix} Binding ready session to managed browser (attempt ${attempt}/${maxAttempts})`);
 
-        const hadActiveBrowser = browserManager.hasActiveBrowser(browserKey);
+        // Always start retries on a fresh Chromium. Reusing a page after
+        // navigation timeout often leaves about:blank / chrome-error and
+        // then page.goto fails with net::ERR_ABORTED even when network is fine.
+        if (attempt > 1 || browserManager.hasActiveBrowser(browserKey)) {
+          logger.system(
+            `${logPrefix} Closing browser before attempt ${attempt} to avoid stuck about:blank page`,
+          );
+          try {
+            await browserManager.closeBrowser(browserKey);
+          } catch (closeErr) {
+            logger.debug(`${logPrefix} Pre-attempt browser close: ${closeErr.message}`);
+          }
+          // Brief pause so Chromium fully releases the process before relaunch.
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+
         const managedSession = await browserManager.getBrowser(browserKey);
         browser = managedSession.browser;
         page = managedSession.page;
@@ -581,37 +642,41 @@ class PurchaseService {
         await page.setDefaultTimeout(45000);
         await page.setDefaultNavigationTimeout(60000);
 
-        let loggedIn = false;
+        this.clearTwoFactorWindowState(scopeKey);
+        logger.system(`${logPrefix} Running full login flow...`);
+        const loginResult = await browserManager.login(
+          browserKey,
+          credentials.email,
+          credentials.password,
+        );
 
-        if (!hadActiveBrowser) {
-          this.clearTwoFactorWindowState(scopeKey);
-          logger.system(`${logPrefix} Running full login flow...`);
-          await browserManager.login(browserKey, credentials.email, credentials.password);
-          loggedIn = await browserManager.verifyAuthenticatedSession(browserKey);
-        } else {
-          loggedIn = await browserManager.verifyAuthenticatedSession(browserKey);
-          if (!loggedIn) {
-            this.clearTwoFactorWindowState(scopeKey);
-            logger.system(`${logPrefix} Running full login flow...`);
-            await browserManager.login(browserKey, credentials.email, credentials.password);
-            loggedIn = await browserManager.verifyAuthenticatedSession(browserKey);
-          }
+        // Always use the live handles returned by login() — never a pre-login
+        // page reference (login may have replaced the browser/page).
+        browser = loginResult.browser;
+        page = loginResult.page;
+
+        if (!browser || !page || (typeof page.isClosed === "function" && page.isClosed())) {
+          throw new Error("Login returned a closed browser/page");
         }
 
-        if (!loggedIn) {
-          throw new Error('Login verification failed - still not authenticated');
+        // login() already authenticated and opened gold.razer.com.
+        // Do NOT call page.goto on a pre-login handle (caused
+        // "Target page has been closed" after "Login successful").
+        // Do NOT run a heavy dashboard verify here — it adds 30s+ and can
+        // false-fail right after a real successful login.
+        const postLoginUrl = String(page.url() || "").toLowerCase();
+        if (
+          postLoginUrl.includes("login") ||
+          postLoginUrl.includes("signin") ||
+          postLoginUrl === "about:blank" ||
+          postLoginUrl.startsWith("chrome-error://")
+        ) {
+          throw new Error(
+            `Login reported success but page is still unauthenticated (${postLoginUrl || "unknown"})`,
+          );
         }
 
-        await withRetry(async () => {
-          await page.goto('https://gold.razer.com/global/en', { waitUntil: 'domcontentloaded', timeout: 30000 });
-          if (await isBanned(page)) throw new Error('rate limited');
-        });
-
-        if (!hadActiveBrowser) {
-          logger.success(`${logPrefix} Created and initialized managed browser (${browserKey})`);
-        } else {
-          logger.success(`${logPrefix} Reusing existing managed browser (${browserKey})`);
-        }
+        logger.success(`${logPrefix} Created and initialized managed browser (${browserKey})`);
 
         if (keepPoolAtMaxOnDisconnect && !browser.__purchaseReadyDisconnectHooked) {
           browser.__purchaseReadyDisconnectHooked = true;
@@ -626,19 +691,7 @@ class PurchaseService {
             }
             this.clearTwoFactorWindowState(scopeKey);
             logger.warn(`${logPrefix} Browser disconnected (${browserKey}). Recreating...`);
-            setTimeout(() => {
-              if (this.intentionalReadyCloseUsers.has(scopeKey)) {
-                logger.debug(`${logPrefix} Recovery skipped after intentional close`);
-                return;
-              }
-              if (browserManager.isBrowserBusy) {
-                logger.debug(`${logPrefix} Skipping delayed recovery - browser busy with: ${browserManager.busyReason}`);
-                return;
-              }
-              this.ensureReadyBrowsers(telegramUserId, { forceRestart: false }).catch(err => {
-                logger.error(`${logPrefix} Failed to recover ready browser:`, err.message);
-              });
-            }, 1500);
+            this.scheduleReadyBrowserRecovery(telegramUserId, logPrefix);
           });
         }
 
@@ -646,10 +699,12 @@ class PurchaseService {
         return { browser, page, slot };
       } catch (err) {
         logger.error(`${logPrefix} Launch/login failed: ${err.message}`);
-        // Never close managed browser from this flow unless it became disconnected.
-        if (browser && !browser.isConnected()) {
-          this.clearTwoFactorWindowState(scopeKey);
-          try { await browserManager.closeBrowser(browserKey); } catch (closeErr) { }
+        this.clearTwoFactorWindowState(scopeKey);
+        // Always tear down after failure so the next attempt cannot reuse a stuck page.
+        try {
+          await browserManager.closeBrowser(browserKey);
+        } catch (closeErr) {
+          logger.debug(`${logPrefix} Post-failure browser close: ${closeErr.message}`);
         }
         if (attempt === maxAttempts) {
           throw new Error(`Failed to prepare ready browser slot ${slot}: ${err.message}`);

@@ -100,6 +100,61 @@ class RazerLoginService {
    * @param {string} password - User password
    * @param {Object} options - Optional logger labels and timing
    */
+  /**
+   * True only for real Chromium error pages — NOT fresh about:blank.
+   * A newly created Playwright page always starts on about:blank; that is normal.
+   */
+  static isChromeErrorUrl(url) {
+    const href = String(url || "").toLowerCase();
+    return (
+      href.startsWith("chrome-error://") ||
+      href.startsWith("chrome://") ||
+      href.includes("neterror")
+    );
+  }
+
+  /** @deprecated Use isChromeErrorUrl — about:blank alone is not a failure. */
+  static isDeadPageUrl(url) {
+    return RazerLoginService.isChromeErrorUrl(url);
+  }
+
+  /**
+   * Only recover real chrome-error pages. Fresh about:blank is left alone —
+   * loginOnPage will navigate to the login URL next.
+   */
+  static async ensurePageNavigable(page) {
+    let currentUrl = "";
+    try {
+      currentUrl = page.url();
+    } catch (_) {
+      throw new Error("Login page is closed or unusable");
+    }
+
+    if (!RazerLoginService.isChromeErrorUrl(currentUrl)) {
+      return;
+    }
+
+    logger.warn(
+      `Login page is on Chromium error URL (${currentUrl}) - attempting recovery navigation`,
+    );
+
+    try {
+      await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
+      await page.goto(LOGIN_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 25000,
+      });
+    } catch (err) {
+      throw new Error(
+        `Login page stuck on chrome-error and recovery failed: ${err.message}`,
+      );
+    }
+
+    if (RazerLoginService.isChromeErrorUrl(page.url())) {
+      throw new Error("Login page still on chrome-error after recovery - browser must be recreated");
+    }
+  }
+
   static async loginOnPage(page, email, password, options = {}) {
     const labels = {
       open: options.openLabel || "Opening Razer login page...",
@@ -108,11 +163,29 @@ class RazerLoginService {
       submit: options.submitLabel || "Submitting login form...",
     };
 
+    await RazerLoginService.ensurePageNavigable(page);
+
     logger.http(labels.open);
-    await page.goto(LOGIN_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 20000,
-    });
+    try {
+      await page.goto(LOGIN_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+    } catch (gotoErr) {
+      // One recovery pass for transient ERR_ABORTED / blank-page stalls.
+      logger.warn(`Login goto failed (${gotoErr.message}) - recreating navigation once`);
+      await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await page.goto(LOGIN_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+    }
+
+    if (RazerLoginService.isChromeErrorUrl(page.url())) {
+      throw new Error("Login page landed on chrome-error after goto");
+    }
+
     try {
       await page.waitForSelector('button[aria-label="Accept All"]', {
         visible: true,
@@ -160,12 +233,33 @@ class RazerLoginService {
     }
 
     logger.info(labels.submit);
-    await Promise.all([
-      page.click('button[type="submit"]'),
-      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }),
-    ]);
+    const urlBeforeSubmit = page.url();
+    try {
+      await Promise.all([
+        page.click('button[type="submit"]'),
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }),
+      ]);
+    } catch (navErr) {
+      const urlAfter = page.url();
+      if (RazerLoginService.isChromeErrorUrl(urlAfter)) {
+        throw new Error(
+          `Login submit left page on chrome-error (${urlAfter}): ${navErr.message}`,
+        );
+      }
+      // Wrong password often keeps the same login URL without a full navigation.
+      if (urlAfter === urlBeforeSubmit || /razerid\.razer\.com\/?$/i.test(urlAfter)) {
+        throw new Error("Login failed");
+      }
+      logger.debug(
+        `Navigation wait timed out but URL changed to ${urlAfter} - continuing`,
+      );
+    }
 
     const currentUrl = page.url();
+    if (RazerLoginService.isChromeErrorUrl(currentUrl)) {
+      throw new Error(`Login ended on chrome-error URL: ${currentUrl}`);
+    }
+
     const stillOnLoginRoot =
       currentUrl === "https://razerid.razer.com" ||
       currentUrl === "https://razerid.razer.com/";

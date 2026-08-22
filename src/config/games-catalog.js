@@ -20,21 +20,15 @@ const gamesCatalog = [
   {
     id: 'pubg-mobile',
     name: '🔫 PUBG Mobile Tencent(Global)',
-    link: 'https://gold.razer.com/global/en/gold/catalog/pubg-mobile-uc-code',
+    link: 'https://gold.razer.com/global/en/gold/catalog/pubg-mobile-uc-code-tencent',
     regionId: 2
   },
   {
     id: "xbox-live-usa",
     name: "❎ Xbox Live USA(Global)",
-    link: "https://gold.razer.com/global/en/gold/catalog/xbox-live-usa",
+    link: "https://gold.razer.com/global/en/gold/catalog/xbox-liveusa",
     regionId: 2
-  },
-  {
-    id: 'pubg-mobile-usa',
-    name: '🔫 PUBG Mobile (USA)',
-    link: 'https://gold.razer.com/us/en/gold/catalog/pubg-mobile',
-    regionId: 12
-  },
+  }
 ];
 
 /**

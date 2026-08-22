@@ -1948,9 +1948,9 @@ class TelegramBotController {
    */
   async handleUpdateCredentialsPassword(chatId, telegramUserId, password) {
     const db = require("../services/DatabaseService");
-    const encryptionService = require("../utils/encryption");
     const session = sessionManager.getSession(chatId);
     const purchaseService = require("../services/PurchaseService");
+    const credentialBootstrapService = require("../services/CredentialBootstrapService");
     const operation = this.beginUserOperation(telegramUserId, "settings", true);
 
     if (!operation) {
@@ -1966,7 +1966,6 @@ class TelegramBotController {
         throw new Error("Credentials update session expired");
       }
 
-      // Get email and password from session
       const email = session.email;
       const passwordTrimmed = password.trim();
       const previousCredentials = await db.getUserCredentials(telegramUserId);
@@ -1989,82 +1988,66 @@ class TelegramBotController {
 
       await this.safeSendMessage(
         chatId,
-        "⏳ Testing new credentials (up to 3 attempts)...\nUse /cancel to keep old credentials.",
+        "⏳ Testing new credentials (up to 2 attempts)...\nUse /cancel to keep old credentials.",
       );
 
       throwIfCancelled();
 
-      // Credentials changed: restart browsers and test new credentials (max 3 attempts).
-      await purchaseService.resetUserBrowsers(telegramUserId);
-      throwIfCancelled();
-
-      const readyResult = await purchaseService.ensureReadyBrowsers(
+      const changeResult = await credentialBootstrapService.applyCredentialChange(
         telegramUserId,
-        {
-          forceRestart: true,
-          maxLoginAttempts: 3,
-          credentialsOverride: {
-            email,
-            password: passwordTrimmed,
-          },
-        },
+        email,
+        passwordTrimmed,
+        previousCredentials,
       );
       throwIfCancelled();
 
-      if (!readyResult || readyResult.count <= 0) {
-        const failure = new Error("New credentials failed login after 3 attempts");
-        failure.code = "INVALID_NEW_CREDENTIALS";
-        failure.failures = readyResult?.failures || [];
-        throw failure;
-      }
-
-      // At least one browser login succeeded - persist encrypted credentials.
-      const emailEncrypted = encryptionService.encrypt(email);
-      const passwordEncrypted = encryptionService.encrypt(passwordTrimmed);
-      await db.saveUserCredentials(
-        telegramUserId,
-        emailEncrypted,
-        passwordEncrypted,
-      );
-
-      // Wait for second browser in background before declaring bot ready.
-      if (!readyResult.ready) {
-        this.safeSendMessage(
-          chatId,
-          `✅ Credentials saved (${readyResult.count}/${readyResult.target} browsers logged in). Waiting for second browser login before bot is ready...`,
-        ).catch(() => {});
-
-        purchaseService
-          .ensureReadyBrowsers(telegramUserId, { forceRestart: false })
-          .then((syncResult) => {
-            if (syncResult && syncResult.ready) {
-              this.safeSendMessage(
-                chatId,
-                "✅ Second browser logged in. Bot is now fully ready to use.",
-              ).catch(() => {});
-            }
-          })
-          .catch((syncErr) => {
-            logger.warn(
-              `Background ready-session sync failed after credential update for user ${telegramUserId}: ${syncErr.message}`,
-            );
-          });
-      }
-
-      // Clear credentials from memory
       sessionManager.clearCredentials(chatId);
-
-      // Reset session state
       sessionManager.updateState(chatId, "idle");
 
-      const browserLabel = readyResult.target === 1 ? "browser" : "browsers";
-      const readyMessage = readyResult.ready
-        ? `✅ *Credentials Updated*\nAll ${readyResult.target} ${browserLabel} are ready.`
-        : `✅ *Credentials Updated*\nWaiting for remaining browser(s) to login before bot becomes ready (${readyResult.count}/${readyResult.target}).`;
+      if (changeResult.outcome === "saved_new") {
+        const readyResult = changeResult.readyResult || {};
+        const browserLabel = readyResult.target === 1 ? "browser" : "browsers";
+        const readyMessage = readyResult.ready
+          ? `✅ *Credentials Updated*\nAll ${readyResult.target || 1} ${browserLabel} are ready.\nBackup codes were cleared — add new ones in /settings.`
+          : `✅ *Credentials Updated*\nBackup codes were cleared — add new ones in /settings.\nWaiting for remaining browser(s) to login (${readyResult.count || 0}/${readyResult.target || 1}).`;
 
-      await this.safeSendMessage(chatId, readyMessage, {
-        parse_mode: "Markdown",
-      });
+        await this.safeSendMessage(chatId, readyMessage, {
+          parse_mode: "Markdown",
+        });
+
+        if (!readyResult.ready) {
+          purchaseService
+            .ensureReadyBrowsers(telegramUserId, { forceRestart: false })
+            .then((syncResult) => {
+              if (syncResult && syncResult.ready) {
+                this.safeSendMessage(
+                  chatId,
+                  "✅ Remaining browser logged in. Bot is now fully ready to use.",
+                ).catch(() => {});
+              }
+            })
+            .catch((syncErr) => {
+              logger.warn(
+                `Background ready-session sync failed after credential update for user ${telegramUserId}: ${syncErr.message}`,
+              );
+            });
+        }
+        return;
+      }
+
+      if (changeResult.outcome === "restored_previous") {
+        await this.safeSendMessage(
+          chatId,
+          "❌ *New credentials are wrong*\nLogin failed after 2 attempts. Old account restored and backup codes were kept.",
+          { parse_mode: "Markdown" },
+        );
+        return;
+      }
+
+      await this.safeSendMessage(
+        chatId,
+        "❌ Login failed for new and saved credentials after 2 attempts each.\nAccount and backup codes were cleared. Add credentials again in /settings.",
+      );
     } catch (err) {
       logger.error("Error saving credentials:", err);
 
@@ -2072,7 +2055,6 @@ class TelegramBotController {
       const cancelledByUser =
         err.message === "Credentials update cancelled by user" ||
         (controller && controller.cancelled);
-      const invalidNewCredentials = err.code === "INVALID_NEW_CREDENTIALS";
 
       const restorePreviousCredentials = async (successMessage) => {
         await purchaseService.resetUserBrowsers(telegramUserId);
@@ -2083,38 +2065,49 @@ class TelegramBotController {
           controller.previousCredentials.email &&
           controller.previousCredentials.password
         ) {
-          await scraperService.login(
+          const credentialBootstrapService = require("../services/CredentialBootstrapService");
+          const restoreResult = await credentialBootstrapService.tryGlobalLogin(
             telegramUserId,
-            controller.previousCredentials.email,
-            controller.previousCredentials.password,
+            controller.previousCredentials,
+            {
+              forceRestart: true,
+              credentialsOverride: controller.previousCredentials,
+            },
           );
 
-          purchaseService
-            .ensureReadyBrowsers(telegramUserId, { forceRestart: false })
-            .catch((syncErr) => {
-              logger.warn(
-                `Background ready-session sync failed after credentials rollback for user ${telegramUserId}: ${syncErr.message}`,
-              );
-            });
+          if (restoreResult.success) {
+            purchaseService
+              .ensureReadyBrowsers(telegramUserId, { forceRestart: false })
+              .catch((syncErr) => {
+                logger.warn(
+                  `Background ready-session sync failed after credentials rollback for user ${telegramUserId}: ${syncErr.message}`,
+                );
+              });
 
-          await this.safeSendMessage(chatId, successMessage, {
-            parse_mode: "Markdown",
-          });
-        } else {
+            await this.safeSendMessage(chatId, successMessage, {
+              parse_mode: "Markdown",
+            });
+            return;
+          }
+
           await this.safeSendMessage(
             chatId,
-            "❌ Credentials were not saved. No old credentials found to restore.",
+            "❌ Credentials were not saved and restoring the old browser session failed. Use /start or /settings.",
           );
+          return;
         }
+
+        await this.safeSendMessage(
+          chatId,
+          "❌ Credentials were not saved. No old credentials found to restore.",
+        );
       };
 
-      if (cancelledByUser || invalidNewCredentials) {
+      if (cancelledByUser) {
         try {
-          const message = invalidNewCredentials
-            ? "❌ *New credentials are wrong*\nLogin failed after 3 attempts. Old credentials were kept and session restored."
-            : "❌ Credentials were not saved. Restored previous credentials and browser session is ready.";
-
-          await restorePreviousCredentials(message);
+          await restorePreviousCredentials(
+            "❌ Credentials were not saved. Restored previous credentials and browser session is ready.",
+          );
         } catch (rollbackErr) {
           logger.error(
             "Error restoring previous credentials session:",
@@ -2122,9 +2115,7 @@ class TelegramBotController {
           );
           await this.safeSendMessage(
             chatId,
-            invalidNewCredentials
-              ? "❌ New credentials are wrong and were not saved. Restoring old browser session failed. Use /start or /settings."
-              : "❌ Credentials were not saved, but restoring old browser session failed. Use /start or /settings.",
+            "❌ Credentials were not saved, but restoring old browser session failed. Use /start or /settings.",
           );
         } finally {
           sessionManager.clearCredentials(chatId);
@@ -2134,7 +2125,6 @@ class TelegramBotController {
         return;
       }
 
-      // Clear credentials on error
       sessionManager.clearCredentials(chatId);
       sessionManager.updateState(chatId, "idle");
 
