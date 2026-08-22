@@ -1,6 +1,6 @@
 const APP_CONFIG = {
   browser: {
-    headlessMode: "false",
+    headlessMode: "true",
     credentialLoginMaxAttempts: 2,
     disconnectRecoveryMaxAttempts: 3,
     defaultTimeoutMs: 30000,
