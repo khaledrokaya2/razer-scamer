@@ -84,7 +84,6 @@ class PurchaseService {
     this.TWO_FACTOR_WINDOW_MS = appConfig.purchase.twoFactorWindowMs ?? (15 * 60 * 1000);
     this.TRANSACTIONS_PAGE_URL = 'https://gold.razer.com/global/en/transactions';
     this.TRANSACTION_DETAIL_URL_PREFIX = 'https://gold.razer.com/global/en/transaction/purchase/';
-    this.TRANSACTION_DETAIL_API_PREFIX = 'https://gold.razer.com/api/webshopv2/';
     this.READY_BROWSER_HOME_URL = 'https://gold.razer.com/global/en';
     this.CHECKOUT_API_PATH = '/api/webshop/checkout/gold';
     this.API_REPLAY_DELAY_MIN_MS = appConfig.purchase.apiReplayDelayMinMs ?? 1500;
@@ -3445,41 +3444,54 @@ class PurchaseService {
       throw new Error('Transaction number is missing');
     }
 
-    // page.request uses the browser cookie jar and does not pass through page.route,
-    // so a detail response cannot be swapped with another in-flight page request.
-    const detailUrl = `${this.TRANSACTION_DETAIL_API_PREFIX}${encodeURIComponent(requestedTxn)}`;
-    const headers = {
-      Accept: 'application/json, text/plain, */*',
-      'Cache-Control': 'no-store',
-      Pragma: 'no-cache',
-      ...apiHeaders
-    };
+    // In-page fetch reuses the logged-in session and is much faster than page.request
+    // or opening each transaction page. JSON is parsed in Node so large ids stay strings.
+    // A mismatched transaction id is rejected here, so a swapped response is not filed.
+    const maxAttempts = 2;
+    let lastError = null;
+    let payload = null;
 
-    const payload = await withRetry(async () => {
-      const response = await page.request.get(detailUrl, {
-        headers,
-        failOnStatusCode: false,
-        timeout: 30000
-      });
-
-      if (!response || !response.ok()) {
-        throw new Error(`Transaction API request failed (${response ? response.status() : 'unknown'})`);
-      }
-
-      let data = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        data = this.parseJsonPreservingTransactionIds(await response.text());
-      } catch (parseErr) {
-        data = null;
-      }
+        const result = await page.evaluate(async ({ transactionNumber, extraHeaders }) => {
+          const response = await fetch(`/api/webshopv2/${encodeURIComponent(transactionNumber)}`, {
+            method: 'GET',
+            credentials: 'include',
+            cache: 'no-store',
+            headers: {
+              Accept: 'application/json, text/plain, */*',
+              'Cache-Control': 'no-store',
+              Pragma: 'no-cache',
+              ...extraHeaders
+            }
+          });
 
-      if (!data) {
-        throw new Error('Transaction API response was not valid JSON');
-      }
+          return {
+            ok: response.ok,
+            statusCode: response.status,
+            text: await response.text()
+          };
+        }, { transactionNumber: requestedTxn, extraHeaders: apiHeaders || {} });
 
-      this.assertTransactionIdMatch(requestedTxn, data.transactionNumber);
-      return data;
-    });
+        if (!result || !result.ok || !result.text) {
+          throw new Error(`Transaction API request failed (${result ? result.statusCode : 'unknown'})`);
+        }
+
+        const data = this.parseJsonPreservingTransactionIds(result.text);
+        this.assertTransactionIdMatch(requestedTxn, data.transactionNumber);
+        payload = data;
+        break;
+      } catch (err) {
+        lastError = err;
+        if (attempt < maxAttempts) {
+          await this.sleep(150);
+        }
+      }
+    }
+
+    if (!payload) {
+      throw lastError || new Error('Transaction API request failed');
+    }
 
     const firstPin = payload
       && payload.fullfillment
@@ -3647,13 +3659,8 @@ class PurchaseService {
         const requestedTxn = this.normalizeTransactionId(transaction.txnNum);
         const historyDescription = this.normalizeTransactionDescription(transaction.description);
 
-        const loadDetail = async () => {
-          try {
-            return await this.fetchTransactionDetailViaApi(primarySession.page, requestedTxn, historyResult.apiHeaders || {});
-          } catch (apiErr) {
-            logger.debug(`API detail fetch fallback for ${requestedTxn}: ${apiErr.message}`);
-            return this.fetchTransactionDetail(primarySession.page, requestedTxn);
-          }
+        const loadDetail = () => {
+          return this.fetchTransactionDetailViaApi(primarySession.page, requestedTxn, historyResult.apiHeaders || {});
         };
 
         const takeVerifiedPin = (detail) => {
