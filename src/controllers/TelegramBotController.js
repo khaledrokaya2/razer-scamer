@@ -869,7 +869,7 @@ class TelegramBotController {
         if (archiveSent === false) {
           await this.safeSendMessage(
             chatId,
-            "❌ PINs were fetched, but Telegram rejected the file upload. Wait a minute and run /transactions again.",
+            "❌ PINs were fetched, but Telegram rejected one or more TXT files. Wait a minute and run /transactions again.",
           );
         }
 
