@@ -84,6 +84,7 @@ class PurchaseService {
     this.TWO_FACTOR_WINDOW_MS = appConfig.purchase.twoFactorWindowMs ?? (15 * 60 * 1000);
     this.TRANSACTIONS_PAGE_URL = 'https://gold.razer.com/global/en/transactions';
     this.TRANSACTION_DETAIL_URL_PREFIX = 'https://gold.razer.com/global/en/transaction/purchase/';
+    this.TRANSACTION_DETAIL_API_PREFIX = 'https://gold.razer.com/api/webshopv2/';
     this.READY_BROWSER_HOME_URL = 'https://gold.razer.com/global/en';
     this.CHECKOUT_API_PATH = '/api/webshop/checkout/gold';
     this.API_REPLAY_DELAY_MIN_MS = appConfig.purchase.apiReplayDelayMinMs ?? 1500;
@@ -3210,6 +3211,46 @@ class PurchaseService {
   }
 
   /**
+   * Compare transaction ids without whitespace.
+   * @param {string|number|null|undefined} value
+   * @returns {string}
+   */
+  normalizeTransactionId(value) {
+    return String(value == null ? '' : value).replace(/\s+/g, '').trim();
+  }
+
+  /**
+   * Parse JSON while keeping transaction ids as strings.
+   * JSON.parse rounds integers above Number.MAX_SAFE_INTEGER, which can
+   * make two different purchases share one id and pull the wrong PIN.
+   * @param {string} text
+   * @returns {Object}
+   */
+  parseJsonPreservingTransactionIds(text) {
+    const safe = String(text || '').replace(
+      /"(txnNum|transactionNumber)"\s*:\s*(\d+)/g,
+      '"$1":"$2"'
+    );
+    return JSON.parse(safe);
+  }
+
+  /**
+   * Reject a detail payload that belongs to a different transaction.
+   * A missing id is allowed; a present id must match the one requested.
+   * @param {string|number} requestedTxn
+   * @param {string|number|null|undefined} returnedTxn
+   * @returns {string}
+   */
+  assertTransactionIdMatch(requestedTxn, returnedTxn) {
+    const requestedId = this.normalizeTransactionId(requestedTxn);
+    const returnedId = this.normalizeTransactionId(returnedTxn);
+    if (returnedId && requestedId && returnedId !== requestedId) {
+      throw new Error(`Transaction mismatch: requested ${requestedId} but received ${returnedId}`);
+    }
+    return returnedId || requestedId;
+  }
+
+  /**
    * Restore ready session pages to the home page after temporary navigation.
    * @param {Array<{page: Object, slot: number}>} sessions
    */
@@ -3301,8 +3342,9 @@ class PurchaseService {
       }
     }
 
+    const historyText = await historyResponse.text();
     return {
-      payload: await historyResponse.json(),
+      payload: this.parseJsonPreservingTransactionIds(historyText),
       apiHeaders: passThroughHeaders
     };
   }
@@ -3380,7 +3422,14 @@ class PurchaseService {
       throw new Error('PIN not found on transaction detail page');
     }
 
-    return detail;
+    const transactionId = this.assertTransactionIdMatch(txnNum, detail.transactionId);
+
+    return {
+      productName: String(detail.productName || '').trim(),
+      pinCode: String(detail.pinCode).trim(),
+      serialNumber: detail.serialNumber,
+      transactionId
+    };
   }
 
   /**
@@ -3391,48 +3440,45 @@ class PurchaseService {
    * @returns {Promise<{pinCode: string, serialNumber: string, productName: string, transactionId: string, status?: string, transactionDate?: string}>}
    */
   async fetchTransactionDetailViaApi(page, txnNum, apiHeaders = {}) {
-    // ANTI-BAN
-    await setupPage(page);
+    const requestedTxn = this.normalizeTransactionId(txnNum);
+    if (!requestedTxn) {
+      throw new Error('Transaction number is missing');
+    }
+
+    // page.request uses the browser cookie jar and does not pass through page.route,
+    // so a detail response cannot be swapped with another in-flight page request.
+    const detailUrl = `${this.TRANSACTION_DETAIL_API_PREFIX}${encodeURIComponent(requestedTxn)}`;
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      'Cache-Control': 'no-store',
+      Pragma: 'no-cache',
+      ...apiHeaders
+    };
 
     const payload = await withRetry(async () => {
-      const result = await page.evaluate(async ({ transactionNumber, extraHeaders }) => {
-        try {
-          const response = await fetch(`/api/webshopv2/${transactionNumber}`, {
-            method: 'GET',
-            credentials: 'include',
-            headers: {
-              Accept: 'application/json, text/plain, */*',
-              ...extraHeaders
-            }
-          });
+      const response = await page.request.get(detailUrl, {
+        headers,
+        failOnStatusCode: false,
+        timeout: 30000
+      });
 
-          const text = await response.text();
-          let data = null;
-          try {
-            data = JSON.parse(text);
-          } catch (parseErr) {
-            data = null;
-          }
-
-          return {
-            ok: response.ok,
-            statusCode: response.status,
-            data
-          };
-        } catch (err) {
-          return {
-            ok: false,
-            statusCode: 0,
-            error: err && err.message ? err.message : 'fetch failed'
-          };
-        }
-      }, { transactionNumber: txnNum, extraHeaders: apiHeaders });
-
-      if (!result || !result.ok || !result.data) {
-        throw new Error(`Transaction API request failed (${result ? result.statusCode : 'unknown'})`);
+      if (!response || !response.ok()) {
+        throw new Error(`Transaction API request failed (${response ? response.status() : 'unknown'})`);
       }
 
-      return result.data;
+      let data = null;
+      try {
+        data = this.parseJsonPreservingTransactionIds(await response.text());
+      } catch (parseErr) {
+        data = null;
+      }
+
+      if (!data) {
+        throw new Error('Transaction API response was not valid JSON');
+      }
+
+      this.assertTransactionIdMatch(requestedTxn, data.transactionNumber);
+      return data;
     });
 
     const firstPin = payload
@@ -3449,11 +3495,14 @@ class PurchaseService {
       throw new Error('PIN not found in transaction API response');
     }
 
+    const pinProduct = firstPin && (firstPin.productName || firstPin.description || firstPin.productTitle);
+    const productName = String(pinProduct || payload.description || payload.productName || '').trim();
+
     return {
-      productName: String(payload.description || payload.productName || '').trim(),
+      productName,
       pinCode,
       serialNumber,
-      transactionId: String(payload.transactionNumber || txnNum || '').trim(),
+      transactionId: this.assertTransactionIdMatch(requestedTxn, payload.transactionNumber),
       status: String(payload.status || '').trim(),
       transactionDate: String(payload.transactionDate || '').trim()
     };
@@ -3486,6 +3535,7 @@ class PurchaseService {
 
     const usableSessions = readySessions.slice(0, Math.min(this.MAX_READY_BROWSERS_FOR_TRANSACTIONS, readySessions.length));
     const groupedPins = new Map();
+    const seenPinOwners = new Map();
     const failures = [];
     let matchedTransactions = [];
 
@@ -3594,17 +3644,55 @@ class PurchaseService {
         if (checkCancellation && checkCancellation()) break;
 
         const transaction = matchedTransactions[i];
+        const requestedTxn = this.normalizeTransactionId(transaction.txnNum);
+        const historyDescription = this.normalizeTransactionDescription(transaction.description);
+
+        const loadDetail = async () => {
+          try {
+            return await this.fetchTransactionDetailViaApi(primarySession.page, requestedTxn, historyResult.apiHeaders || {});
+          } catch (apiErr) {
+            logger.debug(`API detail fetch fallback for ${requestedTxn}: ${apiErr.message}`);
+            return this.fetchTransactionDetail(primarySession.page, requestedTxn);
+          }
+        };
+
+        const takeVerifiedPin = (detail) => {
+          const pinCode = String(detail && detail.pinCode ? detail.pinCode : '').trim();
+          if (!pinCode || pinCode === 'FAILED') {
+            throw new Error('PIN not found for transaction');
+          }
+
+          const previousOwner = seenPinOwners.get(pinCode);
+          if (previousOwner && previousOwner !== requestedTxn) {
+            const mixedError = new Error(`Mixed PIN response: code already belongs to transaction ${previousOwner}`);
+            mixedError.code = 'MIXED_PIN';
+            throw mixedError;
+          }
+
+          const detailProduct = String(detail.productName || '').trim();
+          const description = detailProduct
+            ? this.normalizeTransactionDescription(detailProduct)
+            : historyDescription;
+
+          if (
+            detailProduct
+            && historyDescription
+            && historyDescription !== 'Unknown Product'
+            && description !== historyDescription
+          ) {
+            logger.warn(`Product name differs for txn ${requestedTxn}: history "${historyDescription}" vs detail "${description}". Filing under detail product.`);
+          }
+
+          return {
+            pinCode,
+            serialNumber: detail.serialNumber,
+            txnNum: requestedTxn,
+            description
+          };
+        };
 
         try {
-          const detailOutcome = await runDetailWithCancellation(async () => {
-            // ANTI-BAN
-            try {
-              return await this.fetchTransactionDetailViaApi(primarySession.page, transaction.txnNum, historyResult.apiHeaders || {});
-            } catch (apiErr) {
-              logger.debug(`API detail fetch fallback for ${transaction.txnNum}: ${apiErr.message}`);
-              return this.fetchTransactionDetail(primarySession.page, transaction.txnNum);
-            }
-          });
+          const detailOutcome = await runDetailWithCancellation(loadDetail);
 
           if (detailOutcome && detailOutcome.cancelled) {
             break;
@@ -3614,25 +3702,37 @@ class PurchaseService {
             throw detailOutcome.error;
           }
 
-          const detail = detailOutcome.result;
+          let pinEntry;
+          try {
+            pinEntry = takeVerifiedPin(detailOutcome.result);
+          } catch (pinErr) {
+            if (!pinErr || pinErr.code !== 'MIXED_PIN') {
+              throw pinErr;
+            }
 
-          const description = this.normalizeTransactionDescription(transaction.description || detail.productName);
-
-          if (!groupedPins.has(description)) {
-            groupedPins.set(description, []);
+            logger.warn(`PIN for txn ${requestedTxn} collided with another transaction. Retrying once.`);
+            const retryOutcome = await runDetailWithCancellation(loadDetail);
+            if (retryOutcome && retryOutcome.cancelled) {
+              break;
+            }
+            if (retryOutcome && retryOutcome.error) {
+              throw retryOutcome.error;
+            }
+            pinEntry = takeVerifiedPin(retryOutcome.result);
           }
 
-          groupedPins.get(description).push({
-            pinCode: detail.pinCode,
-            serialNumber: detail.serialNumber,
-            txnNum: transaction.txnNum,
-            description
-          });
+          seenPinOwners.set(pinEntry.pinCode, requestedTxn);
+
+          if (!groupedPins.has(pinEntry.description)) {
+            groupedPins.set(pinEntry.description, []);
+          }
+
+          groupedPins.get(pinEntry.description).push(pinEntry);
         } catch (err) {
-          logger.warn(`Failed to fetch transaction detail for ${transaction.txnNum}: ${err.message}`);
+          logger.warn(`Failed to fetch transaction detail for ${requestedTxn}: ${err.message}`);
           failures.push({
-            txnNum: transaction.txnNum,
-            description: this.normalizeTransactionDescription(transaction.description),
+            txnNum: requestedTxn,
+            description: historyDescription,
             error: err.message
           });
         } finally {

@@ -57,25 +57,31 @@ class BackupCodeReloadService {
       let attemptsUsed = 0;
 
       try {
-        await this.openAccountAndStartBackupOtp(page, checkCancelled);
+        const open = await this.openAccountAndUnlockGate(page, checkCancelled);
 
-        const unlockResult = await this.unlockWithBackupCodes(
-          page,
-          telegramUserId,
-          activeCount,
-          checkCancelled,
-        );
-        attemptsUsed = unlockResult.attemptsUsed;
+        if (open.needsOtp) {
+          const unlockResult = await this.unlockWithBackupCodes(
+            page,
+            telegramUserId,
+            activeCount,
+            checkCancelled,
+          );
+          attemptsUsed = unlockResult.attemptsUsed;
 
-        if (!unlockResult.ok) {
-          return {
-            ok: false,
-            attemptsUsed,
-            errorCode: unlockResult.errorCode || "OTP_FAILED",
-            message:
-              unlockResult.message ||
-              "Reload failed — backup code verification failed.",
-          };
+          if (!unlockResult.ok) {
+            return {
+              ok: false,
+              attemptsUsed,
+              errorCode: unlockResult.errorCode || "OTP_FAILED",
+              message:
+                unlockResult.message ||
+                "Reload failed — backup code verification failed.",
+            };
+          }
+        } else {
+          logger.info(
+            "[backup-reload] OTP skipped — session already unlocked for backup codes",
+          );
         }
 
         this.throwIfCancelled(checkCancelled);
@@ -159,7 +165,12 @@ class BackupCodeReloadService {
     }
   }
 
-  async openAccountAndStartBackupOtp(page, checkCancelled = () => false) {
+  /**
+   * Open account → backup codes section.
+   * Razer sometimes skips OTP and opens the codes page immediately.
+   * @returns {{ needsOtp: boolean }}
+   */
+  async openAccountAndUnlockGate(page, checkCancelled = () => false) {
     logger.info("[backup-reload] Opening Razer ID account page");
     this.throwIfCancelled(checkCancelled);
 
@@ -179,44 +190,225 @@ class BackupCodeReloadService {
     );
     this.throwIfCancelled(checkCancelled);
     await page.click("#section-backup-codes");
+    logger.info(
+      "[backup-reload] Clicked backup codes section — waiting for OTP or codes page",
+    );
 
+    const gate = await this.waitForOtpOrCodesPage(page, checkCancelled, 35000);
+
+    if (gate === "codes") {
+      logger.success("[backup-reload] Codes page opened without OTP");
+      return { needsOtp: false };
+    }
+
+    if (gate === "otp") {
+      logger.info(
+        "[backup-reload] OTP modal shown — switching to Backup Codes method",
+      );
+      this.throwIfCancelled(checkCancelled);
+      await this.clickButtonByText(
+        page,
+        /Choose a different method/i,
+        checkCancelled,
+        30000,
+      );
+      this.throwIfCancelled(checkCancelled);
+      await this.clickButtonByText(
+        page,
+        /^Backup Codes$/i,
+        checkCancelled,
+        20000,
+      );
+
+      await this.raceWithCancel(
+        page.waitForSelector("#otp-input-0", { timeout: 20000 }),
+        checkCancelled,
+        "wait backup otp inputs",
+      );
+      logger.info("[backup-reload] Backup code OTP modal ready");
+      return { needsOtp: true };
+    }
+
+    logger.warn(
+      "[backup-reload] No OTP modal and no codes page — trying direct codes URL",
+    );
     await this.raceWithCancel(
-      page.waitForFunction(
-        () => {
+      page.goto(CODES_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 60000,
+      }),
+      checkCancelled,
+      "goto codes fallback",
+    );
+
+    if (await this.isOnBackupCodesPage(page)) {
+      logger.success(
+        "[backup-reload] Codes page reached via direct URL (no OTP)",
+      );
+      return { needsOtp: false };
+    }
+
+    const lateGate = await this.waitForOtpOrCodesPage(page, checkCancelled, 15000);
+    if (lateGate === "codes") return { needsOtp: false };
+    if (lateGate === "otp") {
+      await this.clickButtonByText(
+        page,
+        /Choose a different method/i,
+        checkCancelled,
+        30000,
+      );
+      await this.clickButtonByText(
+        page,
+        /^Backup Codes$/i,
+        checkCancelled,
+        20000,
+      );
+      await this.raceWithCancel(
+        page.waitForSelector("#otp-input-0", { timeout: 20000 }),
+        checkCancelled,
+        "wait backup otp inputs",
+      );
+      return { needsOtp: true };
+    }
+
+    throw new Error(
+      "Could not open backup codes page and OTP modal did not appear",
+    );
+  }
+
+  /**
+   * @returns {Promise<'otp'|'codes'|'none'>}
+   */
+  async waitForOtpOrCodesPage(page, checkCancelled = () => false, timeoutMs = 35000) {
+    this.throwIfCancelled(checkCancelled);
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      this.throwIfCancelled(checkCancelled);
+
+      if (await this.isOnBackupCodesPage(page)) return "codes";
+
+      const otpVisible = await page
+        .evaluate(() => {
           const modal = document.querySelector(".modal-one-time-password");
-          return !!(
+          if (
             modal &&
             (modal.classList.contains("show") ||
               modal.classList.contains("modal"))
+          ) {
+            const style = window.getComputedStyle(modal);
+            if (style.display !== "none" && style.visibility !== "hidden") {
+              return true;
+            }
+          }
+          return !!document.querySelector("#otp-input-0");
+        })
+        .catch(() => false);
+
+      if (otpVisible) return "otp";
+
+      const methodBtn = await page
+        .evaluate(() => {
+          const buttons = [...document.querySelectorAll("button")];
+          return buttons.some((b) =>
+            /Choose a different method/i.test((b.textContent || "").trim()),
           );
-        },
-        { timeout: 30000 },
-      ),
-      checkCancelled,
-      "wait otp modal",
-    );
+        })
+        .catch(() => false);
+      if (methodBtn) return "otp";
 
-    this.throwIfCancelled(checkCancelled);
-    await this.clickButtonByText(
-      page,
-      /Choose a different method/i,
-      checkCancelled,
-      30000,
-    );
-    this.throwIfCancelled(checkCancelled);
-    await this.clickButtonByText(
-      page,
-      /^Backup Codes$/i,
-      checkCancelled,
-      20000,
-    );
+      await sleep(300);
+    }
 
-    await this.raceWithCancel(
-      page.waitForSelector("#otp-input-0", { timeout: 20000 }),
-      checkCancelled,
-      "wait backup otp inputs",
-    );
-    logger.info("[backup-reload] Backup code OTP modal ready");
+    if (await this.isOnBackupCodesPage(page)) return "codes";
+    return "none";
+  }
+
+  async isOnBackupCodesPage(page) {
+    try {
+      if (String(page.url()).includes("/account/security/codes")) return true;
+      return page.evaluate(
+        () =>
+          !!(
+            document.querySelector("#btn-generate-new-codes") ||
+            document.querySelector(".codes")
+          ),
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  attachTotpListener(page, onResult) {
+    const onResponse = async (response) => {
+      try {
+        const url = response.url() || "";
+        if (!url.includes(TOTP_POST_URL_PART)) return;
+        const status = response.status();
+        let bodyOk = true;
+        try {
+          const json = await response.json();
+          if (
+            json &&
+            (json.success === false ||
+              json.error ||
+              json.status === "error" ||
+              json.statusCode >= 400)
+          ) {
+            bodyOk = false;
+          }
+        } catch (_) {
+          /* non-json */
+        }
+
+        if (status >= 400 || !bodyOk) {
+          onResult("fail");
+        } else if (status >= 200 && status < 300) {
+          onResult("ok");
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    };
+
+    page.on("response", onResponse);
+    return () => {
+      try {
+        page.off("response", onResponse);
+      } catch (_) {
+        /* ignore */
+      }
+    };
+  }
+
+  async waitForBackupCodesUnlock(page, checkCancelled = () => false, timeoutMs = 45000) {
+    const deadline = Date.now() + timeoutMs;
+    let totpHint = null;
+    const detachTotp = this.attachTotpListener(page, (result) => {
+      if (!totpHint) totpHint = result;
+    });
+
+    try {
+      while (Date.now() < deadline) {
+        this.throwIfCancelled(checkCancelled);
+        if (await this.isOnBackupCodesPage(page)) {
+          return "success";
+        }
+        await sleep(400);
+      }
+
+      if (await this.isOnBackupCodesPage(page)) return "success";
+
+      const onModal = await page
+        .evaluate(() => !!document.querySelector("#otp-input-0"))
+        .catch(() => false);
+      if (onModal && totpHint === "fail") return "fail";
+      if (onModal) return "fail";
+      if (await this.isOnBackupCodesPage(page)) return "success";
+      return "fail";
+    } finally {
+      detachTotp();
+    }
   }
 
   /**
@@ -229,6 +421,12 @@ class BackupCodeReloadService {
     checkCancelled = () => false,
   ) {
     this.throwIfCancelled(checkCancelled);
+
+    if (await this.isOnBackupCodesPage(page)) {
+      logger.success("[backup-reload] Already unlocked on backup codes page");
+      return { ok: true, attemptsUsed: 0 };
+    }
+
     const activeCodes = await db.getAllActiveBackupCodes(telegramUserId);
     if (!activeCodes.length) {
       return {
@@ -245,6 +443,12 @@ class BackupCodeReloadService {
 
     for (let i = 0; i < maxAttempts; i++) {
       this.throwIfCancelled(checkCancelled);
+
+      if (await this.isOnBackupCodesPage(page)) {
+        logger.success("[backup-reload] Unlocked on backup codes page");
+        return { ok: true, attemptsUsed };
+      }
+
       const entry = activeCodes[i];
       const code = String(entry.code || "").replace(/\D/g, "");
       if (!/^\d{8}$/.test(code)) {
@@ -278,9 +482,19 @@ class BackupCodeReloadService {
         return { ok: true, attemptsUsed };
       }
 
+      if (await this.isOnBackupCodesPage(page)) {
+        logger.success("[backup-reload] Unlocked on backup codes page (after OTP entry)");
+        return { ok: true, attemptsUsed };
+      }
+
       if (i + 1 < maxAttempts) {
         await this.prepareModalForNextCode(page);
       }
+    }
+
+    if (await this.isOnBackupCodesPage(page)) {
+      logger.success("[backup-reload] Unlocked on backup codes page (final check)");
+      return { ok: true, attemptsUsed };
     }
 
     const onlyOne = activeCount === 1 || activeCodes.length === 1;
@@ -297,7 +511,11 @@ class BackupCodeReloadService {
    */
   async enterBackupCodeAndWait(page, code, checkCancelled = () => false) {
     this.throwIfCancelled(checkCancelled);
-    const totpResultPromise = this.waitForTotpPostResult(page, 45000);
+
+    if (await this.isOnBackupCodesPage(page)) {
+      logger.success("[backup-reload] Already on backup codes page");
+      return "success";
+    }
 
     await this.raceWithCancel(
       page.waitForSelector("#otp-input-0", { timeout: 15000 }),
@@ -360,47 +578,9 @@ class BackupCodeReloadService {
 
     logger.info("[backup-reload] Backup code digits entered, waiting for result");
 
-    const navPromise = page
-      .waitForURL((url) => String(url).includes("/account/security/codes"), {
-        timeout: 45000,
-      })
-      .then(() => "success")
-      .catch(() => null);
+    const outcome = await this.waitForBackupCodesUnlock(page, checkCancelled, 45000);
 
-    const failPromise = totpResultPromise.then((r) =>
-      r === "fail" ? "fail" : null,
-    );
-
-    const stillOnModalPromise = (async () => {
-      await sleep(8000);
-      if (checkCancelled()) return "fail";
-      if (String(page.url()).includes("/account/security/codes")) {
-        return "success";
-      }
-      const onCodes = await page.evaluate(() => {
-        return (
-          !!document.querySelector("#btn-generate-new-codes") ||
-          !!document.querySelector(".codes")
-        );
-      });
-      if (onCodes) return "success";
-
-      const modalVisible = await page.evaluate(
-        () => !!document.querySelector("#otp-input-0"),
-      );
-      return modalVisible ? "fail" : null;
-    })();
-
-    const result = await Promise.race([
-      navPromise,
-      failPromise,
-      stillOnModalPromise,
-    ]);
-
-    if (
-      result === "success" ||
-      String(page.url()).includes("/account/security/codes")
-    ) {
+    if (outcome === "success" || (await this.isOnBackupCodesPage(page))) {
       await page
         .waitForSelector("#btn-generate-new-codes, .codes", { timeout: 30000 })
         .catch(() => {});
@@ -408,79 +588,25 @@ class BackupCodeReloadService {
       return "success";
     }
 
+    await sleep(2000);
+    if (await this.isOnBackupCodesPage(page)) {
+      logger.success("[backup-reload] Reached backup codes page (delayed navigation)");
+      return "success";
+    }
+
     logger.warn("[backup-reload] Backup code OTP rejected or timed out");
     return "fail";
   }
 
-  /**
-   * @returns {Promise<'ok'|'fail'|'unknown'>}
-   */
-  waitForTotpPostResult(page, timeoutMs) {
-    return new Promise((resolve) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        cleanup();
-        if (!settled) {
-          settled = true;
-          resolve("unknown");
-        }
-      }, timeoutMs);
-
-      const onResponse = async (response) => {
-        try {
-          const url = response.url() || "";
-          if (!url.includes(TOTP_POST_URL_PART)) return;
-          const status = response.status();
-          let bodyOk = true;
-          try {
-            const json = await response.json();
-            if (
-              json &&
-              (json.success === false ||
-                json.error ||
-                json.status === "error" ||
-                json.statusCode >= 400)
-            ) {
-              bodyOk = false;
-            }
-          } catch (_) {
-            // non-json
-          }
-
-          if (status >= 400 || !bodyOk) {
-            cleanup();
-            if (!settled) {
-              settled = true;
-              resolve("fail");
-            }
-          } else if (status >= 200 && status < 300) {
-            cleanup();
-            if (!settled) {
-              settled = true;
-              resolve("ok");
-            }
-          }
-        } catch (_) {
-          // ignore listener errors
-        }
-      };
-
-      const cleanup = () => {
-        clearTimeout(timer);
-        try {
-          page.off("response", onResponse);
-        } catch (_) {}
-      };
-
-      page.on("response", onResponse);
-    });
-  }
-
   async prepareModalForNextCode(page) {
+    if (await this.isOnBackupCodesPage(page)) return;
+
     const hasInput = await page.evaluate(
       () => !!document.querySelector("#otp-input-0"),
     );
     if (!hasInput) {
+      if (await this.isOnBackupCodesPage(page)) return;
+
       const switched = await this.clickButtonByText(
         page,
         /Choose a different method/i,
@@ -489,7 +615,11 @@ class BackupCodeReloadService {
         await sleep(400);
         await this.clickButtonByText(page, /^Backup Codes$/i).catch(() => {});
       }
-      await page.waitForSelector("#otp-input-0", { timeout: 15000 });
+
+      if (await this.isOnBackupCodesPage(page)) return;
+
+      await page.waitForSelector("#otp-input-0", { timeout: 15000 }).catch(() => {});
+      if (await this.isOnBackupCodesPage(page)) return;
     }
 
     await page.evaluate(() => {
@@ -507,7 +637,7 @@ class BackupCodeReloadService {
   async generateAndWaitForFreshCodes(page, checkCancelled = () => false) {
     this.throwIfCancelled(checkCancelled);
 
-    if (!String(page.url()).includes("/account/security/codes")) {
+    if (!(await this.isOnBackupCodesPage(page))) {
       await this.raceWithCancel(
         page.goto(CODES_URL, {
           waitUntil: "domcontentloaded",
@@ -519,7 +649,10 @@ class BackupCodeReloadService {
     }
 
     await this.raceWithCancel(
-      page.waitForSelector("#btn-generate-new-codes", { timeout: 30000 }),
+      page.waitForSelector("#btn-generate-new-codes", {
+        state: "visible",
+        timeout: 30000,
+      }),
       checkCancelled,
       "wait generate button",
     );
@@ -537,22 +670,13 @@ class BackupCodeReloadService {
       } catch (_) {}
     });
 
+    await page.locator("#btn-generate-new-codes").scrollIntoViewIfNeeded().catch(() => {});
     await page.click("#btn-generate-new-codes");
 
-    await page
-      .waitForFunction(
-        () => {
-          const buttons = [...document.querySelectorAll("button")];
-          return buttons.some((b) =>
-            /^(Generate|Confirm|Yes)$/i.test((b.textContent || "").trim()),
-          );
-        },
-        { timeout: 2500 },
-      )
-      .then(async () => {
-        await this.clickButtonByText(page, /^(Generate|Confirm|Yes)$/i);
-      })
-      .catch(() => {});
+    const confirmed = await this.clickConfirmGenerateIfPresent(page, checkCancelled);
+    if (confirmed) {
+      logger.info("[backup-reload] Confirm/Generate confirmation clicked");
+    }
 
     const deadline = Date.now() + 45000;
     while (Date.now() < deadline) {
@@ -579,6 +703,31 @@ class BackupCodeReloadService {
     }
 
     logger.warn("[backup-reload] Timed out waiting for fresh code set");
+  }
+
+  async clickConfirmGenerateIfPresent(page, checkCancelled = () => false) {
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      this.throwIfCancelled(checkCancelled);
+      const clicked = await page.evaluate(() => {
+        const re = /^(Generate|Confirm|Yes|OK)$/i;
+        const buttons = [
+          ...document.querySelectorAll("button, a.btn, [role='button']"),
+        ];
+        const btn = buttons.find((b) => re.test((b.textContent || "").trim()));
+        if (!btn) return false;
+        const style = window.getComputedStyle(btn);
+        if (style.display === "none" || style.visibility === "hidden") {
+          return false;
+        }
+        btn.scrollIntoView({ block: "center" });
+        btn.click();
+        return true;
+      });
+      if (clicked) return true;
+      await sleep(250);
+    }
+    return false;
   }
 
   async scrapeActiveCodes(page) {

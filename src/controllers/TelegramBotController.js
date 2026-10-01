@@ -762,6 +762,7 @@ class TelegramBotController {
         `⏳ Fetching transactions for ${dateInput}...`,
       );
       let lastProgressText = "";
+      let lastProgressEditAt = 0;
 
       const onProgress = async (progress) => {
         try {
@@ -790,7 +791,15 @@ class TelegramBotController {
             `✅ ${processed}/${Math.max(1, total)} | 🎯 Matched: ${matched} | ⚠️ Failed: ${failures}`;
 
           if (progressText === lastProgressText) return;
+
+          const isLastItem = total > 0 && processed >= total;
+          const throttleFetchUpdate = phase === "fetching" && !isLastItem && processed > 0;
+          if (throttleFetchUpdate && Date.now() - lastProgressEditAt < 3000) {
+            return;
+          }
+
           lastProgressText = progressText;
+          lastProgressEditAt = Date.now();
 
           await this.bot.editMessageText(progressText, {
             chat_id: chatId,
@@ -825,12 +834,12 @@ class TelegramBotController {
           result.matchedTransactions.length === 0
         ) {
           if (result.cancelled) {
-            await this.bot.sendMessage(
+            await this.safeSendMessage(
               chatId,
               "🛑 Transactions fetching cancelled. No PINs were collected before stopping.",
             );
           } else {
-            await this.bot.sendMessage(
+            await this.safeSendMessage(
               chatId,
               `📭 No successful webshop transactions found for ${result.dateLabel}.`,
             );
@@ -844,12 +853,12 @@ class TelegramBotController {
           0,
         );
 
-        await this.bot.sendMessage(
+        await this.safeSendMessage(
           chatId,
           `${result.cancelled ? "🛑 Partial results (cancelled)" : "📦 Transactions"} for ${result.dateLabel}\nMatched: ${result.matchedTransactions.length}\nPINs fetched: ${totalPins}\nFiles: ${groupedEntries.length}`,
         );
 
-        await fileGenerator.sendGroupedPinFiles(
+        const archiveSent = await fileGenerator.sendGroupedPinFiles(
           this.bot,
           chatId,
           result.groupedPins,
@@ -857,6 +866,12 @@ class TelegramBotController {
             dateLabel: result.dateLabel,
           },
         );
+        if (archiveSent === false) {
+          await this.safeSendMessage(
+            chatId,
+            "❌ PINs were fetched, but Telegram rejected the file upload. Wait a minute and run /transactions again.",
+          );
+        }
 
         if (result.failures && result.failures.length > 0) {
           const failureLines = result.failures.map((failure) => {
@@ -887,7 +902,7 @@ class TelegramBotController {
         err.message &&
         err.message.includes("No ready browser session available")
       ) {
-        this.bot.sendMessage(
+        await this.safeSendMessage(
           chatId,
           "⚠️ No ready browser available. Use /start first, then run /transactions D/M.",
         );
@@ -895,14 +910,14 @@ class TelegramBotController {
       }
 
       if (err.message && err.message.includes("Invalid date")) {
-        this.bot.sendMessage(
+        await this.safeSendMessage(
           chatId,
           `${err.message}\nExample: /transactions 2/9`,
         );
         return;
       }
 
-      this.bot.sendMessage(chatId, "❌ Failed to fetch transactions.");
+      await this.safeSendMessage(chatId, "❌ Failed to fetch transactions.");
     } finally {
       this.clearUserOperation(telegramUserId, operation.id);
     }

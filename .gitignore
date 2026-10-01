@@ -1,6 +1,8 @@
 # Environment variables (contains sensitive data)
 .env
 
+Razer_Top_Up_API
+
 # Test file with sensitive data
 lol.txt
 
