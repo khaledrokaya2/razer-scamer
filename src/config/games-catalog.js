@@ -18,16 +18,10 @@ const gamesCatalog = [
     regionId: 2,
   },
   {
-    id: "pubg-mobile",
+    id: "pubg-mobile-uc-code-tencent",
     name: "🔫 PUBG Mobile Tencent(Global)",
     link: "https://gold.razer.com/global/en/gold/catalog/pubg-mobile-uc-code-tencent",
     regionId: 2,
-  },
-  {
-    id: "pubg-mobile",
-    name: "🔫 PUBG Mobile (USA)",
-    link: "https://gold.razer.com/us/en/gold/catalog/pubg-mobile",
-    regionId: 12,
   },
   {
     id: "xbox-live-usa",
