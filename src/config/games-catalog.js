@@ -1,34 +1,40 @@
 /**
  * Games Catalog
- * 
+ *
  * Contains all available games with their Razer Gold purchase links and catalog region IDs.
  */
 
 const gamesCatalog = [
   {
-    id: 'freefire',
-    name: '🔥 Free Fire(Global)',
-    link: 'https://gold.razer.com/global/en/gold/catalog/freefire-pins',
-    regionId: 2
+    id: "freefire",
+    name: "🔥 Free Fire(Global)",
+    link: "https://gold.razer.com/global/en/gold/catalog/freefire-pins",
+    regionId: 2,
   },
   {
-    id: 'yalla-ludo',
-    name: '🎲 Yalla Ludo(Global)',
-    link: 'https://gold.razer.com/global/en/gold/catalog/yalla-ludo',
-    regionId: 2
+    id: "yalla-ludo",
+    name: "🎲 Yalla Ludo(Global)",
+    link: "https://gold.razer.com/global/en/gold/catalog/yalla-ludo",
+    regionId: 2,
   },
   {
-    id: 'pubg-mobile',
-    name: '🔫 PUBG Mobile Tencent(Global)',
-    link: 'https://gold.razer.com/global/en/gold/catalog/pubg-mobile-uc-code-tencent',
-    regionId: 2
+    id: "pubg-mobile",
+    name: "🔫 PUBG Mobile Tencent(Global)",
+    link: "https://gold.razer.com/global/en/gold/catalog/pubg-mobile-uc-code-tencent",
+    regionId: 2,
+  },
+  {
+    id: "pubg-mobile",
+    name: "🔫 PUBG Mobile (USA)",
+    link: "https://gold.razer.com/us/en/gold/catalog/pubg-mobile",
+    regionId: 12,
   },
   {
     id: "xbox-live-usa",
     name: "❎ Xbox Live USA(Global)",
     link: "https://gold.razer.com/global/en/gold/catalog/xbox-liveusa",
-    regionId: 2
-  }
+    regionId: 2,
+  },
 ];
 
 /**
@@ -37,7 +43,7 @@ const gamesCatalog = [
  * @returns {Object|null} Game object or null
  */
 function getGameById(gameId) {
-  return gamesCatalog.find(game => game.id === gameId) || null;
+  return gamesCatalog.find((game) => game.id === gameId) || null;
 }
 
 /**
@@ -54,14 +60,16 @@ function getAllGames() {
  * @returns {Object|null} Game object or null
  */
 function getGameByName(gameName) {
-  return gamesCatalog.find(game =>
-    game.name.toLowerCase().includes(gameName.toLowerCase())
-  ) || null;
+  return (
+    gamesCatalog.find((game) =>
+      game.name.toLowerCase().includes(gameName.toLowerCase()),
+    ) || null
+  );
 }
 
 module.exports = {
   gamesCatalog,
   getGameById,
   getAllGames,
-  getGameByName
+  getGameByName,
 };
